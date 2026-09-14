@@ -398,6 +398,8 @@ def generate_dma_resources(project_data: dict) -> str:
     - Reads libxr_settings['SPI'/'USART'/...][instance]['dma_section']
     - If section is empty, no attribute is added; if not, __attribute__((section("..."))) is added
     Returns generated C code as string.
+    Cache-equipped targets use padded storage with the original array extent.
+    Both ends are isolated without changing DMA lengths or endpoint capacities.
     """
     dma_code = []
     # Default section settings
@@ -415,6 +417,21 @@ def generate_dma_resources(project_data: dict) -> str:
         if user_section:  # User configuration takes priority
             return user_section
         return DEFAULT_SECTIONS.get(dma_type, "")
+
+    def buffer_declaration(data_type: str, name: str, count, section: str) -> str:
+        # Align the storage type, not only its object: sizeof then includes tail
+        # padding. Keep the array extent so RawData and split buffers are unchanged.
+        return "\n".join([
+            "#if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)",
+            "static struct alignas(__SCB_DCACHE_LINE_SIZE)",
+            "{",
+            f"  {data_type} data[{count}];",
+            f"}} {name}_storage{section};",
+            f"static constexpr auto& {name} = {name}_storage.data;",
+            "#else",
+            f"alignas(4) static {data_type} {name}[{count}]{section};",
+            "#endif",
+        ])
 
     # Iterate all peripherals
     for p_type_raw, instances in project_data.get("Peripherals", {}).items():
@@ -454,9 +471,9 @@ def generate_dma_resources(project_data: dict) -> str:
 
                 buf_code = []
                 if tx_dma:
-                    buf_code.append(f'static uint8_t {instance_lower}_tx_buf[{tx_size}]{sec_str};')
+                    buf_code.append(buffer_declaration("uint8_t", f"{instance_lower}_tx_buf", tx_size, sec_str))
                 if rx_dma:
-                    buf_code.append(f'static uint8_t {instance_lower}_rx_buf[{rx_size}]{sec_str};')
+                    buf_code.append(buffer_declaration("uint8_t", f"{instance_lower}_rx_buf", rx_size, sec_str))
                 if buf_code:
                     dma_code.append("\n".join(buf_code))
 
@@ -487,9 +504,9 @@ def generate_dma_resources(project_data: dict) -> str:
                     ch_cnt = max(1, len(active_channels))               # 至少保留 1 份缓冲
                     elems_per_channel = max(1, int(buf_size // 2))      # 每通道的 uint16_t 元素数
                     total_elems = ch_cnt * elems_per_channel            # 总元素数 = 通道数 × 每通道元素数
-                    dma_code.append(f"static uint16_t {instance_lower}_buf[{total_elems}]{sec_str};")
+                    dma_code.append(buffer_declaration("uint16_t", f"{instance_lower}_buf", total_elems, sec_str))
                 else:
-                    dma_code.append(f"static uint8_t {instance_lower}_buf[{buf_size}]{sec_str};")
+                    dma_code.append(buffer_declaration("uint8_t", f"{instance_lower}_buf", buf_size, sec_str))
 
         elif p_type_base == "USB":
             # Generate buffer variables for each USB EP (controlled by dma_section)
@@ -537,11 +554,11 @@ def generate_dma_resources(project_data: dict) -> str:
                 sec_str = f' __attribute__((section("{dma_section}")))' if dma_section else ""
 
                 # One line per variable to avoid attribute only on the last one
-                dma_code.append(f"static uint8_t {inst_lower}_ep0_in_buf[{ep0}]{sec_str};")
-                dma_code.append(f"static uint8_t {inst_lower}_ep0_out_buf[{ep0}]{sec_str};")
-                dma_code.append(f"static uint8_t {inst_lower}_ep1_in_buf[{tx_sz}]{sec_str};")
-                dma_code.append(f"static uint8_t {inst_lower}_ep1_out_buf[{rx_sz}]{sec_str};")
-                dma_code.append(f"static uint8_t {inst_lower}_ep2_in_buf[16]{sec_str};")
+                dma_code.append(buffer_declaration("uint8_t", f"{inst_lower}_ep0_in_buf", ep0, sec_str))
+                dma_code.append(buffer_declaration("uint8_t", f"{inst_lower}_ep0_out_buf", ep0, sec_str))
+                dma_code.append(buffer_declaration("uint8_t", f"{inst_lower}_ep1_in_buf", tx_sz, sec_str))
+                dma_code.append(buffer_declaration("uint8_t", f"{inst_lower}_ep1_out_buf", rx_sz, sec_str))
+                dma_code.append(buffer_declaration("uint8_t", f"{inst_lower}_ep2_in_buf", 16, sec_str))
 
     # Final output with section header if any code generated
     if dma_code:
