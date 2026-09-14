@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![GitHub Repo](https://img.shields.io/github/stars/Jiu-xiao/libxr?style=social)](https://github.com/Jiu-xiao/libxr)
-[![Documentation](https://img.shields.io/badge/docs-online-brightgreen)](https://jiu-xiao.github.io/libxr/)
+[![Documentation](https://img.shields.io/badge/docs-online-brightgreen)](https://xrobot.work/libxr/)
 [![GitHub Issues](https://img.shields.io/github/issues/Jiu-xiao/LibXR_CppCodeGenerator)](https://github.com/Jiu-xiao/LibXR_CppCodeGenerator/issues)
 [![CI/CD - Python Package](https://github.com/Jiu-xiao/LibXR_CppCodeGenerator/actions/workflows/python-publish.yml/badge.svg)](https://github.com/Jiu-xiao/LibXR_CppCodeGenerator/actions/workflows/python-publish.yml)
 [![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FJiu-xiao%2FLibXR_CppCodeGenerator.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2FJiu-xiao%2FLibXR_CppCodeGenerator?ref=badge_shield)
@@ -589,7 +589,7 @@ LibXR is a cross-platform driver abstraction and utility library supporting STM3
 #### 🔗 Links
 
 - **Repository**: [libxr](https://github.com/Jiu-xiao/libxr)
-- **API Documentation**: [API](https://jiu-xiao.github.io/libxr/)
+- **API Documentation**: [API](https://xrobot.work/libxr/)
 - **Issues**: [Issue Tracker](https://github.com/Jiu-xiao/libxr/issues)
 
 ---
@@ -650,7 +650,7 @@ It does not include any drivers or business logic by itself. Instead, it focuses
 #### 🔗 Links
 
 - **Repository**: [XRobot](https://github.com/xrobot-org/XRobot)
-- **Documentation**: [GitHub Pages](https://xrobot-org.github.io)
+- **Documentation**: [GitHub Pages](https://xrobot.work)
 - **Releases**: [PyPI](https://pypi.org/project/xrobot)
 - **Issues**: [Issue Tracker](https://github.com/xrobot-org/XRobot/issues)
 
