@@ -21,6 +21,9 @@ on:
 permissions:
   contents: read
 
+env:
+  LIBXR_TEST_BRANCH: ${{ (github.ref == 'refs/heads/dev' || github.base_ref == 'dev') && 'dev' || 'master' }}
+
 jobs:
   discover-stm32-targets:
     runs-on: ubuntu-latest
@@ -33,6 +36,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Jiu-xiao/libxr_stm32_test
+          ref: ${{ env.LIBXR_TEST_BRANCH }}
           path: test-project
 
       - name: Discover STM32 targets
@@ -47,6 +51,7 @@ jobs:
               path.name
               for path in root.iterdir()
               if path.is_dir() and not path.name.startswith(".")
+              and (path / "CMakeLists.txt").is_file()
           )
           if not targets:
               raise SystemExit("No STM32 target directories found")
@@ -83,11 +88,12 @@ jobs:
       uses: actions/checkout@v4
       with:
         repository: Jiu-xiao/libxr_stm32_test
+        ref: ${{ env.LIBXR_TEST_BRANCH }}
         path: test-project
 
     - name: Run STM32 target test
       run: |
-        cd test-project && ./test.sh master "${{ matrix.target }}"
+        cd test-project && ./test.sh "$LIBXR_TEST_BRANCH" "${{ matrix.target }}"
 
   build:
     name: Build & Test (${{ matrix.os }} - ${{ matrix.arch }})
