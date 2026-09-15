@@ -270,7 +270,7 @@ def load_libxr_config(output_dir: str, config_source: str) -> None:
         else:
             logging.info("Creating new library configuration file")
             os.makedirs(output_dir, exist_ok=True)
-            with open(config_path, "w", encoding="utf-8") as f:
+            with open(config_path, "w", encoding="utf-8", newline="\n") as f:
                 yaml.dump(libxr_settings, f, allow_unicode=True, sort_keys=False)
 
     except Exception as e:
@@ -536,6 +536,13 @@ def generate_dma_resources(project_data: dict) -> str:
                     logging.info(f"Skipping disabled USB instance: {instance}")
                     continue
 
+                cdc_count = _as_int(usb_cfg.get("cdc_count", cfg.get("cdc_count", 1)), 1)
+                if cdc_count not in (1, 2):
+                    raise ValueError(f"USB instance '{inst_lower}' supports cdc_count 1 or 2, got {cdc_count}")
+                if cdc_count == 2 and inst_u != "USB_OTG_HS":
+                    raise ValueError("cdc_count=2 currently requires USB_OTG_HS")
+                usb_cfg["cdc_count"] = cdc_count
+
                 # EP0 packet size, fallback to defaults if needed
                 ep0 = _as_int(usb_cfg.get("ep0_packet_size", cfg.get("ep0_packet_size", cfg.get("packet_size", 8))), 8)
                 if ep0 not in (8, 16, 32, 64):
@@ -559,6 +566,11 @@ def generate_dma_resources(project_data: dict) -> str:
                 dma_code.append(buffer_declaration("uint8_t", f"{inst_lower}_ep1_in_buf", tx_sz, sec_str))
                 dma_code.append(buffer_declaration("uint8_t", f"{inst_lower}_ep1_out_buf", rx_sz, sec_str))
                 dma_code.append(buffer_declaration("uint8_t", f"{inst_lower}_ep2_in_buf", 16, sec_str))
+                if cdc_count == 2:
+                    # Endpoint addresses are direction-specific: EP2 OUT may coexist with EP2 IN.
+                    dma_code.append(buffer_declaration("uint8_t", f"{inst_lower}_ep2_out_buf", rx_sz, sec_str))
+                    dma_code.append(buffer_declaration("uint8_t", f"{inst_lower}_ep3_in_buf", tx_sz, sec_str))
+                    dma_code.append(buffer_declaration("uint8_t", f"{inst_lower}_ep4_in_buf", 16, sec_str))
 
     # Final output with section header if any code generated
     if dma_code:
@@ -789,8 +801,15 @@ class PeripheralFactory:
         # CDC FIFO
         inst_cfg.setdefault("cdc_tx_fifo_size", _as_int(cfg_in.get("cdc_tx_fifo_size", inst_cfg.get("cdc_tx_fifo_size", 128)), 128))
         inst_cfg.setdefault("cdc_rx_fifo_size", _as_int(cfg_in.get("cdc_rx_fifo_size", inst_cfg.get("cdc_rx_fifo_size", 128)), 128))
-        # CDC queue size
+        # CDC queue size/count. A second CDC is currently defined only for OTG HS,
+        # using EP2 OUT + EP3 IN for data and EP4 IN for notification.
         inst_cfg.setdefault("cdc_queue_size", _as_int(cfg_in.get("cdc_queue_size", inst_cfg.get("cdc_queue_size", 3)), 3))
+        inst_cfg.setdefault("cdc_count", _as_int(cfg_in.get("cdc_count", inst_cfg.get("cdc_count", 1)), 1))
+        cdc_count = int(inst_cfg["cdc_count"])
+        if cdc_count not in (1, 2):
+            raise ValueError(f"USB instance '{inst_lower}' supports cdc_count 1 or 2, got {cdc_count}")
+        if cdc_count == 2 and inst_u != "USB_OTG_HS":
+            raise ValueError("cdc_count=2 currently requires USB_OTG_HS")
         # DMA section name
         inst_cfg.setdefault("dma_section", cfg_in.get("dma_section", inst_cfg.get("dma_section", "")))
 
@@ -841,6 +860,9 @@ class PeripheralFactory:
         size_enum = {8: "SIZE_8", 16: "SIZE_16", 32: "SIZE_32", 64: "SIZE_64"}[ep0_sz]
         lang_var = f"{inst_lower}_lang_pack".upper()
         cdc_var = f"{inst_lower}_cdc"
+        cdc_vars = [cdc_var]
+        if cdc_count == 2:
+            cdc_vars.append(f"{inst_lower}_cdc2")
         pcd_handle = f"hpcd_USB_OTG_{speed}" if is_otg else f"hpcd_USB_{speed}"
         instance_type = "STM32USBDeviceOtgFS" if (is_otg and speed == "FS") else \
             "STM32USBDeviceOtgHS" if (is_otg and speed == "HS") else \
@@ -855,28 +877,44 @@ class PeripheralFactory:
             f"\"{manufacturer}\", \"{product}\", \"{serial}\");"
         )
         # CDC construction with explicit endpoint numbers.
-        # Fixed EP layout: EP1 = CDC data bulk IN/OUT, EP2 = CDC notification IN.
+        # CDC1: EP1 IN/OUT data, EP2 IN notification.
         code.append(
             f"  LibXR::USB::CDCUart {cdc_var}("
             "LibXR::USB::Endpoint::EPNumber::EP1, "
             "LibXR::USB::Endpoint::EPNumber::EP1, "
             "LibXR::USB::Endpoint::EPNumber::EP2, "
-            f"{cdc_rx_fifo_size}, {cdc_tx_fifo_size}, {cdc_queue_size});\n")
+            f"{cdc_rx_fifo_size}, {cdc_tx_fifo_size}, {cdc_queue_size});")
+        if cdc_count == 2:
+            code.append(
+                f"  LibXR::USB::CDCUart {cdc_vars[1]}("
+                "LibXR::USB::Endpoint::EPNumber::EP3, "
+                "LibXR::USB::Endpoint::EPNumber::EP2, "
+                "LibXR::USB::Endpoint::EPNumber::EP4, "
+                f"{cdc_rx_fifo_size}, {cdc_tx_fifo_size}, {cdc_queue_size});")
+        code.append("")
 
         if is_otg:
-            code.append(f"  {instance_type} {obj}(")
-            code.append(f"      &{pcd_handle},")
-            code.append(f"      {rx_fifo_size},")
-            code.append(f"      {{{inst_lower}_ep0_out_buf, {inst_lower}_ep1_out_buf}},")
-            code.append("      {" + ", ".join([
+            out_buffers = [f"{inst_lower}_ep0_out_buf", f"{inst_lower}_ep1_out_buf"]
+            in_buffers = [
                 f"{{{inst_lower}_ep0_in_buf, {ep0_sz}}}",
                 f"{{{inst_lower}_ep1_in_buf, {tx_fifo_size}}}",
                 f"{{{inst_lower}_ep2_in_buf, 16}}",
-            ]) + "},")
+            ]
+            if cdc_count == 2:
+                out_buffers.append(f"{inst_lower}_ep2_out_buf")
+                in_buffers.extend([
+                    f"{{{inst_lower}_ep3_in_buf, {tx_fifo_size}}}",
+                    f"{{{inst_lower}_ep4_in_buf, 16}}",
+                ])
+            code.append(f"  {instance_type} {obj}(")
+            code.append(f"      &{pcd_handle},")
+            code.append(f"      {rx_fifo_size},")
+            code.append("      {" + ", ".join(out_buffers) + "},")
+            code.append("      {" + ", ".join(in_buffers) + "},")
             code.append(f"      USB::DeviceDescriptor::PacketSize0::{size_enum},")
             code.append(f"      0x{vid:X}, 0x{pid:X}, 0x{bcd:X},")
             code.append(f"      {{&{lang_var}}},")
-            code.append(f"      {{{{&{cdc_var}}}}},")
+            code.append("      {{" + ", ".join(f"&{name}" for name in cdc_vars) + "}},")
             code.append("      {reinterpret_cast<void *>(UID_BASE), 12}")
             code.append("  );")
         else:
@@ -897,7 +935,8 @@ class PeripheralFactory:
         code.append(f"  {obj}.Init(false);")
         code.append(f"  {obj}.Start(false);\n")
 
-        _register_device(f"{cdc_var}", "UART")
+        for name in cdc_vars:
+            _register_device(name, "UART")
         return "main", "\n".join(code)
 
 
@@ -1259,7 +1298,7 @@ void app_main(void);
 """
 
     if not os.path.exists(header_path) or open(header_path).read() != content:
-        with open(header_path, "w", encoding="utf-8") as f:
+        with open(header_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(content)
         logging.info(f"Generated header: {header_path}")
 
@@ -1313,7 +1352,7 @@ def inject_flash_layout(project_data: dict, output_dir: str) -> None:
         cpp_code = generate_flash_map_cpp(flash_dict)
         if output_dir:
             hpp_path = os.path.join(output_dir, "flash_map.hpp")
-            with open(hpp_path, "w", encoding="utf-8") as f:
+            with open(hpp_path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(f"""#pragma once
 // Auto-generated Flash Layout Map
 // MCU: {mcu_model}
@@ -1360,14 +1399,14 @@ def main():
         output_code = generate_full_code(project_data, use_xrobot, use_hw_cntr, existing_code)
 
         # Write output
-        with open(args.output, "w", encoding="utf-8") as f:
+        with open(args.output, "w", encoding="utf-8", newline="\n") as f:
             f.write(output_code)
 
         inject_flash_layout(project_data, output_dir)
 
         config_path = os.path.join(output_dir, "libxr_config.yaml")
 
-        with open(config_path, "w", encoding="utf-8") as f:
+        with open(config_path, "w", encoding="utf-8", newline="\n") as f:
             cleaned_config = {
                 k: v for k, v in libxr_settings.items()
                 if not (isinstance(v, dict) and len(v) == 0)
