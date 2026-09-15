@@ -85,9 +85,28 @@ jobs:
         repository: Jiu-xiao/libxr_stm32_test
         path: test-project
 
+    - name: Resolve matching LibXR ref
+      id: libxr-ref
+      shell: bash
+      run: |
+        if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+          ref="${GITHUB_REF_NAME}"
+          if ! git ls-remote --exit-code --tags https://github.com/xrobot-org/libxr.git "refs/tags/${ref}" >/dev/null; then
+            echo "Matching LibXR tag is required for coordinated release: ${ref}" >&2
+            exit 1
+          fi
+        else
+          ref="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          if ! git ls-remote --exit-code --heads https://github.com/xrobot-org/libxr.git "refs/heads/${ref}" >/dev/null; then
+            ref="dev"
+          fi
+        fi
+        echo "Using LibXR ref: ${ref}"
+        echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
     - name: Run STM32 target test
       run: |
-        cd test-project && ./test.sh master "${{ matrix.target }}"
+        cd test-project && ./test.sh "${{ steps.libxr-ref.outputs.ref }}" "${{ matrix.target }}"
 
   build:
     name: Build & Test (${{ matrix.os }} - Python ${{ matrix.python-version }})
