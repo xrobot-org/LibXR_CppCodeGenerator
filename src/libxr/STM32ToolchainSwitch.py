@@ -69,24 +69,26 @@ def patch_clang_stdlib(starm_config):
         sys.exit(1)
     with open(cmake_file, "r", encoding="utf-8") as f:
         lines = f.readlines()
-    pat = re.compile(r'set\s*\(\s*STARM_TOOLCHAIN_CONFIG\s+"(.*?)"\s*\)')
+    pat = re.compile(
+        r'(set\s*\(\s*STARM_TOOLCHAIN_CONFIG\s+")([^"]+)(".*\))'
+    )
     found = False
     for i, line in enumerate(lines):
         m = pat.search(line)
         if m:
-            if m.group(1) == starm_config:
+            if m.group(2) == starm_config:
                 logging.info(f"STARM_TOOLCHAIN_CONFIG already set to \"{starm_config}\".")
                 found = True
                 break
             else:
-                lines[i] = f'set(STARM_TOOLCHAIN_CONFIG "{starm_config}")\n'
+                lines[i] = pat.sub(rf'\1{starm_config}\3', line)
                 found = True
                 logging.info(f"Set STARM_TOOLCHAIN_CONFIG to \"{starm_config}\" in {cmake_file}")
                 break
     if not found:
         logging.error(f"Could not find 'set(STARM_TOOLCHAIN_CONFIG ...)' in {cmake_file}")
         sys.exit(1)
-    with open(cmake_file, "w", encoding="utf-8") as f:
+    with open(cmake_file, "w", encoding="utf-8", newline="\n") as f:
         f.writelines(lines)
     logging.info(f"{cmake_file} updated.")
 

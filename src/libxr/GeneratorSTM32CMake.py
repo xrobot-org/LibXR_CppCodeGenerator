@@ -157,6 +157,65 @@ def update_or_create_libxr_cmake(file_path: str, system: str) -> None:
         logging.info(f"Generated LibXR.CMake at: {cmake_path}")
 
 
+def normalize_starm_clang_toolchain(file_path: Union[str, Path]) -> None:
+    """Keep CubeMX's ST Arm Clang runtime profile selectable from the CMake cache."""
+    path = Path(file_path)
+    if not path.exists():
+        return
+
+    content = read_text_with_fallback(str(path))
+    line_pattern = re.compile(
+        r'^(\s*set\s*\(\s*STARM_TOOLCHAIN_CONFIG\s+")([^"]+)'
+        r'("(?:\s+CACHE\s+STRING\s+"[^"]*")?\s*\)\s*)$',
+        re.MULTILINE,
+    )
+    match = line_pattern.search(content)
+    if match is None:
+        logging.warning("STARM_TOOLCHAIN_CONFIG not found in %s", path)
+        return
+
+    default_config = match.group(2)
+    replacement = (
+        f'{match.group(1)}{default_config}" CACHE STRING '
+        '"ST Arm Clang runtime profile")'
+    )
+    new_content = content[:match.start()] + replacement + content[match.end():]
+
+    property_block = (
+        'set_property(CACHE STARM_TOOLCHAIN_CONFIG PROPERTY STRINGS\n'
+        '             STARM_HYBRID STARM_NEWLIB STARM_PICOLIBC)'
+    )
+    if property_block not in new_content:
+        insert_at = match.start() + len(replacement)
+        new_content = new_content[:insert_at] + '\n' + property_block + new_content[insert_at:]
+
+    # CubeMX emits an if/elseif block that computes multilib flags. Initialize the
+    # variable explicitly and reject misspelled runtime profiles.
+    if 'set(TOOLCHAIN_MULTILIBS "")' not in new_content:
+        marker = 'if(STARM_TOOLCHAIN_CONFIG STREQUAL "STARM_HYBRID")'
+        if marker in new_content:
+            new_content = new_content.replace(
+                marker, 'set(TOOLCHAIN_MULTILIBS "")\n\n' + marker, 1
+            )
+
+    first_if = new_content.find('if(STARM_TOOLCHAIN_CONFIG STREQUAL "STARM_HYBRID")')
+    if first_if >= 0:
+        first_endif = new_content.find('endif()', first_if)
+        if first_endif >= 0:
+            block = new_content[first_if:first_endif]
+            guard = (
+                'elseif(NOT STARM_TOOLCHAIN_CONFIG STREQUAL "STARM_PICOLIBC")\n'
+                '  message(FATAL_ERROR "Unknown STARM_TOOLCHAIN_CONFIG: '
+                '${STARM_TOOLCHAIN_CONFIG}")\n'
+            )
+            if 'Unknown STARM_TOOLCHAIN_CONFIG' not in block:
+                new_content = new_content[:first_endif] + guard + new_content[first_endif:]
+
+    if new_content != content:
+        path.write_text(new_content, encoding="utf-8", newline="\n")
+        logging.info("Made STARM_TOOLCHAIN_CONFIG cache-selectable in %s", path)
+
+
 def clean_cmake_build_dirs(input_directory: Union[str, Path]) -> None:
     input_directory = Path(input_directory)
     removed = False
@@ -213,6 +272,7 @@ def main():
     update_or_create_libxr_cmake(file_path, system)
     logging.info("LibXR.CMake generated/updated successfully.")
 
+    normalize_starm_clang_toolchain(os.path.join(cmake_dir, "starm-clang.cmake"))
 
     main_cmake_path = os.path.join(input_directory, "CMakeLists.txt")
     if os.path.exists(main_cmake_path):

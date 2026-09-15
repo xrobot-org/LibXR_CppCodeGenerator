@@ -90,17 +90,13 @@ jobs:
         cd test-project && ./test.sh master "${{ matrix.target }}"
 
   build:
-    name: Build & Test (${{ matrix.os }} - ${{ matrix.arch }})
+    name: Build & Test (${{ matrix.os }} - Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
 
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
-        arch: [x86_64, arm64]
         python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
-        exclude:
-          - os: windows-latest
-            arch: arm64
 
     steps:
       - name: Checkout Repository
@@ -163,7 +159,7 @@ jobs:
       - name: Upload Built Package
         uses: actions/upload-artifact@v4
         with:
-          name: python-package-${{ matrix.os }}-${{ matrix.arch }}-py${{ matrix.python-version }}
+          name: python-package-${{ matrix.os }}-py${{ matrix.python-version }}
           path: dist/*
 
       - name: Install built package (Linux/macOS)
@@ -179,6 +175,9 @@ jobs:
           if ($pkg) {
             pip install $pkg.FullName
           }
+
+      - name: Candidate source regression tests
+        run: python -m unittest discover -s tests -p test_static_integration.py -v
 
       - name: Import smoke check (all top-level modules)
         run: |

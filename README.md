@@ -1,4 +1,18 @@
 <h1 align="center">
+
+## Static XRobot integration
+
+The `--xrobot` path emits named `XR_REGISTER(object, ExplicitType)` declarations
+and `XROBOT_MAIN()` instead of a runtime HardwareContainer/ApplicationManager.
+ADC channels are borrowed references. Existing user blocks are preserved and
+must be migrated explicitly when they still call the old entry. Without
+`--xrobot`, ordinary LibXR/BSP generation remains independent of XRobot.
+
+Use the matching static XRobot tooling and Module sources. Generate the BSP
+source, then the XRobot header, and build with the original native CMake/vendor
+entry. No board pin layout or build frontend is standardized by this change.
+The source regression tests are in `tests/test_static_integration.py`.
+
 <img src="https://github.com/Jiu-xiao/LibXR_CppCodeGenerator/raw/main/imgs/XRobot.jpeg" width="300">
 </h1><br>
 
