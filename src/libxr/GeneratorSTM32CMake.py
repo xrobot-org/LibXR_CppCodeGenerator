@@ -212,7 +212,10 @@ def normalize_starm_clang_toolchain(file_path: Union[str, Path]) -> None:
                 new_content = new_content[:first_endif] + guard + new_content[first_endif:]
 
     if new_content != content:
-        path.write_text(new_content, encoding="utf-8", newline="\n")
+        # Path.write_text(newline=...) is only available on newer Python. Keep
+        # the package's Python 3.8 support while still emitting deterministic LF.
+        with path.open("w", encoding="utf-8", newline="\n") as stream:
+            stream.write(new_content)
         logging.info("Made STARM_TOOLCHAIN_CONFIG cache-selectable in %s", path)
 
 
