@@ -12,12 +12,8 @@ from pathlib import Path
 import yaml
 
 
-GPIO_PC14_ENTRY_RE = re.compile(
-    r"LibXR::Entry<LibXR::GPIO>\(\{\s*PC14\s*,\s*\{(?P<aliases>[^}]*)\}\s*\}\)"
-)
-STALE_PC14_ENTRY_RE = re.compile(
-    r"LibXR::Entry<LibXR::GPIO>\(\{\s*PC14_OSC32_IN\b"
-)
+GPIO_PC14_ENTRY_RE = re.compile(r"XR_REGISTER\(PC14,\s*LibXR::GPIO\)")
+STALE_PC14_ENTRY_RE = re.compile(r"XR_REGISTER\(PC14_OSC32_IN\b")
 
 
 LEGACY_ALIAS_CASES = {
@@ -46,7 +42,6 @@ def run_stm32_generator(repo_root: Path, config_path: Path, output_path: Path) -
         "-o",
         str(output_path),
         "--xrobot",
-        "--hw-cntr",
     ]
     try:
         try:
@@ -107,7 +102,8 @@ def run_alias_case(repo_root: Path, case_name: str, alias_entry) -> int:
             print(generated)
             return 1
 
-        aliases = set(re.findall(r'"([^"]+)"', entry.group("aliases")))
+        saved = yaml.safe_load(libxr_config_path.read_text(encoding="utf-8"))
+        aliases = set(saved["device_aliases"]["PC14"]["aliases"])
         expected_aliases = {"PC14", "PC14_OSC32_IN"}
         if not expected_aliases.issubset(aliases):
             print(

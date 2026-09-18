@@ -16,7 +16,7 @@ def get_remote_commit(url, ref='refs/heads/main'):
     raise RuntimeError("Remote ref not found")
 
 if __name__ == "__main__":
-    url = "https://github.com/Jiu-Xiao/libxr.git"
+    url = "https://github.com/xrobot-org/libxr.git"
     ref = "refs/heads/master"
     commit = get_remote_commit(url, ref)
     out_path = os.path.join(os.path.dirname(__file__), "..", "src", "libxr", "libxr_version.py")

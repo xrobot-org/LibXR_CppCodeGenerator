@@ -13,14 +13,14 @@ source, then the XRobot header, and build with the original native CMake/vendor
 entry. No board pin layout or build frontend is standardized by this change.
 The source regression tests are in `tests/test_static_integration.py`.
 
-<img src="https://github.com/Jiu-xiao/LibXR_CppCodeGenerator/raw/main/imgs/XRobot.jpeg" width="300">
+<img src="https://github.com/xrobot-org/LibXR_CppCodeGenerator/raw/main/imgs/XRobot.jpeg" width="300">
 </h1><br>
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![GitHub Repo](https://img.shields.io/github/stars/Jiu-xiao/libxr?style=social)](https://github.com/Jiu-xiao/libxr)
+[![GitHub Repo](https://img.shields.io/github/stars/Jiu-xiao/libxr?style=social)](https://github.com/xrobot-org/libxr)
 [![Documentation](https://img.shields.io/badge/docs-online-brightgreen)](https://xrobot.work/libxr/)
-[![GitHub Issues](https://img.shields.io/github/issues/Jiu-xiao/LibXR_CppCodeGenerator)](https://github.com/Jiu-xiao/LibXR_CppCodeGenerator/issues)
-[![CI/CD - Python Package](https://github.com/Jiu-xiao/LibXR_CppCodeGenerator/actions/workflows/python-publish.yml/badge.svg)](https://github.com/Jiu-xiao/LibXR_CppCodeGenerator/actions/workflows/python-publish.yml)
+[![GitHub Issues](https://img.shields.io/github/issues/Jiu-xiao/LibXR_CppCodeGenerator)](https://github.com/xrobot-org/LibXR_CppCodeGenerator/issues)
+[![CI/CD - Python Package](https://github.com/xrobot-org/LibXR_CppCodeGenerator/actions/workflows/python-publish.yml/badge.svg)](https://github.com/xrobot-org/LibXR_CppCodeGenerator/actions/workflows/python-publish.yml)
 [![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FJiu-xiao%2FLibXR_CppCodeGenerator.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2FJiu-xiao%2FLibXR_CppCodeGenerator?ref=badge_shield)
 
 `libxr` 是一个 Python 包，用于自动化嵌入式系统开发。它通过解析硬件配置文件并生成对应的 C++ 工程代码，显著降低嵌入式开发中的重复性工作。目前默认支持 STM32 平台，后续将扩展至更多硬件体系结构。
@@ -73,7 +73,7 @@ pip install libxr
 ### 从源码安装 (Install from source)
 
 ```bash
-git clone https://github.com/Jiu-xiao/LibXR_CppCodeGenerator.git
+git clone https://github.com/xrobot-org/LibXR_CppCodeGenerator.git
 cd LibXR_CppCodeGenerator
 python3 ./scripts/gen_libxr_version.py
 pip install -e .
@@ -319,7 +319,7 @@ Parses `.ioc` files and creates `.config.yaml` with a readable summary.
 Generates STM32 application code from YAML.
 
 ```bash
-usage: xr_gen_code_stm32 [-h] -i INPUT -o OUTPUT [--xrobot] [--hw-cntr] [--libxr-config LIBXR_CONFIG]
+usage: xr_gen_code_stm32 [-h] -i INPUT -o OUTPUT [--xrobot] [--libxr-config LIBXR_CONFIG]
 ```
 
 #### 🔧 Required
@@ -340,10 +340,6 @@ usage: xr_gen_code_stm32 [-h] -i INPUT -o OUTPUT [--xrobot] [--hw-cntr] [--libxr
 
   启用 XRobot glue 代码生成
   Enable XRobot glue generation
-
-- `--hw-cntr`
-  生成 LibXR HardwareContainer 定义及 app_framework.hpp 头文件（可用于非 XRobot 项目）
-  Generate LibXR HardwareContainer definition and include app_framework.hpp header (can be used without XRobot)
 
 - `--libxr-config`：
 
@@ -602,9 +598,9 @@ LibXR is a cross-platform driver abstraction and utility library supporting STM3
 
 #### 🔗 Links
 
-- **Repository**: [libxr](https://github.com/Jiu-xiao/libxr)
+- **Repository**: [libxr](https://github.com/xrobot-org/libxr)
 - **API Documentation**: [API](https://xrobot.work/libxr/)
-- **Issues**: [Issue Tracker](https://github.com/Jiu-xiao/libxr/issues)
+- **Issues**: [Issue Tracker](https://github.com/xrobot-org/libxr/issues)
 
 ---
 
@@ -624,9 +620,9 @@ LibXR_CppCodeGenerator is a code generation toolchain for LibXR. It currently su
 
 #### 🔗 Links
 
-- **Repository**: [LibXR_CppCodeGenerator](https://github.com/Jiu-xiao/LibXR_CppCodeGenerator)
+- **Repository**: [LibXR_CppCodeGenerator](https://github.com/xrobot-org/LibXR_CppCodeGenerator)
 - **Documentation and Releases**: [PyPI](https://pypi.org/project/libxr/)
-- **Issues**: [Issue Tracker](https://github.com/Jiu-xiao/LibXR_CppCodeGenerator/issues)
+- **Issues**: [Issue Tracker](https://github.com/xrobot-org/LibXR_CppCodeGenerator/issues)
 
 ---
 
@@ -655,8 +651,8 @@ It does not include any drivers or business logic by itself. Instead, it focuses
 - 希望构建平台无关的应用层逻辑，与底层驱动解耦
   For building platform-independent application logic decoupled from hardware drivers.
 
-- 与 **LibXR** 结合使用，实现自动注册硬件对象（通过 `HardwareContainer`）
-  When used with **LibXR**, supports automatic hardware registration via `HardwareContainer`.
+- 与 **LibXR / XRobot** 结合时，以 `XR_REGISTER(object, ExplicitType)` 暴露已生成的具名对象，不生成运行期 `HardwareContainer`
+  With **LibXR / XRobot**, exposes generated named objects through `XR_REGISTER(object, ExplicitType)` rather than a runtime `HardwareContainer`.
 
 - 支持生成模块入口代码、配置逻辑名与硬件名的映射，便于快速适配不同硬件配置
   Supports generating module entry code and logical-to-physical hardware name mapping for quick adaptation to different platforms.

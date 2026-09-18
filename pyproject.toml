@@ -23,10 +23,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Jiu-xiao/libxr"
+Homepage = "https://github.com/xrobot-org/libxr"
 Documentation = "https://xrobot.work/"
-Repository = "https://github.com/Jiu-xiao/LibXR_CppCodeGenerator"
-"Bug Tracker" = "https://github.com/Jiu-xiao/LibXR_CppCodeGenerator/issues"
+Repository = "https://github.com/xrobot-org/LibXR_CppCodeGenerator"
+"Bug Tracker" = "https://github.com/xrobot-org/LibXR_CppCodeGenerator/issues"
 
 [project.scripts]
 xr_parse_ioc = "libxr.PeripheralAnalyzerSTM32:main"

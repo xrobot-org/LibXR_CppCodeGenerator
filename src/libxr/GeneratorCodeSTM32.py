@@ -116,8 +116,6 @@ def parse_arguments():
                         help="Output C++ file path")
     parser.add_argument("--xrobot", action="store_true",
                         help="Enable XRobot framework integration")
-    parser.add_argument("--hw-cntr", action="store_true",
-                        help="Generate LibXR HardwareContainer definition")
     parser.add_argument("--libxr-config", default="",
                         help="Optional path or URL to libxr_config.yaml")
     return parser.parse_args()
@@ -173,13 +171,13 @@ def generate_peripheral_instances(project_data: dict) -> str:
 # --------------------------
 # Configuration Loading
 # --------------------------
-def load_configuration(file_path: str, use_hw_cntr: bool) -> dict:
+def load_configuration(file_path: str, use_xrobot: bool) -> dict:
     """Load and validate project YAML configuration with enhanced error reporting."""
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             config = yaml.safe_load(f)
 
-            if use_hw_cntr:
+            if use_xrobot:
                 if 'device_aliases' in config:
                     libxr_settings['device_aliases'] = _normalize_device_aliases(
                         config['device_aliases']
@@ -536,12 +534,8 @@ def generate_dma_resources(project_data: dict) -> str:
                     logging.info(f"Skipping disabled USB instance: {instance}")
                     continue
 
-                cdc_count = _as_int(usb_cfg.get("cdc_count", cfg.get("cdc_count", 1)), 1)
-                if cdc_count not in (1, 2):
-                    raise ValueError(f"USB instance '{inst_lower}' supports cdc_count 1 or 2, got {cdc_count}")
-                if cdc_count == 2 and inst_u != "USB_OTG_HS":
-                    raise ValueError("cdc_count=2 currently requires USB_OTG_HS")
-                usb_cfg["cdc_count"] = cdc_count
+                if 'cdc_count' in usb_cfg or 'cdc_count' in cfg:
+                    raise ValueError("USB cdc_count is not a generator option; define composite USB in BSP user code")
 
                 # EP0 packet size, fallback to defaults if needed
                 ep0 = _as_int(usb_cfg.get("ep0_packet_size", cfg.get("ep0_packet_size", cfg.get("packet_size", 8))), 8)
@@ -566,11 +560,6 @@ def generate_dma_resources(project_data: dict) -> str:
                 dma_code.append(buffer_declaration("uint8_t", f"{inst_lower}_ep1_in_buf", tx_sz, sec_str))
                 dma_code.append(buffer_declaration("uint8_t", f"{inst_lower}_ep1_out_buf", rx_sz, sec_str))
                 dma_code.append(buffer_declaration("uint8_t", f"{inst_lower}_ep2_in_buf", 16, sec_str))
-                if cdc_count == 2:
-                    # Endpoint addresses are direction-specific: EP2 OUT may coexist with EP2 IN.
-                    dma_code.append(buffer_declaration("uint8_t", f"{inst_lower}_ep2_out_buf", rx_sz, sec_str))
-                    dma_code.append(buffer_declaration("uint8_t", f"{inst_lower}_ep3_in_buf", tx_sz, sec_str))
-                    dma_code.append(buffer_declaration("uint8_t", f"{inst_lower}_ep4_in_buf", 16, sec_str))
 
     # Final output with section header if any code generated
     if dma_code:
@@ -611,12 +600,12 @@ class PeripheralFactory:
         adc_config = libxr_settings['ADC'].setdefault(instance.lower(), {})
         vref = adc_config.setdefault('vref', 3.3)
 
-        channels_code = f"  STM32ADC {instance.lower()}(&h{instance.lower()}, {instance.lower()}_buf, {{{', '.join(conversions)}}}, {vref});\n"
+        channels_code = f"  static STM32ADC {instance.lower()}(&h{instance.lower()}, {instance.lower()}_buf, {{{', '.join(conversions)}}}, {vref});\n"
 
         index = 0
 
         for channel in conversions:
-            channels_code += f"  auto& {instance.lower()}_{channel.lower()} = {instance.lower()}.GetChannel({index});\n"
+            channels_code += f"  static auto& {instance.lower()}_{channel.lower()} = {instance.lower()}.GetChannel({index});\n"
             channels_code += f"  UNUSED({instance.lower()}_{channel.lower()});\n"
             _register_device(f"{instance.lower()}_{channel.lower()}", "ADC")
             index = index + 1
@@ -644,7 +633,7 @@ class PeripheralFactory:
             if var_name.startswith("dac_dac_"):
                 var_name = var_name.replace("dac_dac_", "dac_")
             codes.append(
-                f"  STM32DAC {var_name}(&h{instance.lower()}, {channel_id}, {init_voltage}, {vref});"
+                f"  static STM32DAC {var_name}(&h{instance.lower()}, {channel_id}, {init_voltage}, {vref});"
             )
             _register_device(var_name, "DAC")
         return "main", "\n".join(codes) + "\n"
@@ -659,7 +648,7 @@ class PeripheralFactory:
         uart_config = libxr_settings['USART'].setdefault(instance.lower(), {})
         tx_queue = uart_config.setdefault("tx_queue_size", 5)
 
-        code = f"  STM32UART {instance.lower()}(&h{instance.lower().replace('usart', 'uart')},\n" \
+        code = f"  static STM32UART {instance.lower()}(&h{instance.lower().replace('usart', 'uart')},\n" \
                f"              {rx_buf}, {tx_buf}, {tx_queue});\n"
         _register_device(f"{instance.lower()}", "UART")
         return "main", code
@@ -671,7 +660,7 @@ class PeripheralFactory:
         dma_min_size = i2c_config.setdefault('dma_enable_min_size', 3)
         _register_device(f"{instance.lower()}", "I2C")
         return ("main",
-                f"  STM32I2C {instance.lower()}(&h{instance.lower()}, {instance.lower()}_buf, {dma_min_size});\n")
+                f"  static STM32I2C {instance.lower()}(&h{instance.lower()}, {instance.lower()}_buf, {dma_min_size});\n")
 
     @staticmethod
     def _generate_tim(instance: str, config: dict) -> tuple:
@@ -686,9 +675,9 @@ class PeripheralFactory:
             if complementary:
                 if ch_num.endswith("N") or ch_num.endswith("n"):
                     ch_num = ch_num[:-1]
-                code += f"  STM32PWM {dev_name}(&h{instance.lower()}, TIM_CHANNEL_{ch_num}, true);\n"
+                code += f"  static STM32PWM {dev_name}(&h{instance.lower()}, TIM_CHANNEL_{ch_num}, true);\n"
             else:
-                code += f"  STM32PWM {dev_name}(&h{instance.lower()}, TIM_CHANNEL_{ch_num}, false);\n"
+                code += f"  static STM32PWM {dev_name}(&h{instance.lower()}, TIM_CHANNEL_{ch_num}, false);\n"
             _register_device(dev_name, "PWM")
         return "pwm", code
 
@@ -700,7 +689,7 @@ class PeripheralFactory:
 
         _register_device(f"{instance.lower()}", "FDCAN")
         return ("main",
-                f'  STM32CANFD {instance.lower()}(&h{instance.lower()}, {queue_size});\n')
+                f'  static STM32CANFD {instance.lower()}(&h{instance.lower()}, {queue_size});\n')
 
     @staticmethod
     def _generate_can(instance: str, config: dict) -> tuple:
@@ -710,7 +699,7 @@ class PeripheralFactory:
 
         _register_device(f"{instance.lower()}", "CAN")
         return ("main",
-                f'  STM32CAN {instance.lower()}(&h{instance.lower()}, {queue_size});\n')
+                f'  static STM32CAN {instance.lower()}(&h{instance.lower()}, {queue_size});\n')
 
     @staticmethod
     def _generate_spi(instance: str, config: dict) -> tuple:
@@ -727,7 +716,7 @@ class PeripheralFactory:
         _register_device(f"{instance.lower()}", "SPI")
 
         return ("main",
-                f'  STM32SPI {instance.lower()}(&h{instance.lower()}, {rx_buf}, {tx_buf}, {dma_min_size});\n')
+                f'  static STM32SPI {instance.lower()}(&h{instance.lower()}, {rx_buf}, {tx_buf}, {dma_min_size});\n')
 
     @staticmethod
     def _generate_iwdg(instance: str, config: dict) -> tuple:
@@ -738,7 +727,7 @@ class PeripheralFactory:
         feed_ms = iwdg_config.setdefault("feed_interval_ms",
                                          config.get("Configuration", {}).get("feed_interval_ms", 250))
         code = (
-            f"  STM32Watchdog {instance.lower()}(&h{instance.lower()}, "
+            f"  static STM32Watchdog {instance.lower()}(&h{instance.lower()}, "
             f"{timeout_ms}, {feed_ms});\n"
         )
         _register_device(instance.lower(), "Watchdog")
@@ -801,15 +790,9 @@ class PeripheralFactory:
         # CDC FIFO
         inst_cfg.setdefault("cdc_tx_fifo_size", _as_int(cfg_in.get("cdc_tx_fifo_size", inst_cfg.get("cdc_tx_fifo_size", 128)), 128))
         inst_cfg.setdefault("cdc_rx_fifo_size", _as_int(cfg_in.get("cdc_rx_fifo_size", inst_cfg.get("cdc_rx_fifo_size", 128)), 128))
-        # CDC queue size/count. A second CDC is currently defined only for OTG HS,
-        # using EP2 OUT + EP3 IN for data and EP4 IN for notification.
         inst_cfg.setdefault("cdc_queue_size", _as_int(cfg_in.get("cdc_queue_size", inst_cfg.get("cdc_queue_size", 3)), 3))
-        inst_cfg.setdefault("cdc_count", _as_int(cfg_in.get("cdc_count", inst_cfg.get("cdc_count", 1)), 1))
-        cdc_count = int(inst_cfg["cdc_count"])
-        if cdc_count not in (1, 2):
-            raise ValueError(f"USB instance '{inst_lower}' supports cdc_count 1 or 2, got {cdc_count}")
-        if cdc_count == 2 and inst_u != "USB_OTG_HS":
-            raise ValueError("cdc_count=2 currently requires USB_OTG_HS")
+        if 'cdc_count' in cfg_in or 'cdc_count' in inst_cfg:
+            raise ValueError("USB cdc_count is not a generator option; define composite USB in BSP user code")
         # DMA section name
         inst_cfg.setdefault("dma_section", cfg_in.get("dma_section", inst_cfg.get("dma_section", "")))
 
@@ -860,9 +843,6 @@ class PeripheralFactory:
         size_enum = {8: "SIZE_8", 16: "SIZE_16", 32: "SIZE_32", 64: "SIZE_64"}[ep0_sz]
         lang_var = f"{inst_lower}_lang_pack".upper()
         cdc_var = f"{inst_lower}_cdc"
-        cdc_vars = [cdc_var]
-        if cdc_count == 2:
-            cdc_vars.append(f"{inst_lower}_cdc2")
         pcd_handle = f"hpcd_USB_OTG_{speed}" if is_otg else f"hpcd_USB_{speed}"
         instance_type = "STM32USBDeviceOtgFS" if (is_otg and speed == "FS") else \
             "STM32USBDeviceOtgHS" if (is_otg and speed == "HS") else \
@@ -879,18 +859,11 @@ class PeripheralFactory:
         # CDC construction with explicit endpoint numbers.
         # CDC1: EP1 IN/OUT data, EP2 IN notification.
         code.append(
-            f"  LibXR::USB::CDCUart {cdc_var}("
+            f"  static LibXR::USB::CDCUart {cdc_var}("
             "LibXR::USB::Endpoint::EPNumber::EP1, "
             "LibXR::USB::Endpoint::EPNumber::EP1, "
             "LibXR::USB::Endpoint::EPNumber::EP2, "
             f"{cdc_rx_fifo_size}, {cdc_tx_fifo_size}, {cdc_queue_size});")
-        if cdc_count == 2:
-            code.append(
-                f"  LibXR::USB::CDCUart {cdc_vars[1]}("
-                "LibXR::USB::Endpoint::EPNumber::EP3, "
-                "LibXR::USB::Endpoint::EPNumber::EP2, "
-                "LibXR::USB::Endpoint::EPNumber::EP4, "
-                f"{cdc_rx_fifo_size}, {cdc_tx_fifo_size}, {cdc_queue_size});")
         code.append("")
 
         if is_otg:
@@ -900,13 +873,7 @@ class PeripheralFactory:
                 f"{{{inst_lower}_ep1_in_buf, {tx_fifo_size}}}",
                 f"{{{inst_lower}_ep2_in_buf, 16}}",
             ]
-            if cdc_count == 2:
-                out_buffers.append(f"{inst_lower}_ep2_out_buf")
-                in_buffers.extend([
-                    f"{{{inst_lower}_ep3_in_buf, {tx_fifo_size}}}",
-                    f"{{{inst_lower}_ep4_in_buf, 16}}",
-                ])
-            code.append(f"  {instance_type} {obj}(")
+            code.append(f"  static {instance_type} {obj}(")
             code.append(f"      &{pcd_handle},")
             code.append(f"      {rx_fifo_size},")
             code.append("      {" + ", ".join(out_buffers) + "},")
@@ -914,11 +881,11 @@ class PeripheralFactory:
             code.append(f"      USB::DeviceDescriptor::PacketSize0::{size_enum},")
             code.append(f"      0x{vid:X}, 0x{pid:X}, 0x{bcd:X},")
             code.append(f"      {{&{lang_var}}},")
-            code.append("      {{" + ", ".join(f"&{name}" for name in cdc_vars) + "}},")
+            code.append(f"      {{{{&{cdc_var}}}}},")
             code.append("      {reinterpret_cast<void *>(UID_BASE), 12}")
             code.append("  );")
         else:
-            code.append(f"  {instance_type} {obj}(")
+            code.append(f"  static {instance_type} {obj}(")
             code.append(f"      &{pcd_handle},")
             code.append("      {")
             code.append(f"          {{{inst_lower}_ep0_in_buf, {inst_lower}_ep0_out_buf, {ep0_sz}, {ep0_sz}}},")
@@ -935,12 +902,11 @@ class PeripheralFactory:
         code.append(f"  {obj}.Init(false);")
         code.append(f"  {obj}.Start(false);\n")
 
-        for name in cdc_vars:
-            _register_device(name, "UART")
+        _register_device(cdc_var, "UART")
         return "main", "\n".join(code)
 
 
-def _generate_header_includes(use_xrobot: bool = False, use_hw_cntr: bool = False) -> str:
+def _generate_header_includes(use_xrobot: bool = False) -> str:
     """Generate essential header inclusions with optional XRobot components."""
     headers = [
         '#include "app_main.h"\n',
@@ -964,8 +930,6 @@ def _generate_header_includes(use_xrobot: bool = False, use_hw_cntr: bool = Fals
         '#include "flash_map.hpp"'
     ]
 
-    if use_hw_cntr and not use_xrobot:
-        headers.append('#include "app_framework.hpp"')
     if use_xrobot:
         headers.append('#include "xrobot_main.hpp"')
 
@@ -1031,13 +995,13 @@ def _generate_core_system(project_data: dict) -> str:
     timebase_cfg = project_data.get('Timebase', {'Source': 'SysTick'})
     source = timebase_cfg.get('Source', 'SysTick')
 
-    timebase_init = '  STM32Timebase timebase;'  # Default to SysTick
+    timebase_init = '  static STM32Timebase timebase;'  # Default to SysTick
 
     if source != 'SysTick':
         timer_type = 'TIM' if source.startswith('TIM') else \
             'LPTIM' if source.startswith('LPTIM') else 'HRTIM'
         handler = f'h{source.lower()}'
-        timebase_init = f'  STM32TimerTimebase timebase(&{handler});'
+        timebase_init = f'  static STM32TimerTimebase timebase(&{handler});'
 
     system_type = libxr_settings['SYSTEM']
     timer_cfg = libxr_settings['software_timer']
@@ -1053,7 +1017,7 @@ def _generate_core_system(project_data: dict) -> str:
 
     return f"""{timebase_init}
   PlatformInit({init_args});
-  STM32PowerManager power_manager;"""
+  static STM32PowerManager power_manager;"""
 
 
 def generate_gpio_config(project_data: dict) -> str:
@@ -1061,7 +1025,7 @@ def generate_gpio_config(project_data: dict) -> str:
     code = '\n  /* GPIO Configuration */\n'
     for port, config in project_data.get('GPIO', {}).items():
         alias = generate_gpio_alias(port, config, project_data)
-        code += f'  STM32GPIO {alias};\n'
+        code += f'  static STM32GPIO {alias};\n'
     return code
 
 
@@ -1085,12 +1049,12 @@ def configure_watchdog(project_data: dict) -> str:
         if run_as_thread:
             thread_stack = wdg_config.setdefault("thread_stack_depth", 1024)
             thread_priority = wdg_config.setdefault("thread_priority", 3)
-            code += f"""  LibXR::Thread {name}_thread;
+            code += f"""  static LibXR::Thread {name}_thread;
   {name}_thread.Create(reinterpret_cast<LibXR::Watchdog *>(&{name}), {name}.ThreadFun, "{name}_wdg", {thread_stack},
                       static_cast<LibXR::Thread::Priority>({thread_priority}));
 """
         else:
-            code += f"""  auto {name}_task = Timer::CreateTask({name}.TaskFun, reinterpret_cast<LibXR::Watchdog *>(&{name}), {feed_interval});
+            code += f"""  static auto {name}_task = Timer::CreateTask({name}.TaskFun, reinterpret_cast<LibXR::Watchdog *>(&{name}), {feed_interval});
   Timer::Add({name}_task);
   Timer::Start({name}_task);
 """
@@ -1134,18 +1098,18 @@ def configure_terminal(project_data: dict) -> str:
             thread_priority = term_config.setdefault("thread_priority", 3)
 
         code += f"""
-  RamFS ramfs("XRobot");
-  Terminal<{', '.join(map(str, params))}> terminal(ramfs);
+  static RamFS ramfs("XRobot");
+  static Terminal<{', '.join(map(str, params))}> terminal(ramfs);
 """
         if run_as_thread:
             code += f"""\
-  LibXR::Thread term_thread;
+  static LibXR::Thread term_thread;
   term_thread.Create(&terminal, terminal.ThreadFun, "terminal", {thread_stack_depth},
                      static_cast<LibXR::Thread::Priority>({thread_priority}));
 """
         else:
             code += f"""\
-  auto terminal_task = Timer::CreateTask(terminal.TaskFun, &terminal, 10);
+  static auto terminal_task = Timer::CreateTask(terminal.TaskFun, &terminal, 10);
   Timer::Add(terminal_task);
   Timer::Start(terminal_task);
 """
@@ -1154,68 +1118,9 @@ def configure_terminal(project_data: dict) -> str:
     return code
 
 
-def _detect_usb_device(project_data: dict) -> dict:
-    usb_config = project_data.get("Peripherals", {}).get("USB", {})
-    if not usb_config:
-        return None
-
-    speed = 'FS'
-    mode = "Device"
-
-    for instance, config in project_data.get("Peripherals", {}).get("USB", {}).items():
-        if 'HS' in instance:
-            speed = 'HS'
-
-        if 'FS' in instance:
-            speed = 'FS'
-
-        # if 'OTG' in instance:
-        #     mode = 'OTG'
-
-    return {
-        "handler": f"hUsb{mode}{speed}",
-        "speed": speed
-    }
-
-
 # --------------------------
 # XRobot Integration
 # --------------------------
-def generate_xrobot_hardware_container() -> str:
-    """
-    Generate a C++ definition for HardwareContainer using Entry<T> syntax.
-    Each device is associated with its logical aliases.
-    """
-    global device_aliases
-
-    _merge_pin_derived_gpio_aliases()
-
-    # Normalize device_aliases structure
-    libxr_settings["device_aliases"] = {
-        dev: {
-            "type": meta.get("type", "Unknown"),
-            "aliases": sorted(set(meta.get("aliases", [])))
-        }
-        for dev, meta in device_aliases.items()
-    }
-
-    # Collect types (Entry<T>) and entries (device with aliases)
-    entry_list = []
-
-    for dev, meta in device_aliases.items():
-        dev_type = meta["type"]
-        aliases = meta["aliases"]
-
-        if not aliases:
-            entry_list.append(f"  LibXR::Entry<LibXR::{dev_type}>({{{dev}, {{}}}})")  # No aliases
-        else:
-            alias_str = ", ".join(f'"{alias}"' for alias in aliases)
-            entry_list.append(f"  LibXR::Entry<LibXR::{dev_type}>({{{dev}, {{{alias_str}}}}})")  # With aliases
-
-    entry_body = ",\n  ".join(entry_list)
-    return f"\n  LibXR::HardwareContainer peripherals{{\n  {entry_body}\n  }};\n"
-
-
 def generate_xrobot_registrations() -> str:
     """Expose named BSP objects to the static entry without a runtime container.
 
@@ -1244,10 +1149,10 @@ def generate_xrobot_registrations() -> str:
 # --------------------------
 # Main Generator
 # --------------------------
-def generate_full_code(project_data: dict, use_xrobot: bool, use_hw_cntr: bool, existing_code: str) -> str:
+def generate_full_code(project_data: dict, use_xrobot: bool, existing_code: str) -> str:
     user_code_def_3 = '  XROBOT_MAIN();\n' if use_xrobot else f"  while(true) {{\n    Thread::Sleep(UINT32_MAX);\n  }}\n"
     components = [
-        _generate_header_includes(use_xrobot, use_hw_cntr),
+        _generate_header_includes(use_xrobot),
         '/* User Code Begin 1 */',
         preserve_user_blocks(existing_code, 1),
         '/* User Code End 1 */',
@@ -1270,8 +1175,7 @@ def generate_full_code(project_data: dict, use_xrobot: bool, use_hw_cntr: bool, 
         generate_peripheral_instances(project_data),
         configure_terminal(project_data),
         configure_watchdog(project_data),
-        generate_xrobot_registrations() if use_xrobot else
-        (generate_xrobot_hardware_container() if use_hw_cntr else ''),
+        generate_xrobot_registrations() if use_xrobot else '',
         '  // clang-format on',
         '  // NOLINTEND',
         '  /* User Code Begin 3 */',
@@ -1378,14 +1282,11 @@ def main():
         args = parse_arguments()
 
         use_xrobot = args.xrobot
-        use_hw_cntr = args.hw_cntr
-        # XRobot uses static slots; --hw-cntr remains a standalone LibXR option.
-        track_devices = use_xrobot or use_hw_cntr
 
         # Load configurations
-        project_data = load_configuration(args.input, track_devices)
+        project_data = load_configuration(args.input, use_xrobot)
         load_libxr_config(os.path.dirname(args.output), args.libxr_config)
-        initialize_device_aliases(track_devices)
+        initialize_device_aliases(use_xrobot)
 
         output_dir = os.path.dirname(args.output)
         os.makedirs(output_dir, exist_ok=True)
@@ -1396,7 +1297,7 @@ def main():
             with open(args.output, "r", encoding="utf-8") as f:
                 existing_code = f.read()
 
-        output_code = generate_full_code(project_data, use_xrobot, use_hw_cntr, existing_code)
+        output_code = generate_full_code(project_data, use_xrobot, existing_code)
 
         # Write output
         with open(args.output, "w", encoding="utf-8", newline="\n") as f:
