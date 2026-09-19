@@ -9,6 +9,8 @@ import urllib.request
 import argparse
 import yaml
 
+from xr_syntax.cpp import CppDocument
+
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
 PIN_DERIVED_GPIO_ALIAS_RE = re.compile(r"^(P[A-K]\d+)(?:_|$)")
@@ -954,22 +956,29 @@ def _generate_extern_declarations(project_data: dict) -> str:
 
 
 def preserve_user_blocks(existing_code: str, section: int) -> str:
-    """Preserve user code between protection markers with enhanced pattern matching."""
-    patterns = {
-        1: (r'/\* User Code Begin 1 \*/(.*?)/\* User Code End 1 \*/', ''),
-        2: (r'/\* User Code Begin 2 \*/(.*?)/\* User Code End 2 \*/', ''),
-        3: (r'/\* User Code Begin 3 \*/(.*?)/\* User Code End 3 \*/', ''),
-    }
+    """Preserve user code between the numbered protection markers."""
+    if section not in (1, 2, 3):
+        return ""
 
-    if section not in patterns:
-        return ''
+    expected_begin = f"/* User Code Begin {section} */"
+    expected_end = f"/* User Code End {section} */"
+    document = CppDocument.parse(existing_code)
 
-    pattern, default = patterns[section]
-    match = re.search(pattern, existing_code, re.DOTALL)
-    if section != 1:
-        return '  ' + match.group(1).strip() if match else default
-    else:
-        return match.group(1).strip() if match else default
+    region = next(
+        (
+            item
+            for item in document.user_regions()
+            if item.name == str(section)
+            and item.begin.text.strip() == expected_begin
+            and item.end.text.strip() == expected_end
+        ),
+        None,
+    )
+    if region is None:
+        return ""
+
+    body = region.body_text.strip()
+    return body if section == 1 else "  " + body
 
 
 def _generate_core_system(project_data: dict) -> str:
