@@ -79,6 +79,21 @@ endif()
 )
 
 include_cmake_cmd = "include(${CMAKE_CURRENT_LIST_DIR}/cmake/LibXR.CMake)\n"
+_LIBXR_CMAKE_INCLUDE = "${CMAKE_CURRENT_LIST_DIR}/cmake/LibXR.CMake"
+
+
+def has_libxr_cmake_include(content: str) -> bool:
+    document = CMakeDocument.parse(content)
+    for command in document.command_views("include"):
+        if command.name != "include":
+            continue
+        args = _command_args(command)
+        if len(args) != 1:
+            continue
+        if args[0].strip('"') == _LIBXR_CMAKE_INCLUDE:
+            return True
+    return False
+
 
 
 def _command_args(command) -> list:
@@ -370,7 +385,7 @@ def main():
     if os.path.exists(main_cmake_path):
         cmake_content = read_text_with_fallback(main_cmake_path)
 
-        if include_cmake_cmd not in cmake_content:
+        if not has_libxr_cmake_include(cmake_content):
             with open(main_cmake_path, "a", encoding="utf-8", newline="\n") as f:
                 f.write('\n# Add LibXR\n' + include_cmake_cmd)
             logging.info("LibXR.CMake included in CMakeLists.txt.")

@@ -2,7 +2,11 @@
 
 import re
 
-from libxr.GeneratorSTM32CMake import LIBXR_CMAKE_TEMPLATE, normalize_libxr_cmake
+from libxr.GeneratorSTM32CMake import (
+    LIBXR_CMAKE_TEMPLATE,
+    has_libxr_cmake_include,
+    normalize_libxr_cmake,
+)
 
 
 def _legacy_normalize(content: str, system: str) -> str:
@@ -129,3 +133,24 @@ def test_crlf_input_matches_legacy() -> None:
         "target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE User)\r\n"
     )
     _assert_parity(source, "None")
+
+
+def test_libxr_include_detection_accepts_existing_legacy_line() -> None:
+    source = "project(Demo)\ninclude(${CMAKE_CURRENT_LIST_DIR}/cmake/LibXR.CMake)\n"
+    assert has_libxr_cmake_include(source)
+
+
+def test_libxr_include_detection_is_structural_not_textual() -> None:
+    source = (
+        "project(Demo)\n"
+        "include (  \"${CMAKE_CURRENT_LIST_DIR}/cmake/LibXR.CMake\"  )\n"
+    )
+    assert has_libxr_cmake_include(source)
+
+
+def test_libxr_include_detection_ignores_comment_text() -> None:
+    source = (
+        "# include(${CMAKE_CURRENT_LIST_DIR}/cmake/LibXR.CMake)\n"
+        "project(Demo)\n"
+    )
+    assert not has_libxr_cmake_include(source)
