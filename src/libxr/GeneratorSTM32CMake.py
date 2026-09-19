@@ -103,6 +103,18 @@ def _line_start(data: bytes, offset: int) -> int:
     return newline + 1
 
 
+def _legacy_leading_whitespace_start(data: bytes, offset: int) -> int:
+    start = _line_start(data, offset)
+    while start > 0:
+        previous_end = start - 1
+        previous_start = _line_start(data, previous_end)
+        previous_line = data[previous_start:previous_end]
+        if previous_line.strip():
+            break
+        start = previous_start
+    return start
+
+
 def _trailing_whitespace_end(data: bytes, offset: int) -> int:
     whitespace = b" \t\r\n\f\v"
     while offset < len(data) and data[offset] in whitespace:
@@ -118,8 +130,11 @@ def _remove_cmake_set(content: str, variable: str, value_check) -> str:
         args = _command_args(command)
         if len(args) != 2 or args[0] != variable or not value_check(args[1]):
             continue
-        start = _line_start(data, command.node.span.start)
-        if data[start:command.node.span.start].strip():
+        if command.name != "set":
+            continue
+        start = _legacy_leading_whitespace_start(data, command.node.span.start)
+        line_start = _line_start(data, command.node.span.start)
+        if data[line_start:command.node.span.start].strip():
             continue
         end = _trailing_whitespace_end(data, command.node.span.end)
         edits.append((start, end, ""))
@@ -158,7 +173,8 @@ def normalize_libxr_cmake(content: str, system: str) -> str:
         (
             command
             for command in document.command_views("set")
-            if len(_command_args(command)) == 2
+            if command.name == "set"
+            and len(_command_args(command)) == 2
             and _command_args(command)[0] == "LIBXR_SYSTEM"
         ),
         None,
@@ -171,14 +187,17 @@ def normalize_libxr_cmake(content: str, system: str) -> str:
             (
                 command
                 for command in document.command_views("set")
-                if len(_command_args(command)) == 2
+                if command.name == "set"
+                and len(_command_args(command)) == 2
                 and _command_args(command)[0] == "LIBXR_DRIVER"
             ),
             None,
         )
         if driver_command is not None:
             data = document.render_bytes()
-            insert_at = _line_start(data, driver_command.node.span.start)
+            insert_at = _legacy_leading_whitespace_start(
+                data, driver_command.node.span.start
+            )
             content = _apply_byte_edits(
                 content,
                 [(insert_at, insert_at, f"set(LIBXR_SYSTEM {system})\n")],
@@ -228,20 +247,35 @@ def normalize_libxr_cmake(content: str, system: str) -> str:
     target_properties = "set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES"
     if target_properties not in content:
         document = CMakeDocument.parse(content)
+        data = document.render_bytes()
+
+        def matches_legacy_include_anchor(command) -> bool:
+            args = _command_args(command)
+            if (
+                command.name != "target_include_directories"
+                or len(args) < 2
+                or args[0] != "${CMAKE_PROJECT_NAME}"
+                or args[1] != "PRIVATE"
+            ):
+                return False
+            private_end = command.arguments[1].node.span.end
+            newline = data.find(b"\n", private_end)
+            if newline < 0 or command.node.span.end <= newline:
+                return False
+            return not data[private_end:newline].strip()
+
         include_command = next(
             (
                 command
                 for command in document.command_views("target_include_directories")
-                if command.name == "target_include_directories"
-                and len(_command_args(command)) >= 2
-                and _command_args(command)[0] == "${CMAKE_PROJECT_NAME}"
-                and _command_args(command)[1] == "PRIVATE"
+                if matches_legacy_include_anchor(command)
             ),
             None,
         )
         if include_command is not None:
-            data = document.render_bytes()
-            insert_at = _line_start(data, include_command.node.span.start)
+            insert_at = _legacy_leading_whitespace_start(
+                data, include_command.node.span.start
+            )
             block = (
                 "set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES\n"
                 "    CXX_STANDARD 20\n"
