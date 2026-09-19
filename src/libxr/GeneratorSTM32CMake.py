@@ -7,6 +7,9 @@ import re
 from pathlib import Path
 from typing import Union
 
+from xr_syntax.cmake import CMakeDocument
+from xr_syntax.core import decode_source, encode_source
+
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
 LIBXR_CMAKE_TEMPLATE = (
@@ -78,62 +81,177 @@ endif()
 include_cmake_cmd = "include(${CMAKE_CURRENT_LIST_DIR}/cmake/LibXR.CMake)\n"
 
 
+def _command_args(command) -> list:
+    return [argument.text for argument in command.arguments]
+
+
+def _apply_byte_edits(content: str, edits: list) -> str:
+    data = encode_source(content)
+    previous_start = len(data)
+    for start, end, replacement in sorted(edits, key=lambda item: item[0], reverse=True):
+        if start < 0 or end < start or end > len(data):
+            raise ValueError("invalid CMake source edit span")
+        if end > previous_start:
+            raise ValueError("overlapping CMake source edits")
+        data = data[:start] + encode_source(replacement) + data[end:]
+        previous_start = start
+    return decode_source(data)
+
+
+def _line_start(data: bytes, offset: int) -> int:
+    newline = data.rfind(b"\n", 0, offset)
+    return newline + 1
+
+
+def _trailing_whitespace_end(data: bytes, offset: int) -> int:
+    whitespace = b" \t\r\n\f\v"
+    while offset < len(data) and data[offset] in whitespace:
+        offset += 1
+    return offset
+
+
+def _remove_cmake_set(content: str, variable: str, value_check) -> str:
+    document = CMakeDocument.parse(content)
+    data = document.render_bytes()
+    edits = []
+    for command in document.command_views("set"):
+        args = _command_args(command)
+        if len(args) != 2 or args[0] != variable or not value_check(args[1]):
+            continue
+        start = _line_start(data, command.node.span.start)
+        if data[start:command.node.span.start].strip():
+            continue
+        end = _trailing_whitespace_end(data, command.node.span.end)
+        edits.append((start, end, ""))
+    return _apply_byte_edits(content, edits)
+
+
+def _replace_argument(content: str, command, argument_index: int, value: str) -> str:
+    span = command.arguments[argument_index].node.span
+    return _apply_byte_edits(content, [(span.start, span.end, value)])
+
+
+def _replace_command(content: str, command, source: str) -> str:
+    span = command.node.span
+    return _apply_byte_edits(content, [(span.start, span.end, source)])
+
+
 def normalize_libxr_cmake(content: str, system: str) -> str:
-    content = re.sub(
-        r'^\s*set\s*\(\s*CMAKE_CXX_STANDARD\s+\d+\s*\)\s*\n?',
-        '',
+    content = _remove_cmake_set(
         content,
-        flags=re.MULTILINE
+        "CMAKE_CXX_STANDARD",
+        lambda value: value.isdigit(),
     )
-    content = re.sub(
-        r'^\s*set\s*\(\s*CMAKE_CXX_STANDARD_REQUIRED\s+\S+\s*\)\s*\n?',
-        '',
+    content = _remove_cmake_set(
         content,
-        flags=re.MULTILINE
+        "CMAKE_CXX_STANDARD_REQUIRED",
+        lambda value: bool(value) and not any(ch.isspace() for ch in value),
     )
-    content = "set(CMAKE_CXX_STANDARD 20)\nset(CMAKE_CXX_STANDARD_REQUIRED ON)\n\n" + content.lstrip('\n')
+    content = (
+        "set(CMAKE_CXX_STANDARD 20)\n"
+        "set(CMAKE_CXX_STANDARD_REQUIRED ON)\n\n"
+        + content.lstrip("\n")
+    )
 
-    system_pattern = re.compile(
-        r'(^\s*set\s*\(\s*LIBXR_SYSTEM\s+)(\S+)(\s*\)\s*)',
-        re.MULTILINE
+    document = CMakeDocument.parse(content)
+    system_command = next(
+        (
+            command
+            for command in document.command_views("set")
+            if len(_command_args(command)) == 2
+            and _command_args(command)[0] == "LIBXR_SYSTEM"
+        ),
+        None,
     )
-    if system_pattern.search(content):
-        content = system_pattern.sub(rf'\1{system}\3', content, count=1)
+    if system_command is not None:
+        content = _replace_argument(content, system_command, 1, system)
     else:
-        content = re.sub(
-            r'(^\s*set\s*\(\s*LIBXR_DRIVER\s+\S+\s*\)\s*$)',
-            f"set(LIBXR_SYSTEM {system})\n\\1",
-            content,
-            count=1,
-            flags=re.MULTILINE
+        document = CMakeDocument.parse(content)
+        driver_command = next(
+            (
+                command
+                for command in document.command_views("set")
+                if len(_command_args(command)) == 2
+                and _command_args(command)[0] == "LIBXR_DRIVER"
+            ),
+            None,
         )
+        if driver_command is not None:
+            data = document.render_bytes()
+            insert_at = _line_start(data, driver_command.node.span.start)
+            content = _apply_byte_edits(
+                content,
+                [(insert_at, insert_at, f"set(LIBXR_SYSTEM {system})\n")],
+            )
 
-    content = re.sub(
-        r'target_compile_features\s*\(\s*xr\s+PUBLIC\s+cxx_std_\d+\s*\)',
-        'target_compile_features(xr PUBLIC cxx_std_20)',
-        content,
-        count=1
+    document = CMakeDocument.parse(content)
+    compile_feature = next(
+        (
+            command
+            for command in document.command_views("target_compile_features")
+            if command.name == "target_compile_features"
+            and len(_command_args(command)) == 3
+            and _command_args(command)[0] == "xr"
+            and _command_args(command)[1] == "PUBLIC"
+            and re.fullmatch(r"cxx_std_\d+", _command_args(command)[2])
+        ),
+        None,
     )
-    if "target_compile_features(xr PUBLIC cxx_std_20)" not in content:
-        content = re.sub(
-            r'(target_link_libraries\s*\(\s*xr\b[\s\S]*?\)\s*)',
-            r'\1\ntarget_compile_features(xr PUBLIC cxx_std_20)\n',
+    if compile_feature is not None:
+        content = _replace_command(
             content,
-            count=1
+            compile_feature,
+            "target_compile_features(xr PUBLIC cxx_std_20)",
         )
 
-    if "set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES" not in content:
-        content = re.sub(
-            r'(^\s*target_include_directories\(\$\{CMAKE_PROJECT_NAME\}\s+PRIVATE\s*$)',
-            "set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES\n"
-            "    CXX_STANDARD 20\n"
-            "    CXX_STANDARD_REQUIRED ON\n"
-            ")\n\n"
-            r'\1',
-            content,
-            count=1,
-            flags=re.MULTILINE
+    canonical_feature = "target_compile_features(xr PUBLIC cxx_std_20)"
+    if canonical_feature not in content:
+        document = CMakeDocument.parse(content)
+        link_command = next(
+            (
+                command
+                for command in document.command_views("target_link_libraries")
+                if command.name == "target_link_libraries"
+                and _command_args(command)
+                and _command_args(command)[0] == "xr"
+            ),
+            None,
         )
+        if link_command is not None:
+            data = document.render_bytes()
+            insert_at = _trailing_whitespace_end(data, link_command.node.span.end)
+            content = _apply_byte_edits(
+                content,
+                [(insert_at, insert_at, f"\n{canonical_feature}\n")],
+            )
+
+    target_properties = "set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES"
+    if target_properties not in content:
+        document = CMakeDocument.parse(content)
+        include_command = next(
+            (
+                command
+                for command in document.command_views("target_include_directories")
+                if command.name == "target_include_directories"
+                and len(_command_args(command)) >= 2
+                and _command_args(command)[0] == "${CMAKE_PROJECT_NAME}"
+                and _command_args(command)[1] == "PRIVATE"
+            ),
+            None,
+        )
+        if include_command is not None:
+            data = document.render_bytes()
+            insert_at = _line_start(data, include_command.node.span.start)
+            block = (
+                "set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES\n"
+                "    CXX_STANDARD 20\n"
+                "    CXX_STANDARD_REQUIRED ON\n"
+                ")\n\n"
+            )
+            content = _apply_byte_edits(
+                content,
+                [(insert_at, insert_at, block)],
+            )
 
     return content
 

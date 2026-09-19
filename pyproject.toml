@@ -19,7 +19,8 @@ keywords = ["code generation", "embedded systems", "automation"]
 dependencies = [
     "pyyaml",
     "requests",
-    "packaging"
+    "packaging",
+    "xr-syntax @ git+https://github.com/xrobot-org/xr-source.git@59330ed9a2a7bce671e602ef8685e3c209839ad0"
 ]
 
 [project.urls]
