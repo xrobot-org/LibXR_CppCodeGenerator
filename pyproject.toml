@@ -49,7 +49,7 @@ xr_stm32_toolchain_switch = "libxr.legacy:xr_stm32_toolchain_switch"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"libxr" = ["libxr_version.py", "STM32FlashLayoutRules.xml"]
+"libxr" = ["libxr_version.py", "STM32FlashLayoutRules.xml", "pin_data/*"]
 
 [tool.ruff]
 line-length = 100

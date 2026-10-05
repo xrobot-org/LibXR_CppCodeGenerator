@@ -1,0 +1,243 @@
+"""libxr pins（libxr.pin_layout）：由型号给出封装和引脚布局。
+libxr pins (libxr.pin_layout): the package and pin layout of a model.
+"""
+
+import json
+import unittest
+
+import yaml
+from fixtures import TestCase, run_libxr
+
+from libxr import pin_layout
+from libxr.pin_layout import layout_pins, layout_to_dict
+
+
+class Stm32Models(TestCase):
+    """STM32 型号按 ST 的数据解析：温度等级、分组文件名和后缀都能对上。
+    STM32 models resolve against ST's data: the temperature grade, grouped file names and
+    suffixes all match.
+    """
+
+    def test_the_temperature_grade_is_not_part_of_the_data_name(self):
+        layout = layout_pins("stm32h723vgt6")
+        self.assertEqual((layout.part, layout.package), ("STM32H723VGTx", "LQFP100"))
+        self.assertEqual(len(layout.pins), 100)
+        first = layout.pins[0]
+        self.assertEqual((first.position, first.name), ("1", "PE2"))
+        self.assertIn("USART10_RX", first.signals)
+
+    def test_grouped_file_names_cover_every_model_of_the_group(self):
+        # ST 把 STM32F407IE 和 STM32F407IG 放在同一个文件 STM32F407I(E-G)Hx.xml 中。
+        # ST keeps STM32F407IE and STM32F407IG in one file, STM32F407I(E-G)Hx.xml.
+        for model in ("STM32F407IGH6", "STM32F407IEH6"):
+            with self.subTest(model=model):
+                layout = layout_pins(model)
+                self.assertEqual(layout.package, "UFBGA176")
+                self.assertEqual(layout_to_dict(layout)["pin_count"], 201)
+
+    def test_a_suffix_after_the_temperature_grade_is_kept(self):
+        self.assertEqual(layout_pins("STM32U5G9ZJT6Q").part, "STM32U5G9ZJTxQ")
+        self.assertEqual(layout_pins("STM32G0B1CBT6N").part, "STM32G0B1CBTxN")
+
+    def test_remapped_pins_share_one_position(self):
+        # STM32G0 的 PA9 和 PA11 可以互换，同一个封装位置上有两个条目。
+        # PA9 and PA11 of an STM32G0 can be swapped, so one package position has two entries.
+        layout = layout_pins("STM32G0B1CBT6N")
+        at_33 = [pin.name for pin in layout.pins if pin.position == "33"]
+        self.assertEqual(sorted(at_33), ["PA11 [PA9]", "PA9 [PA11]"])
+        self.assertEqual(layout_to_dict(layout)["pin_count"], 48)
+        self.assertGreater(len(layout.pins), 48)
+
+    def test_a_given_package_must_be_the_one_of_the_model(self):
+        self.assertEqual(layout_pins("STM32H723VGT6", "lqfp100").package, "LQFP100")
+        with self.assertRaises(ValueError) as caught:
+            layout_pins("STM32H723VGT6", "LQFP64")
+        self.assertEqual(
+            str(caught.exception),
+            "STM32H723VGT6 comes in LQFP100, not LQFP64; the package is part of the STM32 model",
+        )
+
+    def test_an_unknown_model_names_similar_ones(self):
+        with self.assertRaises(ValueError) as caught:
+            layout_pins("STM32H723VGT6X9")
+        self.assertTrue(
+            str(caught.exception).startswith("Unknown STM32 model: STM32H723VGT6X9; similar: "),
+            str(caught.exception),
+        )
+        with self.assertRaises(ValueError) as caught:
+            layout_pins("STM32Q999RGT6")
+        self.assertEqual(str(caught.exception), "Unknown STM32 model: STM32Q999RGT6")
+
+
+class Mspm0Models(TestCase):
+    """MSPM0 型号按器件族和封装代码解析，每个引脚带 PINCM 和各信号的模式号。
+    MSPM0 models resolve by family and package code; every pin carries its PINCM and the mode of
+    each signal.
+    """
+
+    def test_the_package_code_in_the_model_chooses_the_package(self):
+        layout = layout_pins("MSPM0G3507SPMR")
+        self.assertEqual((layout.part, layout.package), ("MSPM0G3507", "LQFP-64(PM)"))
+        self.assertEqual(layout_to_dict(layout)["pin_count"], 64)
+        pin = next(pin for pin in layout.pins if pin.position == "33")
+        self.assertEqual(pin.name, "PA0")
+        self.assertEqual(pin.extra["iomux_pincm"], 1)
+        self.assertEqual(pin.extra["modes"]["UART0.TX"], 2)
+        self.assertEqual(pin.extra["modes"]["I2C0.SDA"], 3)
+
+    def test_a_package_can_be_given_in_three_spellings(self):
+        for spelling in ("LQFP-64(PM)", "LQFP-64", "pm"):
+            with self.subTest(package=spelling):
+                self.assertEqual(layout_pins("MSPM0G3507", spelling).package, "LQFP-64(PM)")
+
+    def test_a_model_without_a_package_asks_for_one(self):
+        with self.assertRaises(ValueError) as caught:
+            layout_pins("MSPM0G3507")
+        self.assertEqual(
+            str(caught.exception),
+            "Cannot tell the package of MSPM0G3507; give it with --package "
+            "(LQFP-64(PM), VQFN-48(RGZ), LQFP-48(PT), VSSOP-28(DGS28), VQFN-32(RHB))",
+        )
+        with self.assertRaises(ValueError) as caught:
+            layout_pins("MSPM0G3507", "BGA")
+        self.assertTrue(
+            str(caught.exception).startswith("MSPM0G3507 has no package BGA; this family has "),
+            str(caught.exception),
+        )
+
+    def test_the_longest_family_prefix_wins(self):
+        # MSPM0C1105 有自己的器件族，不属于 MSPM0C110X。
+        # MSPM0C1105 has a family of its own and is not part of MSPM0C110X.
+        layout = layout_pins("MSPM0C1105", "VQFN-32")
+        self.assertEqual((layout.part, layout.package), ("MSPM0C1105", "VQFN-32(RHB)"))
+        self.assertEqual(layout_pins("MSPM0C1103", "VSSOP-20").part, "MSPM0C1103")
+
+    def test_an_unknown_model_is_an_error(self):
+        with self.assertRaises(ValueError) as caught:
+            layout_pins("MSPM0Z9999")
+        self.assertEqual(str(caught.exception), "Unknown MSPM0 model: MSPM0Z9999")
+
+
+class Dispatch(TestCase):
+    """型号的前缀选平台。
+    The prefix of the model chooses the platform.
+    """
+
+    def test_the_platform_follows_the_prefix(self):
+        self.assertEqual(layout_pins("STM32F103C8T6").platform, "stm32")
+        self.assertEqual(layout_pins("MSPM0G3507SPMR").platform, "mspm0")
+
+    def test_an_unsupported_model_lists_the_platforms(self):
+        with self.assertRaises(ValueError) as caught:
+            layout_pins("CH32V203C8T6")
+        self.assertEqual(
+            str(caught.exception),
+            "No supported platform for the model CH32V203C8T6 (supported: STM32, MSPM0)",
+        )
+
+    def test_the_output_fields_are_the_same_for_every_platform(self):
+        for model in ("STM32F103C8T6", "MSPM0G3507SPMR"):
+            with self.subTest(model=model):
+                info = layout_to_dict(layout_pins(model))
+                self.assertEqual(
+                    list(info),
+                    ["model", "platform", "part", "package", "pin_count", "source", "pins"],
+                )
+                self.assertLessEqual({"position", "name", "type", "signals"}, set(info["pins"][0]))
+
+
+class DataFiles(TestCase):
+    """数据带着来源和许可证文本一起分发。
+    The data is distributed with its source and the license texts.
+    """
+
+    def test_every_data_set_records_its_source_and_license(self):
+        for platform, vendor in (("stm32", "STMicroelectronics"), ("mspm0", "Texas Instruments")):
+            with self.subTest(platform=platform):
+                source = pin_layout.load_data(platform)["source"]
+                self.assertEqual(source["vendor"], vendor)
+                self.assertTrue(source["license"])
+        self.assertRegex(pin_layout.load_data("stm32")["source"]["commit"], r"^[0-9a-f]{40}$")
+        self.assertRegex(pin_layout.load_data("mspm0")["source"]["version"], r"^\d+\.\d+\.\d+")
+
+    def test_the_license_texts_are_next_to_the_data(self):
+        st = (pin_layout.DATA / "LICENSE-ST.txt").read_text(encoding="utf-8")
+        ti = (pin_layout.DATA / "LICENSE-TI.txt").read_text(encoding="utf-8")
+        self.assertIn("BSD 3-Clause License", st)
+        self.assertIn("STMicroelectronics", st)
+        self.assertIn("Texas Instruments Incorporated", ti)
+        self.assertIn("TI Devices", ti)
+
+    def test_the_data_files_are_declared_as_package_data(self):
+        project = (pin_layout.DATA.parents[2] / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn('"pin_data/*"', project)
+
+
+class CommandLine(TestCase):
+    """布局写到标准输出，报错以错误日志给出。
+    The layout goes to stdout, and errors are logged.
+    """
+
+    def run_pins(self, *argv):
+        """以这些参数运行 libxr pins，返回退出码、标准输出和标准错误。
+        Run libxr pins with these arguments; return the exit code, stdout and stderr.
+        """
+        return run_libxr("pins", *argv)
+
+    def test_the_layout_is_yaml_by_default(self):
+        code, out, err = self.run_pins("STM32F103C8T6")
+        self.assertEqual((code, err), (0, ""))
+        info = yaml.safe_load(out)
+        self.assertEqual(
+            (info["model"], info["platform"], info["package"], info["pin_count"]),
+            ("STM32F103C8T6", "stm32", "LQFP48", 48),
+        )
+        self.assertEqual(len(info["pins"]), 48)
+
+    def test_the_layout_can_be_json(self):
+        code, out, err = self.run_pins("MSPM0G3507SPMR", "--format", "json")
+        self.assertEqual((code, err), (0, ""))
+        info = json.loads(out)
+        self.assertEqual((info["package"], info["pin_count"]), ("LQFP-64(PM)", 64))
+        self.assertEqual(info["pins"][32]["name"], "PA0")
+
+    def test_the_package_can_be_given(self):
+        code, out, _ = self.run_pins("MSPM0G3507", "-p", "VQFN-48")
+        self.assertEqual(code, 0)
+        self.assertEqual(yaml.safe_load(out)["package"], "VQFN-48(RGZ)")
+
+    def test_help_and_wrong_usage(self):
+        code, out, err = self.run_pins("--help")
+        self.assertEqual((code, err), (0, ""))
+        usage = "usage: libxr pins [-h] [-p PACKAGE] [-f {yaml,json}] [--verbose] model\n"
+        self.assertTrue(out.startswith(usage), out)
+        self.assertIn("libxr pins STM32H723VGT6", out)
+        code, out, err = self.run_pins()
+        self.assertEqual((code, out), (2, ""))
+        self.assertTrue(err.startswith(usage), err)
+
+    def test_errors_are_logged(self):
+        for argv, reason in (
+            (("CH32V203C8T6",), pin_layout_error("CH32V203C8T6")),
+            (("STM32Q999RGT6",), "Unknown STM32 model: STM32Q999RGT6"),
+            (
+                ("STM32H723VGT6", "-p", "LQFP64"),
+                "STM32H723VGT6 comes in LQFP100, not LQFP64; the package is part of the STM32 "
+                "model",
+            ),
+        ):
+            with self.subTest(argv=argv), self.assertLogs(level="ERROR") as logs:
+                code, out, _ = self.run_pins(*argv)
+                self.assertEqual((code, out), (1, ""))
+                self.assertEqual(logs.output, [f"ERROR:root:{reason}"])
+
+
+def pin_layout_error(model):
+    """没有支持的平台时的报错。
+    The error for a model without a supported platform.
+    """
+    return f"No supported platform for the model {model} (supported: STM32, MSPM0)"
+
+
+if __name__ == "__main__":
+    unittest.main()

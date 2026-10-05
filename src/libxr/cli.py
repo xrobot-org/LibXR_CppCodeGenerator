@@ -255,6 +255,15 @@ def cmd_stm32_flash_info(args: argparse.Namespace) -> None:
     print_flash_info(args.model)
 
 
+def cmd_pins(args: argparse.Namespace) -> None:
+    """libxr pins：打印一个型号的封装和引脚布局。
+    libxr pins: print the package and pin layout of a model.
+    """
+    from libxr.pin_layout import print_pin_layout
+
+    print_pin_layout(args.model, args.package, args.format)
+
+
 def cmd_stm32_toolchain(args: argparse.Namespace) -> None:
     """libxr stm32 toolchain：切换默认 preset 的工具链和 clang 的标准库。
     libxr stm32 toolchain: switch the toolchain of the default preset and the clang standard
@@ -603,6 +612,41 @@ def _add_project_directory(parser) -> None:
     )
 
 
+def _add_pins(commands) -> None:
+    """加入 pins 子命令。
+    Add the pins subcommand.
+    """
+    parser = _command(
+        commands,
+        "pins",
+        tr(
+            "print the package and pin layout of a chip model (STM32, MSPM0)",
+            "打印芯片型号的封装和引脚布局（STM32、MSPM0）",
+        ),
+        cmd_pins,
+        epilog=tr("examples:", "示例：")
+        + "\n  libxr pins STM32H723VGT6\n  libxr pins MSPM0G3507SPMR"
+        + "\n  libxr pins MSPM0G3507 --package LQFP-64 --format json",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("model", help=tr("chip model", "芯片型号"))
+    parser.add_argument(
+        "-p",
+        "--package",
+        help=tr(
+            "package, for a model that does not name it (MSPM0: LQFP-64, PM, ...)",
+            "封装，用于型号中没有封装的情况（MSPM0：LQFP-64、PM 等）",
+        ),
+    )
+    parser.add_argument(
+        "-f",
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help=tr("output format (default: yaml)", "输出格式（默认：yaml）"),
+    )
+
+
 def _add_stm32_flash_info(commands) -> None:
     """加入 stm32 flash-info 子命令。
     Add the stm32 flash-info subcommand.
@@ -704,6 +748,7 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(metavar="<command>", required=True)
     _add_parse(commands)
     _add_gen(commands)
+    _add_pins(commands)
     stm32 = commands.add_parser(
         "stm32",
         help=tr("commands for STM32CubeMX projects", "STM32CubeMX 工程的命令"),

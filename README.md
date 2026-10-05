@@ -644,6 +644,48 @@ sectors:
 
 ---
 
+## 📌 引脚布局 / Pin Layout
+
+`libxr pins` 按型号给出芯片的封装和引脚布局：每个引脚的封装位置、名称、类型和全部可选信号。型号的前缀决定平台，目前支持 STM32 和 MSPM0；输出为 YAML，`--format json` 输出 JSON。
+
+`libxr pins` prints the package and pin layout of a chip model: for each pin its position on the package, name, type and all selectable signals. The prefix of the model chooses the platform; STM32 and MSPM0 are supported. The output is YAML, or JSON with `--format json`.
+
+```bash
+$ libxr pins MSPM0G3507SPMR
+model: MSPM0G3507SPMR
+platform: mspm0
+part: MSPM0G3507
+package: LQFP-64(PM)
+pin_count: 64
+# ...
+- position: '33'
+  name: PA0
+  type: Default
+  signals:
+  - PA0
+  - UART0.TX
+  - I2C0.SDA
+  # ...
+  iomux_pincm: 1
+  modes:
+    PA0: 1
+    UART0.TX: 2
+    I2C0.SDA: 3
+    # ...
+```
+
+- STM32 的封装由型号决定（`STM32H723VGT6` 为 LQFP100）；MSPM0 的封装取自型号后缀中的代码（`MSPM0G3507SPMR` 的 `PM`），型号中没有时用 `--package` 给出（`LQFP-64`、`PM` 或 `LQFP-64(PM)`）。
+- `pin_count` 是封装上的位置数。一个位置可以有多个条目：STM32G0 的 PA9 和 PA11 可以互换，共用一个位置。
+- MSPM0 的引脚还有 `iomux_pincm` 和每个信号的模式号 `modes`。
+- 数据来自厂商：STM32 来自 ST 的 [STM32_open_pin_data](https://github.com/STMicroelectronics/STM32_open_pin_data)（BSD-3-Clause），MSPM0 来自 TI SysConfig 的器件数据（TI 有限许可，只可用于 TI 器件）。数据文件和两份许可证文本在 `src/libxr/pin_data/`，随包分发；用 `scripts/build_pin_data.py` 重新生成。
+
+- The package of an STM32 is part of the model (`STM32H723VGT6` is LQFP100); that of an MSPM0 comes from the code in the model suffix (`PM` of `MSPM0G3507SPMR`), or from `--package` when the model has none (`LQFP-64`, `PM` or `LQFP-64(PM)`).
+- `pin_count` is the number of positions on the package. A position can have several entries: PA9 and PA11 of an STM32G0 can be swapped and share one position.
+- An MSPM0 pin also has `iomux_pincm` and `modes`, the mode of each signal.
+- The data comes from the vendors: STM32 from ST's [STM32_open_pin_data](https://github.com/STMicroelectronics/STM32_open_pin_data) (BSD-3-Clause), MSPM0 from the device data of TI SysConfig (TI limited license, for TI devices only). The data files and both license texts are in `src/libxr/pin_data/` and are distributed with the package; `scripts/build_pin_data.py` rebuilds them.
+
+---
+
 ## 🚀 命令一览 / Commands
 
 `parse` 和 `gen` 按工程所属的平台选择解析器和生成器，只属于某个平台的命令放在平台名之下。
@@ -655,6 +697,7 @@ belong to one platform sit under its name.
 | --- | --- | --- |
 | `libxr parse` | 解析工程，写出工程 YAML | Parse a project into the project YAML |
 | `libxr gen` | 由工程 YAML 生成入口源文件 | Generate the entry source from the project YAML |
+| `libxr pins` | 打印某个型号的封装和引脚布局 | Print the package and pin layout of a model |
 | `libxr stm32 setup` | 为 CubeMX 工程加入 LibXR，生成代码并接入 CMake | Add LibXR to a CubeMX project, generate the code and integrate CMake |
 | `libxr stm32 cubemx-gen` | 以脚本模式运行 STM32CubeMX，由 `.ioc` 重新生成 CubeMX 工程 | Run STM32CubeMX in script mode to regenerate the CubeMX project from the `.ioc` file |
 | `libxr stm32 cmake` | 把 LibXR 接入 CubeMX 的 CMake 工程 | Integrate LibXR into the CubeMX CMake project |

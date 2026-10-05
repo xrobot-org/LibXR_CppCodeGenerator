@@ -175,6 +175,7 @@ class Options(TestCase):
         loud = {"verbose": True}
         setup = {"terminal": "", "commit": "", "git_source": "auto", "git_mirrors": ""}
         toolchain = {"run": "cmd_stm32_toolchain"}
+        pins = {"run": "cmd_pins"}
         for argv, expected in (
             (["parse"], {"directory": ".", "output": None, **quiet, "run": "cmd_parse"}),
             (
@@ -278,6 +279,14 @@ class Options(TestCase):
             (
                 ["stm32", "flash-info", "STM32F103C8T6", "--verbose"],
                 {"model": "STM32F103C8T6", **loud, "run": "cmd_stm32_flash_info"},
+            ),
+            (
+                ["pins", "STM32H723VGT6"],
+                {"model": "STM32H723VGT6", "package": None, "format": "yaml", **quiet, **pins},
+            ),
+            (
+                ["pins", "MSPM0G3507", "-p", "PM", "-f", "json", "--verbose"],
+                {"model": "MSPM0G3507", "package": "PM", "format": "json", **loud, **pins},
             ),
             (
                 ["stm32", "toolchain", "gcc"],
