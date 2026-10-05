@@ -364,6 +364,126 @@ class SyscfgPackage(TestCase):
         self.assertRegex(source["source"]["commit"], r"^[0-9a-f]{40}$")
 
 
+SYSCFG = textwrap.dedent("""\
+    /**
+     * These arguments were used when this file was generated.
+     */
+    // @cliArgs --board /ti/boards/LP_MSPM0G3507 --rtos nortos
+    const GPIO  = scripting.addModule("/ti/driverlib/GPIO", {}, false);
+    const GPIO1 = GPIO.addInstance();
+    const UART  = scripting.addModule("/ti/driverlib/UART", {}, false);
+    const UART1 = UART.addInstance();
+    const SPI   = scripting.addModule("/ti/driverlib/SPI", {}, false);
+    const SPI1  = SPI.addInstance();
+    const SYSCTL = system.modules["/ti/driverlib/SYSCTL"].$static;
+
+    GPIO1.$name = "GPIO_GRP_0";
+    GPIO1.associatedPins[0].assignedPin = "22";
+
+    UART1.$name             = "UART_0";
+    UART1.enabledInterrupts = ["RX","TX"];
+    UART1.targetBaudRate    = 2000000;
+    UART1.enableFIFO        = false;
+    UART1.ovsRate           = "3";
+    UART1.txPinConfig.$name = "ti_driverlib_gpio_GPIOPinGeneric0";
+    UART1.peripheral.$assign = "UART0";
+    UART1.peripheral.txPin.$assign = "PA0";
+
+    SPI1.$name = "SPI_0";
+    SPI1.targetBitRate = 0x100000;
+    SPI1.peripheral.$suggestSolution = "SPI1";
+
+    SYSCTL.powerPolicy = "STANDBY0";
+    // UART1.targetBaudRate = 9600;
+""")
+
+
+class SysconfigSettings(TestCase):
+    """MSPM0 外设的设置取自 .syscfg，只读。
+    The settings of an MSPM0 peripheral come from the .syscfg, read-only.
+    """
+
+    def test_the_settings_of_each_peripheral_are_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = write(Path(directory), "a.syscfg", SYSCFG)
+            settings = pin_project.read_syscfg_settings(path)
+        self.assertEqual(
+            settings["UART0"],
+            {
+                "module": "UART",
+                "name": "UART_0",
+                "params": {
+                    "enabledInterrupts": ["RX", "TX"],
+                    "targetBaudRate": 2000000,
+                    "enableFIFO": False,
+                    "ovsRate": "3",
+                },
+            },
+        )
+
+    def test_a_solver_suggestion_names_the_peripheral_and_a_hex_number_is_a_number(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = write(Path(directory), "a.syscfg", SYSCFG)
+            settings = pin_project.read_syscfg_settings(path)
+        self.assertEqual(settings["SPI1"]["params"], {"targetBitRate": 0x100000})
+
+    def test_what_is_not_a_setting_is_left_out(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = write(Path(directory), "a.syscfg", SYSCFG)
+            settings = pin_project.read_syscfg_settings(path)
+        # Pin assignments, the solver's $ items, comments, and what has no peripheral of its own
+        # (a GPIO group, a static module).
+        self.assertNotIn("txPinConfig.$name", settings["UART0"]["params"])
+        self.assertEqual(sorted(settings), ["SPI1", "UART0"])
+        self.assertEqual(settings["UART0"]["params"]["targetBaudRate"], 2000000)
+
+    def test_an_expression_is_kept_as_written(self):
+        text = (
+            'const UART = scripting.addModule("/ti/driverlib/UART", {}, false);\n'
+            "const UART1 = UART.addInstance();\n"
+            "UART1.targetBaudRate = 2 * 1000000;\n"
+            'UART1.peripheral.$assign = "UART0";\n'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = write(Path(directory), "a.syscfg", text)
+            settings = pin_project.read_syscfg_settings(path)
+        self.assertEqual(settings["UART0"]["params"], {"targetBaudRate": "2 * 1000000"})
+
+    def overlay(self, files):
+        """给定文件的 MSPM0 工程的叠加结果。
+        The overlay of an MSPM0 project with these files.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            for name, text in files.items():
+                write(Path(directory), name, text)
+            return layout_with_project(directory, None, "PM", None)["project"]
+
+    def test_a_used_peripheral_carries_its_sysconfig_settings(self):
+        project = self.overlay(
+            {"sysconfig/ti_msp_dl_config.h": TI_HEADER, "sysconfig/p.syscfg": SYSCFG}
+        )
+        self.assertEqual(project["sysconfig_file"], "sysconfig/p.syscfg")
+        uart = project["peripherals"]["UART0"]["sysconfig"]
+        self.assertEqual((uart["module"], uart["name"]), ("UART", "UART_0"))
+        self.assertEqual(uart["params"]["targetBaudRate"], 2000000)
+        # A peripheral the project does not use is not listed, and a GPIO has no settings.
+        self.assertNotIn("SPI1", project["peripherals"])
+        self.assertNotIn("sysconfig", project["peripherals"]["GPIOB"])
+
+    def test_without_a_syscfg_there_are_no_settings(self):
+        project = self.overlay({"sysconfig/ti_msp_dl_config.h": TI_HEADER})
+        self.assertIsNone(project["sysconfig_file"])
+        self.assertNotIn("sysconfig", project["peripherals"]["UART0"])
+
+    def test_a_syscfg_outside_the_project_is_not_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            write(root, "ti_msp_dl_config.h", TI_HEADER)
+            write(Path(directory), "other.syscfg", SYSCFG)
+            project = layout_with_project(str(root), None, "PM", None)["project"]
+        self.assertIsNone(project["sysconfig_file"])
+
+
 class NoProject(TestCase):
     """没有可识别的工程时报错。
     A directory without a recognizable project is an error.

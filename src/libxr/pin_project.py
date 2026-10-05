@@ -270,7 +270,10 @@ def find_syscfg(root: Path, header: Path) -> list[Path]:
     folders += [folder for folder in sorted(root.iterdir()) if folder.is_dir()]
     found: list[Path] = []
     for folder in folders:
-        if folder.name in {"build", "cmake-build"}:
+        # Only inside the project: the folder above the header may be the root's parent.
+        if folder.name in {"build", "cmake-build"} or (
+            folder != root and root not in folder.parents
+        ):
             continue
         for path in sorted(folder.glob("*.syscfg")):
             if path not in found:
@@ -285,6 +288,94 @@ def load_boards() -> dict:
     """
     path = pin_layout.DATA / "mspm0_boards.json"
     return json.loads(path.read_text(encoding="utf-8"))["boards"]
+
+
+SYSCFG_MODULE = re.compile(
+    r'^const\s+(\w+)\s*=\s*scripting\.addModule\(\s*"/ti/driverlib/(\w+)"', re.M
+)
+SYSCFG_INSTANCE = re.compile(r"^const\s+(\w+)\s*=\s*(\w+)\.addInstance\(\)", re.M)
+SYSCFG_ASSIGNMENT = re.compile(r"^(\w+)((?:\.[$\w]+|\[\d+\])+)\s*=\s*(.+?);\s*$", re.M)
+
+
+def syscfg_value(text: str):
+    """.syscfg 中赋值的右边：字符串、数字、布尔值和数组按其类型，表达式原样保留为字符串。
+    The right side of an assignment in a .syscfg: strings, numbers, booleans and arrays as what
+    they are; an expression is kept as written, as a string.
+    """
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    if re.fullmatch(r"0[xX][0-9a-fA-F]+", text):
+        return int(text, 16)
+    return text
+
+
+def read_syscfg_settings(path: Path) -> dict[str, dict]:
+    """.syscfg 中每个外设的设置：外设实例（UART0）-> 模块、名字（UART_0）和参数。
+    The settings of each peripheral in a .syscfg: the peripheral instance (UART0) -> its module,
+    its name (UART_0) and its parameters.
+
+    SysConfig 的配置是脚本：UART1.targetBaudRate = 9600; 和 UART1.peripheral.$assign = "UART0";。
+    变量 UART1 是模块 UART 的一个实例，peripheral.$assign（用户指定）或 $suggestSolution（求解器
+    给出）说明它用的外设。引脚的指定和求解器内部的 $ 项不是设置，不收。
+    The configuration of SysConfig is a script: UART1.targetBaudRate = 9600; and
+    UART1.peripheral.$assign = "UART0";. The variable UART1 is an instance of the module UART, and
+    peripheral.$assign (the user's) or $suggestSolution (the solver's) names the peripheral it
+    uses. The assignment of pins and the solver's own $ items are not settings and are left out.
+    """
+    text = path.read_text(encoding="utf-8", errors="replace")
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    text = re.sub(r"^[ \t]*//.*$", "", text, flags=re.M)
+    modules = {var: module for var, module in SYSCFG_MODULE.findall(text)}
+    instances = {
+        var: modules[module] for var, module in SYSCFG_INSTANCE.findall(text) if module in modules
+    }
+    found: dict[str, dict] = {}
+    for var, tail, value in SYSCFG_ASSIGNMENT.findall(text):
+        if var not in instances:
+            continue
+        entry = found.setdefault(
+            var,
+            {
+                "module": instances[var],
+                "name": None,
+                "assigned": None,
+                "suggested": None,
+                "params": {},
+            },
+        )
+        if tail == ".$name":
+            entry["name"] = syscfg_value(value)
+        elif tail == ".peripheral.$assign":
+            entry["assigned"] = syscfg_value(value)
+        elif tail == ".peripheral.$suggestSolution":
+            entry["suggested"] = syscfg_value(value)
+        elif not tail.startswith(".peripheral.") and "$" not in tail:
+            entry["params"][tail.lstrip(".")] = syscfg_value(value)
+    settings = {}
+    for entry in found.values():
+        peripheral = entry["assigned"] or entry["suggested"]
+        if peripheral:
+            settings[peripheral] = {
+                "module": entry["module"],
+                "name": entry["name"],
+                "params": entry["params"],
+            }
+    return settings
+
+
+def syscfg_settings(root: Path, header: Path) -> tuple[Path | None, dict[str, dict]]:
+    """工程里第一个给出外设设置的 .syscfg 和其中的设置；没有时为 (None, {})。
+    The first .syscfg of the project that gives peripheral settings, and the settings; (None, {})
+    when none does.
+    """
+    for path in find_syscfg(root, header):
+        settings = read_syscfg_settings(path)
+        if settings:
+            return path, settings
+    return None, {}
 
 
 def syscfg_package(root: Path, header: Path) -> str | None:
@@ -378,7 +469,12 @@ def config_key(platform: str, entry: dict) -> tuple[str, str] | None:
     return section, USB_KEYS.get(instance, instance.lower())
 
 
-def project_overlay(layout: PinLayout, assigned: dict[str, dict], config_path: Path | None) -> dict:
+def project_overlay(
+    layout: PinLayout,
+    assigned: dict[str, dict],
+    config_path: Path | None,
+    sysconfig: dict[str, dict] | None = None,
+) -> dict:
     """工程叠加结果：每个引脚的已选信号，以及每个已选外设用到的引脚和它在 libxr_config.yaml
     中的设置。
     The project overlay: the selected signal of each pin, and for each selected peripheral the
@@ -393,6 +489,10 @@ def project_overlay(layout: PinLayout, assigned: dict[str, dict], config_path: P
         used = peripherals.setdefault(entry["peripheral"], {"kind": entry["kind"], "pins": {}})
         used["pins"][entry["function"]] = pin_name
     for instance, used in peripherals.items():
+        # MSPM0：外设的设置在 SysConfig 工程（.syscfg）里，只读给出。
+        # MSPM0: the settings of a peripheral are in the SysConfig project (.syscfg), given read-only.
+        if sysconfig and instance in sysconfig:
+            used["sysconfig"] = sysconfig[instance]
         key = config_key(layout.platform, {"peripheral": instance, "kind": used["kind"]})
         if key is None:
             continue
@@ -431,6 +531,7 @@ def layout_with_project(
     """
     root = Path(directory)
     config_path = Path(libxr_config) if libxr_config else root / "User" / "libxr_config.yaml"
+    syscfg_file, sysconfig = None, {}
     if sorted(root.glob("*.ioc")):
         chip, source, layout, assigned = stm32_assignments(
             root, lambda chip: pin_layout.layout_pins(model or chip, package)
@@ -451,11 +552,13 @@ def layout_with_project(
         )
         assigned = mspm0_assignments(header, layout)
         source = header.relative_to(root).as_posix()
+        syscfg_file, sysconfig = syscfg_settings(root, header)
     info = pin_layout.layout_to_dict(layout)
     info["project"] = {
         "directory": str(root),
         "source": source,
         "libxr_config": str(config_path) if config_path.is_file() else None,
-        **project_overlay(layout, assigned, config_path),
+        "sysconfig_file": syscfg_file.relative_to(root).as_posix() if syscfg_file else None,
+        **project_overlay(layout, assigned, config_path, sysconfig),
     }
     return info
