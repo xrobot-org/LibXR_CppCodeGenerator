@@ -3,6 +3,7 @@ libxr pins (libxr.pin_layout): the package and pin layout of a model.
 """
 
 import json
+import re
 import unittest
 
 import yaml
@@ -141,9 +142,94 @@ class Dispatch(TestCase):
                 info = layout_to_dict(layout_pins(model))
                 self.assertEqual(
                     list(info),
-                    ["model", "platform", "part", "package", "pin_count", "source", "pins"],
+                    [
+                        "model",
+                        "platform",
+                        "part",
+                        "package",
+                        "pin_count",
+                        "source",
+                        "peripherals",
+                        "pins",
+                    ],
                 )
                 self.assertLessEqual({"position", "name", "type", "signals"}, set(info["pins"][0]))
+
+
+class Recognition(TestCase):
+    """外设从信号名识别，与 LibXR 是否有对应的外设无关。
+    Peripherals are recognized from the signal names, whether or not LibXR has a matching
+    peripheral.
+    """
+
+    def test_st_signal_names(self):
+        for signal, expected in (
+            ("USART1_TX", ("USART1", "USART", "TX")),
+            ("I2C2_SCL", ("I2C2", "I2C", "SCL")),
+            ("FDCAN1_RX", ("FDCAN1", "FDCAN", "RX")),
+            ("ETH_MII_TXD1", ("ETH", "ETH", "MII_TXD1")),
+            ("FMC_A23", ("FMC", "FMC", "A23")),
+            ("TIM2_CH1", ("TIM2", "TIM", "CH1")),
+            ("ADC1_INP19", ("ADC1", "ADC", "INP19")),
+            ("USB_OTG_HS_DM", ("USB_OTG_HS", "USB_OTG", "DM")),
+            ("USB_DRD_FS_DP", ("USB_DRD_FS", "USB_DRD", "DP")),
+            ("OCTOSPIM_P1_IO2", ("OCTOSPIM_P1", "OCTOSPIM", "IO2")),
+            ("CEC", ("CEC", "CEC", "CEC")),
+            ("BOOT0", ("BOOT0", "BOOT", "BOOT0")),
+        ):
+            with self.subTest(signal=signal):
+                self.assertEqual(pin_layout.recognize_stm32(signal), expected)
+        self.assertIsNone(pin_layout.recognize_stm32("GPIO"))
+
+    def test_ti_signal_names(self):
+        for signal, expected in (
+            ("UART0.TX", ("UART0", "UART", "TX")),
+            ("TIMA0.CCP0", ("TIMA0", "TIMA", "CCP0")),
+            ("SYSCTL.FCC_IN", ("SYSCTL", "SYSCTL", "FCC_IN")),
+            ("COMP2.IN0-", ("COMP2", "COMP", "IN0-")),
+        ):
+            with self.subTest(signal=signal):
+                self.assertEqual(pin_layout.recognize_mspm0(signal), expected)
+        for name in ("PA0", "PB22", "PA17/PA14"):
+            with self.subTest(name=name):
+                self.assertIsNone(pin_layout.recognize_mspm0(name))
+
+    def test_peripherals_without_a_libxr_object_are_recognized(self):
+        # LibXR 没有 ETH 和 OctoSPI 的抽象，它们仍然要被认出来，并给出可选的引脚。
+        # LibXR has no abstraction for ETH or OctoSPI; they are still recognized, with their pins.
+        peripherals = layout_to_dict(layout_pins("STM32H723VGT6"))["peripherals"]
+        self.assertEqual(peripherals["ETH"]["kind"], "ETH")
+        self.assertEqual(peripherals["ETH"]["signals"]["CRS"], ["PA0"])
+        self.assertIn("IO2", peripherals["OCTOSPIM_P1"]["signals"])
+        self.assertEqual(peripherals["USB_OTG_HS"]["signals"]["DM"], ["PA11"])
+
+    def test_a_function_lists_the_pins_that_can_carry_it(self):
+        usart1 = layout_to_dict(layout_pins("STM32H723VGT6"))["peripherals"]["USART1"]
+        self.assertEqual(sorted(usart1["signals"]["TX"]), ["PA9", "PB14", "PB6"])
+        uart0 = layout_to_dict(layout_pins("MSPM0G3507SPMR"))["peripherals"]["UART0"]
+        self.assertEqual(sorted(uart0["signals"]["TX"]), ["PA0", "PA10", "PA28", "PB0"])
+
+    def test_peripherals_sort_naturally(self):
+        names = list(layout_to_dict(layout_pins("STM32H723VGT6"))["peripherals"])
+        self.assertLess(names.index("USART2"), names.index("USART10"))
+
+    def test_every_signal_in_the_data_is_recognized_except_plain_gpio(self):
+        # ST 的 GPIO 和 TI 的引脚名（PA0、PA17/PA14）是引脚的普通用法，其余都是外设信号。
+        # ST's GPIO and TI's pin names (PA0, PA17/PA14) are the plain use of the pin; the rest
+        # are peripheral signals.
+        st = pin_layout.load_data("stm32")["parts"]
+        for shard in {shard for shard, _ in st.values()}:
+            for pin_set in pin_layout.load_stm32_shard(shard).values():
+                for _, _, _, signals in pin_set["pins"]:
+                    for signal in signals:
+                        if signal != "GPIO":
+                            self.assertIsNotNone(pin_layout.recognize_stm32(signal), signal)
+        for family in pin_layout.load_data("mspm0")["families"].values():
+            for pins in family["packages"].values():
+                for _, _, _, _, signals in pins:
+                    for signal, _ in signals:
+                        if not re.fullmatch(r"P[A-C]\d+(/P[A-C]\d+)?", signal):
+                            self.assertIsNotNone(pin_layout.recognize_mspm0(signal), signal)
 
 
 class DataFiles(TestCase):

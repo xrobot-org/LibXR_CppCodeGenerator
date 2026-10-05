@@ -198,6 +198,86 @@ def layout_mspm0(model: str, package: str | None) -> PinLayout:
     return PinLayout("mspm0", model, part.group(0) if part else model, chosen, data["source"], pins)
 
 
+def recognize_stm32(signal: str) -> tuple[str, str, str] | None:
+    """识别 ST 的信号名：返回外设实例、外设类型和功能，不是外设信号（GPIO）时返回 None。
+    Recognize an ST signal name: return the peripheral instance, the peripheral kind and the
+    function, or None when the signal is not a peripheral's (GPIO).
+
+    名字是 <实例>_<功能>：USART1_TX 为 USART1、USART、TX。类型是实例去掉末尾的数字（I2C2 为
+    I2C）。USB_OTG_HS_DM、USB_DRD_FS_DP 和 OCTOSPIM_P1_IO2 的实例有多段，单独处理。识别只看
+    名字，不依赖 LibXR 是否有对应的外设。
+    A name is <instance>_<function>: USART1_TX is USART1, USART, TX. The kind is the instance
+    without its trailing digits (I2C for I2C2). The instances of USB_OTG_HS_DM, USB_DRD_FS_DP and
+    OCTOSPIM_P1_IO2 have several parts and are handled separately. Recognition looks at the name
+    only, whether or not LibXR has a matching peripheral.
+    """
+    match = re.fullmatch(r"(USB_OTG|USB_DRD)_([A-Z]+)_(.+)", signal)
+    if match:
+        return f"{match.group(1)}_{match.group(2)}", match.group(1), match.group(3)
+    match = re.fullmatch(r"(OCTOSPIM)_(P\d+)_(.+)", signal)
+    if match:
+        return f"{match.group(1)}_{match.group(2)}", match.group(1), match.group(3)
+    match = re.fullmatch(r"([A-Za-z0-9]+?)_(.+)", signal)
+    if match is not None:
+        return match.group(1), re.sub(r"\d+$", "", match.group(1)), match.group(2)
+    # 没有下划线的信号（CEC、BOOT0、AUDIOCLK）自己就是实例和功能；GPIO 只是引脚的普通用法。
+    # A signal without an underscore (CEC, BOOT0, AUDIOCLK) is its own instance and function;
+    # GPIO is only the plain use of the pin.
+    if signal == "GPIO":
+        return None
+    return signal, re.sub(r"\d+$", "", signal), signal
+
+
+def recognize_mspm0(signal: str) -> tuple[str, str, str] | None:
+    """识别 TI 的信号名：<实例>.<功能>，UART0.TX 为 UART0、UART、TX；引脚自己的名字（PA0）
+    不是外设信号，返回 None。
+    Recognize a TI signal name, <instance>.<function>: UART0.TX is UART0, UART, TX; the name of
+    the pin itself (PA0) is not a peripheral's, so None.
+    """
+    match = re.fullmatch(r"([A-Za-z0-9]+)\.(.+)", signal)
+    if match is None:
+        return None
+    return match.group(1), re.sub(r"\d+$", "", match.group(1)), match.group(2)
+
+
+# 各平台识别信号名的函数。
+# The function of each platform that recognizes a signal name.
+RECOGNIZERS = {"stm32": recognize_stm32, "mspm0": recognize_mspm0}
+
+
+def natural_key(name: str) -> list:
+    """自然排序的键：USART2 排在 USART10 之前。
+    A natural sort key: USART2 sorts before USART10.
+    """
+    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", name)]
+
+
+def peripheral_index(layout: PinLayout) -> dict:
+    """布局中识别出的全部外设：实例名 -> 类型和各功能可选的引脚。
+    All the peripherals recognized in the layout: instance name -> kind and, per function, the
+    pins that can carry it.
+    """
+    recognize = RECOGNIZERS[layout.platform]
+    found: dict[str, dict] = {}
+    for pin in layout.pins:
+        for signal in pin.signals:
+            recognized = recognize(signal)
+            if recognized is None:
+                continue
+            instance, kind, function = recognized
+            entry = found.setdefault(instance, {"kind": kind, "signals": {}})
+            entry["signals"].setdefault(function, []).append(pin.name)
+    return {
+        instance: {
+            "kind": found[instance]["kind"],
+            "signals": dict(
+                sorted(found[instance]["signals"].items(), key=lambda s: natural_key(s[0]))
+            ),
+        }
+        for instance in sorted(found, key=natural_key)
+    }
+
+
 # 各平台：名称、型号前缀和布局函数。新平台在此加一行。
 # The platforms: name, model prefix and layout function. A new platform adds a line here.
 PLATFORMS = (
@@ -234,6 +314,11 @@ def layout_to_dict(layout: PinLayout) -> dict:
     pin_count is the number of positions on the package. A position can have several entries:
     the pins of an STM32G0 can be remapped, so PA9 and PA11 share one position, written
     PA11 [PA9] and PA9 [PA11].
+
+    peripherals 列出从信号名识别出的全部外设（USART1、ETH、FMC……），每个功能可选的引脚都在
+    其中；它与 LibXR 是否有对应的外设无关。
+    peripherals lists every peripheral recognized from the signal names (USART1, ETH, FMC, ...)
+    with the pins that can carry each function, whether or not LibXR has a matching peripheral.
     """
     return {
         "model": layout.model,
@@ -242,6 +327,7 @@ def layout_to_dict(layout: PinLayout) -> dict:
         "package": layout.package,
         "pin_count": len({pin.position for pin in layout.pins}),
         "source": layout.source,
+        "peripherals": peripheral_index(layout),
         "pins": [
             {
                 "position": pin.position,
