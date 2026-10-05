@@ -209,6 +209,41 @@ class Recognition(TestCase):
         uart0 = layout_to_dict(layout_pins("MSPM0G3507SPMR"))["peripherals"]["UART0"]
         self.assertEqual(sorted(uart0["signals"]["TX"]), ["PA0", "PA10", "PA28", "PB0"])
 
+    def test_plain_gpio_is_listed_by_port_and_line(self):
+        for model, pin in (("STM32H723VGT6", "PA9"), ("MSPM0G3507SPMR", "PA9")):
+            with self.subTest(model=model):
+                gpio_a = layout_to_dict(layout_pins(model))["peripherals"]["GPIOA"]
+                self.assertEqual(gpio_a["kind"], "GPIO")
+                self.assertEqual(gpio_a["signals"]["P9"], [pin])
+
+    def test_external_interrupt_lines_list_the_pins_that_can_use_them(self):
+        # 线号等于引脚号：LINE9 可以来自任一端口的第 9 脚（ST 数据中 GPIO 带 EXTI 模式）。
+        # The line number is the pin number: LINE9 can come from pin 9 of any port (the GPIO has
+        # the EXTI mode in ST's data).
+        peripherals = layout_to_dict(layout_pins("STM32H723VGT6"))["peripherals"]
+        self.assertEqual(
+            sorted(peripherals["EXTI"]["signals"]["LINE9"]), ["PA9", "PB9", "PC9", "PD9", "PE9"]
+        )
+        info = layout_to_dict(layout_pins("STM32H723VGT6"))
+        modes = {pin["name"]: pin.get("gpio_modes") for pin in info["pins"]}
+        self.assertIn("EXTI", modes["PE2"])
+        self.assertIsNone(modes["NRST"])
+
+    def test_the_ti_data_does_not_say_which_pins_have_interrupts(self):
+        # TI 的器件数据没有这一项，所以不列出 EXTI，而不是猜测。
+        # TI's device data has no such field, so EXTI is not listed rather than guessed.
+        peripherals = layout_to_dict(layout_pins("MSPM0G3507SPMR"))["peripherals"]
+        self.assertNotIn("EXTI", peripherals)
+
+    def test_timers_with_output_channels_are_marked_pwm(self):
+        peripherals = layout_to_dict(layout_pins("STM32H723VGT6"))["peripherals"]
+        self.assertEqual(peripherals["TIM1"]["capabilities"], ["pwm"])
+        self.assertEqual(peripherals["LPTIM1"]["capabilities"], ["pwm"])
+        self.assertNotIn("capabilities", peripherals["USART1"])
+        ti = layout_to_dict(layout_pins("MSPM0G3507SPMR"))["peripherals"]
+        self.assertEqual(ti["TIMA0"]["capabilities"], ["pwm"])
+        self.assertNotIn("capabilities", ti["UART0"])
+
     def test_peripherals_sort_naturally(self):
         names = list(layout_to_dict(layout_pins("STM32H723VGT6"))["peripherals"])
         self.assertLess(names.index("USART2"), names.index("USART10"))
@@ -220,7 +255,7 @@ class Recognition(TestCase):
         st = pin_layout.load_data("stm32")["parts"]
         for shard in {shard for shard, _ in st.values()}:
             for pin_set in pin_layout.load_stm32_shard(shard).values():
-                for _, _, _, signals in pin_set["pins"]:
+                for _, _, _, signals, _ in pin_set["pins"]:
                     for signal in signals:
                         if signal != "GPIO":
                             self.assertIsNotNone(pin_layout.recognize_stm32(signal), signal)

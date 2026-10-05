@@ -115,7 +115,10 @@ def layout_stm32(model: str, package: str | None) -> PinLayout:
                 f"{model} 的封装是 {found['package']}，不是 {package}；STM32 的封装由型号决定",
             )
         )
-    pins = [Pin(position, name, kind, signals) for position, name, kind, signals in found["pins"]]
+    pins = [
+        Pin(position, name, kind, signals, {"gpio_modes": modes} if modes else {})
+        for position, name, kind, signals, modes in found["pins"]
+    ]
     return PinLayout("stm32", model, part, found["package"], data["source"], pins)
 
 
@@ -252,30 +255,79 @@ def natural_key(name: str) -> list:
     return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", name)]
 
 
+# 定时器的哪些功能是可以输出 PWM 的通道：类型 -> 功能的正则。
+# Which functions of a timer are channels that can output PWM: kind -> regex of the function.
+PWM_CHANNELS = {
+    "TIM": r"CH\d+N?",
+    "LPTIM": r"OUT|CH\d+",
+    "HRTIM": r"CH[A-F]\d",
+    "TIMA": r"CCP\d+(_CMPL)?",
+    "TIMG": r"CCP\d+(_CMPL)?",
+}
+
+
+def gpio_port_and_line(pin_name: str) -> tuple[str, str] | None:
+    """引脚名的端口字母和线号：PA9 为 (A, 9)，PC2_C 为 (C, 2)；不是 P<字母><数字> 形式时为 None。
+    The port letter and the line number of a pin name: (A, 9) for PA9, (C, 2) for PC2_C; None
+    when the name is not of the form P<letter><digits>.
+    """
+    match = re.match(r"P([A-Z])(\d+)", pin_name)
+    return (match.group(1), match.group(2)) if match else None
+
+
+def pin_has_gpio(pin: Pin) -> bool:
+    """引脚能当普通 GPIO：ST 的信号里有 GPIO；TI 的信号里有引脚自己的名字（PA0）。
+    Whether the pin can be a plain GPIO: ST lists GPIO among the signals, TI lists the name of
+    the pin itself (PA0).
+    """
+    return "GPIO" in pin.signals or pin.name in pin.signals
+
+
 def peripheral_index(layout: PinLayout) -> dict:
     """布局中识别出的全部外设：实例名 -> 类型和各功能可选的引脚。
     All the peripherals recognized in the layout: instance name -> kind and, per function, the
     pins that can carry it.
+
+    除信号名中的外设外，还有：GPIOA、GPIOB……（普通 GPIO，每条线 P0、P1……）；EXTI（外部中断，
+    线 LINE0……可选的引脚取自 ST 数据中 GPIO 的 EXTI 模式）；可输出 PWM 的定时器带
+    capabilities: [pwm]。
+    Besides the peripherals in the signal names there are GPIOA, GPIOB, ... (plain GPIO, one
+    function P0, P1, ... per line); EXTI (external interrupts, lines LINE0, ..., the pins taken
+    from the EXTI mode of the GPIO in ST's data); and a timer that can output PWM carries
+    capabilities: [pwm].
     """
     recognize = RECOGNIZERS[layout.platform]
     found: dict[str, dict] = {}
+
+    def add(instance: str, kind: str, function: str, pin: Pin) -> None:
+        """把 pin 记为外设 instance 的 function 可选的引脚。
+        Record pin as one that can carry the function of the peripheral instance.
+        """
+        entry = found.setdefault(instance, {"kind": kind, "signals": {}})
+        entry["signals"].setdefault(function, []).append(pin.name)
+
     for pin in layout.pins:
         for signal in pin.signals:
             recognized = recognize(signal)
-            if recognized is None:
-                continue
-            instance, kind, function = recognized
-            entry = found.setdefault(instance, {"kind": kind, "signals": {}})
-            entry["signals"].setdefault(function, []).append(pin.name)
-    return {
-        instance: {
-            "kind": found[instance]["kind"],
-            "signals": dict(
-                sorted(found[instance]["signals"].items(), key=lambda s: natural_key(s[0]))
-            ),
+            if recognized is not None:
+                add(*recognized, pin)
+        port_line = gpio_port_and_line(pin.name)
+        if port_line is not None and pin_has_gpio(pin):
+            port, line = port_line
+            add(f"GPIO{port}", "GPIO", f"P{line}", pin)
+            if any(mode.startswith("EXTI") for mode in pin.extra.get("gpio_modes", [])):
+                add("EXTI", "EXTI", f"LINE{line}", pin)
+    index = {}
+    for instance in sorted(found, key=natural_key):
+        entry = found[instance]
+        index[instance] = {
+            "kind": entry["kind"],
+            "signals": dict(sorted(entry["signals"].items(), key=lambda s: natural_key(s[0]))),
         }
-        for instance in sorted(found, key=natural_key)
-    }
+        pattern = PWM_CHANNELS.get(entry["kind"])
+        if pattern and any(re.fullmatch(pattern, function) for function in entry["signals"]):
+            index[instance]["capabilities"] = ["pwm"]
+    return index
 
 
 # 各平台：名称、型号前缀和布局函数。新平台在此加一行。
@@ -315,10 +367,10 @@ def layout_to_dict(layout: PinLayout) -> dict:
     the pins of an STM32G0 can be remapped, so PA9 and PA11 share one position, written
     PA11 [PA9] and PA9 [PA11].
 
-    peripherals 列出从信号名识别出的全部外设（USART1、ETH、FMC……），每个功能可选的引脚都在
-    其中；它与 LibXR 是否有对应的外设无关。
-    peripherals lists every peripheral recognized from the signal names (USART1, ETH, FMC, ...)
-    with the pins that can carry each function, whether or not LibXR has a matching peripheral.
+    peripherals 列出识别出的全部外设（USART1、ETH、FMC、GPIOA、EXTI……），每个功能可选的引脚
+    都在其中；它与 LibXR 是否有对应的外设无关。
+    peripherals lists every peripheral recognized (USART1, ETH, FMC, GPIOA, EXTI, ...) with the
+    pins that can carry each function, whether or not LibXR has a matching peripheral.
     """
     return {
         "model": layout.model,

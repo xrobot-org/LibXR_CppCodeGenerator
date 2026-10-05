@@ -42,20 +42,30 @@ def expand_group(stem: str) -> list[str]:
 
 
 def read_st_part(path: Path) -> tuple[str, list[list]]:
-    """读取一个 STM32 型号的 XML，返回封装名和引脚：[位置, 名称, 类型, [信号...]]。
+    """读取一个 STM32 型号的 XML，返回封装名和引脚：[位置, 名称, 类型, [信号...], [GPIO 模式...]]。
+    GPIO 模式取自 GPIO 信号的 IOModes（Input、Output、Analog、EVENTOUT、EXTI……），引脚没有
+    GPIO 功能时为空。
     Read the XML of one STM32 part; return the package name and the pins as
-    [position, name, type, [signals...]].
+    [position, name, type, [signals...], [GPIO modes...]]. The GPIO modes come from the IOModes
+    of the GPIO signal (Input, Output, Analog, EVENTOUT, EXTI, ...) and are empty for a pin
+    without a GPIO function.
     """
     root = ET.parse(path).getroot()
-    pins = [
-        [
-            pin.get("Position"),
-            pin.get("Name"),
-            pin.get("Type"),
-            [signal.get("Name") for signal in pin.findall(f"{ST_NAMESPACE}Signal")],
-        ]
-        for pin in root.findall(f"{ST_NAMESPACE}Pin")
-    ]
+    pins = []
+    for pin in root.findall(f"{ST_NAMESPACE}Pin"):
+        signals = pin.findall(f"{ST_NAMESPACE}Signal")
+        modes = next(
+            (s.get("IOModes") for s in signals if s.get("Name") == "GPIO" and s.get("IOModes")), ""
+        )
+        pins.append(
+            [
+                pin.get("Position"),
+                pin.get("Name"),
+                pin.get("Type"),
+                [signal.get("Name") for signal in signals],
+                modes.split(",") if modes else [],
+            ]
+        )
     return root.get("Package"), pins
 
 
