@@ -63,6 +63,17 @@ def load_data(platform: str) -> dict:
         return json.load(file)
 
 
+@cache
+def load_stm32_shard(shard: str) -> dict:
+    """读取并缓存 STM32 的一个数据分片（一个系列的引脚集）。只读用到的分片，命令因此启动得快，
+    占用的内存也小。
+    Read and cache one data shard of the STM32 (the pin sets of a series). Only the shard in use
+    is read, which keeps the command quick to start and its memory small.
+    """
+    with gzip.open(DATA / f"stm32-{shard}.json.gz", "rt", encoding="utf-8") as file:
+        return json.load(file)
+
+
 def stm32_candidates(model: str) -> list[str]:
     """型号在 ST 数据中可能的写法：原样，以及把温度等级数字换成 X（STM32H723VGT6 为
     STM32H723VGTX）。
@@ -94,7 +105,8 @@ def layout_stm32(model: str, package: str | None) -> PinLayout:
             tr(f"Unknown STM32 model: {model}", f"未知的 STM32 型号：{model}")
             + (hint if near else "")
         )
-    found = data["sets"][data["parts"][part]]
+    shard, key = data["parts"][part]
+    found = load_stm32_shard(shard)[key]
     if package is not None and package.upper() != found["package"].upper():
         raise ValueError(
             tr(

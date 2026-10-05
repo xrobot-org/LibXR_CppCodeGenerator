@@ -168,6 +168,19 @@ class DataFiles(TestCase):
         self.assertIn("Texas Instruments Incorporated", ti)
         self.assertIn("TI Devices", ti)
 
+    def test_every_part_points_to_a_pin_set_in_an_existing_shard(self):
+        parts = pin_layout.load_data("stm32")["parts"]
+        for shard in {shard for shard, _ in parts.values()}:
+            self.assertTrue((pin_layout.DATA / f"stm32-{shard}.json.gz").is_file(), shard)
+        for name, (shard, key) in parts.items():
+            with self.subTest(part=name):
+                self.assertIn(key, pin_layout.load_stm32_shard(shard))
+
+    def test_a_layout_reads_only_the_shard_of_its_series(self):
+        pin_layout.load_stm32_shard.cache_clear()
+        layout_pins("STM32H723VGT6")
+        self.assertEqual(pin_layout.load_stm32_shard.cache_info().currsize, 1)
+
     def test_the_data_files_are_declared_as_package_data(self):
         project = (pin_layout.DATA.parents[2] / "pyproject.toml").read_text(encoding="utf-8")
         self.assertIn('"pin_data/*"', project)

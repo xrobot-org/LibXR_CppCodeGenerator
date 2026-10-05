@@ -71,20 +71,36 @@ def git_commit(directory: Path) -> str:
     ).stdout.strip()
 
 
-def build_stm32(st_data: Path) -> dict:
-    """STM32 数据：型号到引脚集的映射，以及按内容去重的引脚集。
-    The STM32 data: a map from part to pin set, and the pin sets deduplicated by content.
+def stm32_shard(name: str) -> str:
+    """一个 STM32 型号所属的数据分片（系列）：STM32H723VGTx 为 H7，STM32WBA52CGUx 为 WBA5。
+    The data shard (series) of an STM32 part: H7 for STM32H723VGTx, WBA5 for STM32WBA52CGUx.
     """
-    parts: dict[str, str] = {}
-    sets: dict[str, dict] = {}
+    match = re.match(r"STM32([A-Z]+\d)", name)
+    return match.group(1) if match else "OTHER"
+
+
+def build_stm32(st_data: Path) -> tuple[dict, dict[str, dict]]:
+    """STM32 数据：索引（来源，以及型号到分片和引脚集的映射），和按系列分片、按内容去重的引脚集。
+    读一个型号只需要索引和它所在的分片。
+    The STM32 data: the index (the source, and a map from part to shard and pin set) and the pin
+    sets, split into shards by series and deduplicated by content. Reading one part needs only
+    the index and its shard.
+    """
+    parts: dict[str, list[str]] = {}
+    shards: dict[str, dict] = {}
+    holder: dict[str, str] = {}
     for path in sorted((st_data / "mcu").glob("*.xml")):
         package, pins = read_st_part(path)
         content = json.dumps([package, pins], separators=(",", ":"))
         key = hashlib.sha1(content.encode()).hexdigest()[:10]
-        sets[key] = {"package": package, "pins": pins}
         for name in expand_group(path.stem):
-            parts[name] = key
-    return {
+            # 内容相同的引脚集只存一份，放在第一个用到它的系列的分片里。
+            # A pin set of the same content is stored once, in the shard of the first series that
+            # uses it.
+            shard = holder.setdefault(key, stm32_shard(name))
+            shards.setdefault(shard, {})[key] = {"package": package, "pins": pins}
+            parts[name] = [shard, key]
+    index = {
         "source": {
             "vendor": "STMicroelectronics",
             "dataset": "STM32_open_pin_data",
@@ -93,8 +109,8 @@ def build_stm32(st_data: Path) -> dict:
             "license": "BSD-3-Clause",
         },
         "parts": parts,
-        "sets": sets,
     }
+    return index, shards
 
 
 def family_prefixes(family: str) -> list[str]:
@@ -194,7 +210,14 @@ def main() -> None:
     )
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    write_gzip_json(args.output / "stm32.json.gz", build_stm32(args.st_data))
+    # 先清掉旧的数据文件，不留下已经不存在的分片。
+    # Remove the old data files first, so no shard that no longer exists stays.
+    for old in args.output.glob("*.json.gz"):
+        old.unlink()
+    index, shards = build_stm32(args.st_data)
+    write_gzip_json(args.output / "stm32.json.gz", index)
+    for shard, sets in shards.items():
+        write_gzip_json(args.output / f"stm32-{shard}.json.gz", sets)
     write_gzip_json(args.output / "mspm0.json.gz", build_mspm0(args.sysconfig))
     # 许可证原文随数据分发。TI 的文件不是 UTF-8，转成 UTF-8 写出。
     # The license texts are distributed with the data. TI's file is not UTF-8; it is written as
