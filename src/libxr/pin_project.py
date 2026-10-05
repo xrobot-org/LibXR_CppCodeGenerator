@@ -318,12 +318,13 @@ def project_overlay(layout: PinLayout, assigned: dict[str, dict], config_path: P
         if key is None:
             continue
         section, name = key
-        params = (
-            settings.get(section, {}).get(name) if isinstance(settings.get(section), dict) else None
-        )
-        used["config"] = {"section": section, "key": name, "present": params is not None}
-        if params is not None:
-            used["config"]["params"] = params
+        # 键的大小写以文件为准：同一个文件里有 fdcan1，也有 FDCAN1。
+        # The case of the key is the file's: one file has fdcan1, another FDCAN1.
+        entries = settings.get(section) if isinstance(settings.get(section), dict) else {}
+        actual = next((key for key in entries if str(key).lower() == name), None)
+        used["config"] = {"section": section, "key": actual or name, "present": actual is not None}
+        if actual is not None:
+            used["config"]["params"] = entries[actual]
     return {
         "assignments": dict(
             sorted(assigned.items(), key=lambda item: pin_layout.natural_key(item[0]))

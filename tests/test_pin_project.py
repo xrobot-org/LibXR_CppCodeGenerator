@@ -133,6 +133,20 @@ class Stm32Projects(TestCase):
         self.assertEqual(peripherals["SPI1"]["config"]["params"], {"dma_section": ".axi_ram"})
         self.assertNotIn("config", peripherals["GPIOC"])
 
+    def test_the_case_of_a_key_in_the_file_is_kept(self):
+        # 有的 libxr_config.yaml 写 fdcan1，有的写 FDCAN1，两种都要找得到。
+        # One libxr_config.yaml writes fdcan1 and another FDCAN1; both have to be found.
+        with tempfile.TemporaryDirectory() as directory:
+            write(Path(directory), "a.ioc", ioc("STM32H723VGTx", [], {"PD0": "FDCAN1_RX"}))
+            write(
+                Path(directory), "User/libxr_config.yaml", "FDCAN:\n  FDCAN1:\n    queue_size: 5\n"
+            )
+            info = layout_with_project(directory, None, None, None)
+        self.assertEqual(
+            info["project"]["peripherals"]["FDCAN1"]["config"],
+            {"section": "FDCAN", "key": "FDCAN1", "present": True, "params": {"queue_size": 5}},
+        )
+
     def test_a_missing_configuration_file_is_not_an_error(self):
         with tempfile.TemporaryDirectory() as directory:
             info = self.project(directory, config=None)
