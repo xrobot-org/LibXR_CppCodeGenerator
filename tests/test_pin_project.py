@@ -2,6 +2,7 @@
 libxr pins -d (libxr.pin_project): overlay the pin signals a project has selected on the layout.
 """
 
+import json
 import tempfile
 import textwrap
 import unittest
@@ -10,6 +11,7 @@ from pathlib import Path
 import yaml
 from fixtures import IOC, TestCase, run_libxr
 
+from libxr import pin_layout, pin_project
 from libxr.pin_project import layout_with_project
 
 # 一个 MSPM0G3507 工程的 ti_msp_dl_config.h 片段：UART0 的两个引脚和一个 GPIO 组。
@@ -283,6 +285,83 @@ class Mspm0Projects(TestCase):
             ),
             str(caught.exception),
         )
+
+
+class SyscfgPackage(TestCase):
+    """MSPM0 的封装取自 SysConfig 工程的 .syscfg：--package，或 --board 对应的 LaunchPad。
+    The package of an MSPM0 comes from the .syscfg of the SysConfig project: its --package, or the
+    LaunchPad its --board names.
+    """
+
+    def package(self, syscfg: str | None, option=None, header_folder="sysconfig", syscfg_path=None):
+        """给出的 .syscfg 内容下，叠加结果里的封装（syscfg 为 None 时没有 .syscfg）。
+        The package in the overlay for this .syscfg content (no .syscfg when it is None).
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            write(Path(directory), f"{header_folder}/ti_msp_dl_config.h", TI_HEADER)
+            if syscfg is not None:
+                write(Path(directory), syscfg_path or "sysconfig/project.syscfg", syscfg)
+            return layout_with_project(directory, None, option, None)["package"]
+
+    def test_a_device_based_project_names_its_package(self):
+        for line in (
+            '//@cliArgs --device "MSPM0G350X" --package "LQFP-64(PM)" --part "Default"',
+            ' * @cliArgs --device "MSPM0G3507" --package "LQFP-64(PM)"',
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(self.package(line + "\n"), "LQFP-64(PM)")
+
+    def test_a_board_based_project_gets_the_package_of_the_board(self):
+        for line in (
+            "// @cliArgs --board /ti/boards/LP_MSPM0G3507 --rtos nortos",
+            ' * @cliArgs --board "/ti/boards/LP_MSPM0G3507" --product "mspm0_sdk@2.09.00.00"',
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(self.package(line + "\n"), "LQFP-64(PM)")
+
+    def test_the_v2_line_comes_last_and_wins(self):
+        text = (
+            '//@cliArgs --device "MSPM0G350X" --package "VQFN-48(RGZ)" --part "Default"\n'
+            '//@v2CliArgs --device "MSPM0G3507" --package "LQFP-64(PM)"\n'
+        )
+        self.assertEqual(self.package(text), "LQFP-64(PM)")
+
+    def test_a_given_package_wins_over_the_project(self):
+        text = '//@cliArgs --device "MSPM0G350X" --package "LQFP-64(PM)"\n'
+        self.assertEqual(self.package(text, option="VQFN-48"), "VQFN-48(RGZ)")
+
+    def test_the_syscfg_may_sit_in_the_root_while_the_header_is_in_a_build_output(self):
+        # CCS 的工程：.syscfg 在根目录，生成的头文件在 Debug/syscfg/。
+        # A CCS project: the .syscfg in the root, the generated header in Debug/syscfg/.
+        text = '//@cliArgs --device "MSPM0G350X" --package "LQFP-48(PT)"\n'
+        self.assertEqual(
+            self.package(text, header_folder="Debug/syscfg", syscfg_path="empty.syscfg"),
+            "LQFP-48(PT)",
+        )
+
+    def test_without_a_package_the_error_asks_for_one(self):
+        for text in (None, "// nothing here\n", "// @cliArgs --board /ti/boards/LP_UNKNOWN\n"):
+            with self.subTest(text=text), self.assertRaises(ValueError) as caught:
+                self.package(text)
+            self.assertTrue(
+                str(caught.exception).startswith("Cannot tell the package of MSPM0G3507"),
+                str(caught.exception),
+            )
+
+    def test_the_board_table_has_the_launchpads_with_their_devices(self):
+        boards = pin_project.load_boards()
+        self.assertEqual(
+            boards["LP_MSPM0G3507"], {"device": "MSPM0G3507", "package": "LQFP-64(PM)"}
+        )
+        self.assertEqual(boards["LP_MSPM0C1106"]["device"], "MSPM0C1106")
+        self.assertTrue(all(board["package"] for board in boards.values()))
+
+    def test_the_board_table_ships_with_its_license(self):
+        text = (pin_layout.DATA / "LICENSE-TI-BOARDS.txt").read_text(encoding="utf-8")
+        self.assertIn("Texas Instruments Incorporated", text)
+        self.assertIn("Redistribution and use in source and binary forms", text)
+        source = json.loads((pin_layout.DATA / "mspm0_boards.json").read_text(encoding="utf-8"))
+        self.assertRegex(source["source"]["commit"], r"^[0-9a-f]{40}$")
 
 
 class NoProject(TestCase):

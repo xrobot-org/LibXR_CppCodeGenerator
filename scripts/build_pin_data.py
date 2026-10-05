@@ -7,12 +7,16 @@ There are two sources:
 - STM32：ST 公开的 STM32_open_pin_data 仓库（BSD-3-Clause）的 mcu/*.xml。
   STM32: mcu/*.xml of ST's public STM32_open_pin_data repository (BSD-3-Clause).
 - MSPM0：TI SysConfig 安装目录下 dist/deviceData/MSPM0*/ 中的器件 JSON（TI 有限许可，只可用于
-  TI 器件）。
+  TI 器件）；以及 MSPM0 SDK 中 source/ti/boards/.meta/ 的板子定义（每块 LaunchPad 的器件和封装，
+  BSD-3-Clause），用于由 .syscfg 中的 --board 得到封装。
   MSPM0: the device JSON in dist/deviceData/MSPM0*/ of a TI SysConfig installation (TI limited
-  license, for TI devices only).
+  license, for TI devices only); and the board definitions in source/ti/boards/.meta/ of the MSPM0
+  SDK (the device and package of each LaunchPad, BSD-3-Clause), which give the package of a
+  .syscfg that names a --board.
 
 用法 / Usage:
-    python scripts/build_pin_data.py --st-data <STM32_open_pin_data> --sysconfig <SysConfig>
+    python scripts/build_pin_data.py --st-data <STM32_open_pin_data> --sysconfig <SysConfig> \\
+        --mspm0-sdk <mspm0-sdk>
 """
 
 import argparse
@@ -195,6 +199,39 @@ def build_mspm0(sysconfig: Path) -> dict:
     }
 
 
+def read_boards(sdk: Path) -> dict:
+    """MSPM0 SDK 的板子定义：板名（文件名）到器件和封装。
+    The board definitions of the MSPM0 SDK: the board name (the file name) to its device and
+    package.
+
+    定义文件是带注释的 JSON，这里只取 gpn（器件）和 pkg（封装）两个字段。
+    The definition files are JSON with comments; only gpn (the device) and pkg (the package) are
+    read.
+    """
+    boards = {}
+    for path in sorted((sdk / "source" / "ti" / "boards" / ".meta").glob("*.syscfg.json")):
+        text = path.read_text(encoding="utf-8")
+        device = re.search(r'"gpn":\s*"([^"]+)"', text)
+        package = re.search(r'"pkg":\s*"([^"]+)"', text)
+        if device and package:
+            boards[path.name.removesuffix(".syscfg.json")] = {
+                "device": device.group(1),
+                "package": package.group(1),
+            }
+    return boards
+
+
+def board_license(sdk: Path) -> str:
+    """板子定义文件开头的版权和 BSD-3-Clause 许可证注释。
+    The copyright and BSD-3-Clause license comment at the top of a board definition file.
+    """
+    path = next((sdk / "source" / "ti" / "boards" / ".meta").glob("*.syscfg.json"))
+    text = path.read_text(encoding="utf-8")
+    comment = text[: text.index("*/")]
+    lines = [re.sub(r"^\s*/?\*+\$?\s?", "", line) for line in comment.splitlines()]
+    return "\n".join(lines).strip() + "\n"
+
+
 def write_gzip_json(path: Path, data: dict) -> None:
     """把 data 写成压缩的 JSON；不写时间戳，同样的数据得到同样的文件。
     Write data as compressed JSON; no timestamp is written, so the same
@@ -215,6 +252,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--st-data", type=Path, required=True, help="STM32_open_pin_data checkout")
     parser.add_argument("--sysconfig", type=Path, required=True, help="TI SysConfig installation")
+    parser.add_argument("--mspm0-sdk", type=Path, required=True, help="TI MSPM0 SDK checkout")
     parser.add_argument(
         "--output", type=Path, default=REPOSITORY / "src" / "libxr" / "pin_data", help="output dir"
     )
@@ -229,6 +267,21 @@ def main() -> None:
     for shard, sets in shards.items():
         write_gzip_json(args.output / f"stm32-{shard}.json.gz", sets)
     write_gzip_json(args.output / "mspm0.json.gz", build_mspm0(args.sysconfig))
+    boards = {
+        "source": {
+            "vendor": "Texas Instruments",
+            "dataset": "MSPM0 SDK source/ti/boards/.meta",
+            "commit": git_commit(args.mspm0_sdk),
+            "license": "BSD-3-Clause",
+        },
+        "boards": read_boards(args.mspm0_sdk),
+    }
+    (args.output / "mspm0_boards.json").write_text(
+        json.dumps(boards, indent=1, sort_keys=True) + "\n", encoding="utf-8", newline="\n"
+    )
+    (args.output / "LICENSE-TI-BOARDS.txt").write_text(
+        board_license(args.mspm0_sdk), encoding="utf-8", newline="\n"
+    )
     # 许可证原文随数据分发。TI 的文件不是 UTF-8，转成 UTF-8 写出。
     # The license texts are distributed with the data. TI's file is not UTF-8; it is written as
     # UTF-8.

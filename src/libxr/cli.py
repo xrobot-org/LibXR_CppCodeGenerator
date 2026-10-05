@@ -661,8 +661,10 @@ def _add_pins(commands) -> None:
         "-p",
         "--package",
         help=tr(
-            "package, for a model that does not name it (MSPM0: LQFP-64, PM, ...)",
-            "封装，用于型号中没有封装的情况（MSPM0：LQFP-64、PM 等）",
+            "package, for a model that does not name it (MSPM0: LQFP-64, PM, ...); with -d an "
+            "MSPM0 takes it from the SysConfig project",
+            "封装，用于型号中没有封装的情况（MSPM0：LQFP-64、PM 等）；用 -d 时 MSPM0 取自 "
+            "SysConfig 工程",
         ),
     )
     parser.add_argument(

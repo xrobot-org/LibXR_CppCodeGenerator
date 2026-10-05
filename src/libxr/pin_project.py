@@ -11,7 +11,10 @@ against the selectable signals of its pin in the layout; one that does not match
 is, with matched false.
 """
 
+import json
 import re
+from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 
 import yaml
@@ -223,6 +226,82 @@ def find_ti_header(directory: Path) -> Path | None:
     return None
 
 
+SYSCFG_ARGS = re.compile(r"^[ \t]*(?://|\*)?[ \t]*@(v2)?[Cc]li[Aa]rgs[ \t]+(.*)$", re.M)
+
+
+@dataclass
+class Syscfg:
+    """一个 .syscfg 的 @cliArgs 里的封装和板子；没有的为 None。
+    The package and board in the @cliArgs of a .syscfg; None for what it does not give.
+    """
+
+    package: str | None = None
+    board: str | None = None
+
+
+def cli_option(arguments: str, name: str) -> str | None:
+    """@cliArgs 的参数串中 --name 的值（带引号或不带）。
+    The value of --name in the argument string of an @cliArgs, quoted or not.
+    """
+    match = re.search(rf'--{name}[ \t]+(?:"([^"]*)"|(\S+))', arguments)
+    return (match.group(1) if match.group(1) is not None else match.group(2)) if match else None
+
+
+def read_syscfg(path: Path) -> Syscfg:
+    """读 .syscfg 开头的 @cliArgs 和 @v2CliArgs（后者在后，覆盖前者）。
+    Read the @cliArgs and @v2CliArgs at the top of a .syscfg (the latter comes last and overrides
+    the former).
+    """
+    info = Syscfg()
+    text = path.read_text(encoding="utf-8", errors="replace")
+    for _, arguments in sorted(SYSCFG_ARGS.findall(text), key=lambda found: found[0] == "v2"):
+        info.package = cli_option(arguments, "package") or info.package
+        board = cli_option(arguments, "board")
+        info.board = board.rsplit("/", 1)[-1] if board else info.board
+    return info
+
+
+def find_syscfg(root: Path, header: Path) -> list[Path]:
+    """工程里的 .syscfg：根目录，头文件所在目录及其上一级，再往下一级的子目录；不进构建目录。
+    The .syscfg files of a project: the root, the folder of the header and the one above it, then
+    the folders one level down; never a build folder.
+    """
+    folders = [root, header.parent, header.parent.parent]
+    folders += [folder for folder in sorted(root.iterdir()) if folder.is_dir()]
+    found: list[Path] = []
+    for folder in folders:
+        if folder.name in {"build", "cmake-build"}:
+            continue
+        for path in sorted(folder.glob("*.syscfg")):
+            if path not in found:
+                found.append(path)
+    return found
+
+
+@cache
+def load_boards() -> dict:
+    """MSPM0 SDK 的板子（LP_MSPM0G3507 等）到器件和封装。
+    The boards of the MSPM0 SDK (LP_MSPM0G3507, ...) to their device and package.
+    """
+    path = pin_layout.DATA / "mspm0_boards.json"
+    return json.loads(path.read_text(encoding="utf-8"))["boards"]
+
+
+def syscfg_package(root: Path, header: Path) -> str | None:
+    """SysConfig 工程给出的封装：.syscfg 的 --package，或它的 --board 对应的板子的封装。
+    The package the SysConfig project gives: the --package of a .syscfg, or the package of the
+    board its --board names.
+    """
+    for path in find_syscfg(root, header):
+        info = read_syscfg(path)
+        if info.package:
+            return info.package
+        board = load_boards().get(info.board or "")
+        if board:
+            return board["package"]
+    return None
+
+
 def mspm0_model(header: Path) -> str:
     """ti_msp_dl_config.h 中的器件名：#define CONFIG_MSPM0G3507。
     The device name in ti_msp_dl_config.h: #define CONFIG_MSPM0G3507.
@@ -342,10 +421,12 @@ def layout_with_project(
     The layout and overlay of a project directory: recognize the platform, read the selected
     signals and return the layout dict with a project section.
 
-    给出 model 时以它为准，否则取自工程（STM32 的 .ioc，MSPM0 的 ti_msp_dl_config.h）。
+    给出 model 时以它为准，否则取自工程（STM32 的 .ioc，MSPM0 的 ti_msp_dl_config.h）。MSPM0 的
+    封装取自 .syscfg，package 给出时以它为准。
     libxr_config 默认为目录下的 User/libxr_config.yaml。
     A given model wins; otherwise it comes from the project (the .ioc of an STM32, the
-    ti_msp_dl_config.h of an MSPM0). libxr_config defaults to User/libxr_config.yaml in the
+    ti_msp_dl_config.h of an MSPM0). The package of an MSPM0 comes from the .syscfg, and a given
+    package wins. libxr_config defaults to User/libxr_config.yaml in the
     directory.
     """
     root = Path(directory)
@@ -363,7 +444,11 @@ def layout_with_project(
                     f"{root}：没有找到 STM32CubeMX 的 .ioc 或 SysConfig 的 ti_msp_dl_config.h",
                 )
             )
-        layout = pin_layout.layout_pins(model or mspm0_model(header), package)
+        # 封装：-p 优先，否则取 SysConfig 工程（.syscfg）给出的。
+        # The package: -p first, otherwise the one the SysConfig project (.syscfg) gives.
+        layout = pin_layout.layout_pins(
+            model or mspm0_model(header), package or syscfg_package(root, header)
+        )
         assigned = mspm0_assignments(header, layout)
         source = header.relative_to(root).as_posix()
     info = pin_layout.layout_to_dict(layout)
