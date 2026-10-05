@@ -261,7 +261,7 @@ def cmd_pins(args: argparse.Namespace) -> None:
     """
     from libxr.pin_layout import print_pin_layout
 
-    print_pin_layout(args.model, args.package, args.format)
+    print_pin_layout(args.model, args.package, args.format, args.directory, args.libxr_config)
 
 
 def cmd_stm32_toolchain(args: argparse.Namespace) -> None:
@@ -626,10 +626,37 @@ def _add_pins(commands) -> None:
         cmd_pins,
         epilog=tr("examples:", "示例：")
         + "\n  libxr pins STM32H723VGT6\n  libxr pins MSPM0G3507SPMR"
-        + "\n  libxr pins MSPM0G3507 --package LQFP-64 --format json",
+        + "\n  libxr pins MSPM0G3507 --package LQFP-64 --format json"
+        + "\n  libxr pins -d path/to/project",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("model", help=tr("chip model", "芯片型号"))
+    parser.add_argument(
+        "model",
+        nargs="?",
+        help=tr(
+            "chip model (default: the one of the project given with -d)",
+            "芯片型号（默认：-d 给出的工程的型号）",
+        ),
+    )
+    parser.add_argument(
+        "-d",
+        "--directory",
+        help=tr(
+            "project directory: overlay the signals it has selected (an STM32CubeMX .ioc, or a "
+            "SysConfig ti_msp_dl_config.h) and their libxr_config.yaml settings",
+            "工程目录：叠加其中已选的信号（STM32CubeMX 的 .ioc 或 SysConfig 的 "
+            "ti_msp_dl_config.h）和它们在 libxr_config.yaml 中的设置",
+        ),
+    )
+    parser.add_argument(
+        "-c",
+        "--libxr-config",
+        help=tr(
+            "libxr_config.yaml to read the settings from (default: User/libxr_config.yaml in "
+            "the project)",
+            "读取设置的 libxr_config.yaml（默认：工程中的 User/libxr_config.yaml）",
+        ),
+    )
     parser.add_argument(
         "-p",
         "--package",

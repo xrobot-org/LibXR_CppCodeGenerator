@@ -393,16 +393,35 @@ def layout_to_dict(layout: PinLayout) -> dict:
     }
 
 
-def print_pin_layout(model: str, package: str | None, output_format: str) -> None:
-    """以 YAML 或 JSON 向标准输出打印型号的引脚布局。
-    Print the pin layout of a model as YAML or JSON to standard output.
+def print_pin_layout(
+    model: str | None,
+    package: str | None,
+    output_format: str,
+    directory: str | None = None,
+    libxr_config: str | None = None,
+) -> None:
+    """以 YAML 或 JSON 向标准输出打印型号的引脚布局；给出 directory 时叠加工程已选的信号。
+    Print the pin layout of a model as YAML or JSON to standard output; with directory, the
+    signals the project has selected are overlaid.
 
-    型号或封装无法识别时记录错误（写到标准错误）并以状态 1 退出；输出不会混入报错。
-    A model or package that is not recognized logs an error, on standard error, and exits with
-    status 1; the output never mixes with the error.
+    型号、封装或工程无法识别时记录错误（写到标准错误）并以状态 1 退出；输出不会混入报错。
+    A model, package or project that is not recognized logs an error, on standard error, and
+    exits with status 1; the output never mixes with the error.
     """
     try:
-        info = layout_to_dict(layout_pins(model, package))
+        if directory is not None:
+            from libxr.pin_project import layout_with_project
+
+            info = layout_with_project(directory, model, package, libxr_config)
+        elif model is None:
+            raise ValueError(
+                tr(
+                    "Give a chip model, or a project directory with -d",
+                    "请给出芯片型号，或用 -d 给出工程目录",
+                )
+            )
+        else:
+            info = layout_to_dict(layout_pins(model, package))
     except ValueError as error:
         logging.error(str(error))
         sys.exit(1)

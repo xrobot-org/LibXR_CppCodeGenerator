@@ -176,6 +176,7 @@ class Options(TestCase):
         setup = {"terminal": "", "commit": "", "git_source": "auto", "git_mirrors": ""}
         toolchain = {"run": "cmd_stm32_toolchain"}
         pins = {"run": "cmd_pins"}
+        pins_default = {"package": None, "format": "yaml", "directory": None, "libxr_config": None}
         for argv, expected in (
             (["parse"], {"directory": ".", "output": None, **quiet, "run": "cmd_parse"}),
             (
@@ -282,11 +283,29 @@ class Options(TestCase):
             ),
             (
                 ["pins", "STM32H723VGT6"],
-                {"model": "STM32H723VGT6", "package": None, "format": "yaml", **quiet, **pins},
+                {**pins_default, "model": "STM32H723VGT6", **quiet, **pins},
             ),
             (
                 ["pins", "MSPM0G3507", "-p", "PM", "-f", "json", "--verbose"],
-                {"model": "MSPM0G3507", "package": "PM", "format": "json", **loud, **pins},
+                {
+                    **pins_default,
+                    "model": "MSPM0G3507",
+                    "package": "PM",
+                    "format": "json",
+                    **loud,
+                    **pins,
+                },
+            ),
+            (
+                ["pins", "-d", "p", "-c", "c.yaml"],
+                {
+                    **pins_default,
+                    "model": None,
+                    "directory": "p",
+                    "libxr_config": "c.yaml",
+                    **quiet,
+                    **pins,
+                },
             ),
             (
                 ["stm32", "toolchain", "gcc"],

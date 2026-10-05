@@ -5,6 +5,7 @@ libxr pins (libxr.pin_layout): the package and pin layout of a model.
 import json
 import re
 import unittest
+from pathlib import Path
 
 import yaml
 from fixtures import TestCase, run_libxr
@@ -303,7 +304,12 @@ class DataFiles(TestCase):
         self.assertEqual(pin_layout.load_stm32_shard.cache_info().currsize, 1)
 
     def test_the_data_files_are_declared_as_package_data(self):
-        project = (pin_layout.DATA.parents[2] / "pyproject.toml").read_text(encoding="utf-8")
+        # CI 在装好的包上运行测试，所以仓库的位置取自测试文件，不取自包。
+        # CI runs the tests on the installed package, so the repository is found from the test
+        # file, not from the package.
+        project = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(
+            encoding="utf-8"
+        )
         self.assertIn('"pin_data/*"', project)
 
 
@@ -340,15 +346,11 @@ class CommandLine(TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(yaml.safe_load(out)["package"], "VQFN-48(RGZ)")
 
-    def test_help_and_wrong_usage(self):
+    def test_help(self):
         code, out, err = self.run_pins("--help")
         self.assertEqual((code, err), (0, ""))
-        usage = "usage: libxr pins [-h] [-p PACKAGE] [-f {yaml,json}] [--verbose] model\n"
-        self.assertTrue(out.startswith(usage), out)
+        self.assertTrue(out.startswith("usage: libxr pins [-h] [-d DIRECTORY]"), out)
         self.assertIn("libxr pins STM32H723VGT6", out)
-        code, out, err = self.run_pins()
-        self.assertEqual((code, out), (2, ""))
-        self.assertTrue(err.startswith(usage), err)
 
     def test_errors_are_logged(self):
         for argv, reason in (

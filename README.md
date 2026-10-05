@@ -674,12 +674,14 @@ pin_count: 64
     # ...
 ```
 
+- `libxr pins -d <工程目录>` 叠加工程已选的信号：STM32 读 CubeMX 的 `.ioc`，MSPM0 读 SysConfig 生成的 `ti_msp_dl_config.h`（型号取自工程，MSPM0 的封装用 `--package` 给出）。输出多一个 `project` 段：`assignments` 是每个引脚选了什么（信号、外设、功能、GPIO 标签），`peripherals` 是每个外设用到的引脚；STM32 的外设还给出它在 `libxr_config.yaml` 中的段和键（如 `USART.usart1`）和当前参数，文件默认为 `User/libxr_config.yaml`，可用 `-c` 指定。
 - STM32 的封装由型号决定（`STM32H723VGT6` 为 LQFP100）；MSPM0 的封装取自型号后缀中的代码（`MSPM0G3507SPMR` 的 `PM`），型号中没有时用 `--package` 给出（`LQFP-64`、`PM` 或 `LQFP-64(PM)`）。
 - `pin_count` 是封装上的位置数。一个位置可以有多个条目：STM32G0 的 PA9 和 PA11 可以互换，共用一个位置。
 - `peripherals` 列出从信号名识别出的全部外设和每个功能可选的引脚（`USART1` 的 `TX` 可以接 `PA9`、`PB6`、`PB14`）。识别只看信号名，ETH、FMC、OctoSPI 这些 LibXR 没有对应抽象的外设也会列出。普通 GPIO 按端口列出（`GPIOA` 的 `P9` 是 `PA9`）；STM32 的外部中断列为 `EXTI`，`LINE9` 可以来自任一端口的第 9 脚，STM32 的引脚另有 `gpio_modes`（Input、Output、Analog、EXTI 等）；有输出通道的定时器带 `capabilities: [pwm]`。TI 的器件数据没有中断信息，所以 MSPM0 不列 `EXTI`。
 - MSPM0 的引脚还有 `iomux_pincm` 和每个信号的模式号 `modes`。
 - 数据来自厂商：STM32 来自 ST 的 [STM32_open_pin_data](https://github.com/STMicroelectronics/STM32_open_pin_data)（BSD-3-Clause），MSPM0 来自 TI SysConfig 的器件数据（TI 有限许可，只可用于 TI 器件）。数据文件和两份许可证文本在 `src/libxr/pin_data/`，随包分发；用 `scripts/build_pin_data.py` 重新生成。
 
+- `libxr pins -d <project directory>` overlays the signals a project has selected: the CubeMX `.ioc` for an STM32, the `ti_msp_dl_config.h` SysConfig generates for an MSPM0 (the model comes from the project; give the package of an MSPM0 with `--package`). The output gets a `project` section: `assignments` is what each pin selected (signal, peripheral, function, GPIO label) and `peripherals` the pins each peripheral uses; an STM32 peripheral also gets its section and key in `libxr_config.yaml` (such as `USART.usart1`) and its current parameters, from `User/libxr_config.yaml` by default or the file given with `-c`.
 - The package of an STM32 is part of the model (`STM32H723VGT6` is LQFP100); that of an MSPM0 comes from the code in the model suffix (`PM` of `MSPM0G3507SPMR`), or from `--package` when the model has none (`LQFP-64`, `PM` or `LQFP-64(PM)`).
 - `pin_count` is the number of positions on the package. A position can have several entries: PA9 and PA11 of an STM32G0 can be swapped and share one position.
 - `peripherals` lists every peripheral recognized from the signal names, with the pins that can carry each function (`TX` of `USART1` can use `PA9`, `PB6` or `PB14`). Recognition looks at the signal names only, so peripherals LibXR has no abstraction for, such as ETH, FMC and OctoSPI, are listed too. Plain GPIO is listed by port (`P9` of `GPIOA` is `PA9`); the external interrupts of an STM32 are listed as `EXTI`, where `LINE9` can come from pin 9 of any port, and an STM32 pin also has `gpio_modes` (Input, Output, Analog, EXTI, ...); a timer with output channels carries `capabilities: [pwm]`. TI's device data has no interrupt information, so an MSPM0 lists no `EXTI`.
