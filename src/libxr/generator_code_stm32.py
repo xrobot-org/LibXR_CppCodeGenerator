@@ -1102,7 +1102,8 @@ def _usb_settings(instance: str) -> tuple[str, dict] | None:
 
     enable 的默认值由 _default_usb_enables() 先行写入，仍然缺少时为 false；未启用的实例不再补其他
     设置。已启用的实例按固定顺序补上缺少的设置：包大小、缓冲区和 FIFO 大小、dma_section、cdc 列表
-    （每路 CDC 一项，含 tx_fifo_size、rx_fifo_size 和 queue_size，默认一路），以及描述符（默认
+    （每路 CDC 一项，含 tx_fifo_size、rx_fifo_size、queue_size 和可选的 interface，默认一路），
+    以及描述符（默认
     1d50:6199 / 0x0100 / "XRUSB-DEMO-"，1d50:6199 的分配记录见
     https://github.com/openmoko/openmoko-usb-oui/commit/27f3846d77e0d0d10271b809b831f70040c6197a）。
     旧版的 cdc_tx_fifo_size、cdc_rx_fifo_size 和 cdc_queue_size 转换为 cdc 的一项，并在原来的位置
@@ -1111,7 +1112,8 @@ def _usb_settings(instance: str) -> tuple[str, dict] | None:
     _default_usb_enables() writes the default enable first; when it is still missing it is
     false, and a disabled instance gets no other setting. An enabled instance gets its missing
     settings in a fixed order: packet size, buffer and FIFO sizes, dma_section, the cdc list (one
-    item per CDC with tx_fifo_size, rx_fifo_size and queue_size, one CDC by default), and the
+    item per CDC with tx_fifo_size, rx_fifo_size, queue_size and an optional interface, one CDC
+    by default), and the
     descriptor (default 1d50:6199 / 0x0100 / "XRUSB-DEMO-"; see the link above for the
     allocation of 1d50:6199). The earlier cdc_tx_fifo_size, cdc_rx_fifo_size and
     cdc_queue_size become one item of cdc, written back where they were. An ep0_packet_size
@@ -1258,6 +1260,9 @@ def _check_cdc(prefix: str, cfg: dict, is_otg: bool) -> None:
     Check the cdc list and give each item its defaults: a non-empty list whose items are
     mappings with positive integer values.
 
+    可选的 interface 是字符串，不补默认值。
+    The optional interface is a string and gets no default.
+
     CDC 的路数不得超过端点号 EP1 到 EP15 能容纳的路数；OTG 设备的接收 FIFO 为 EP0 和每路 CDC 的
     OUT 端点各留 64 字节。
     The number of CDCs may not exceed what the endpoint numbers EP1 to EP15 hold; the receive
@@ -1280,6 +1285,8 @@ def _check_cdc(prefix: str, cfg: dict, is_otg: bool) -> None:
             raise _invalid_setting(f"{key}[{index}]", item, "a mapping", "映射")
         for name, default in _CDC_DEFAULTS.items():
             _integer(f"{key}[{index}].{name}", item.setdefault(name, default))
+        if "interface" in item:
+            item["interface"] = _text(f"{key}[{index}].interface", item["interface"])
     if len(cdc) > _MAX_CDC:
         raise LibXRConfigError(
             tr(
@@ -1486,13 +1493,16 @@ def _usb_buffer_plan(is_otg: bool, cdc_count: int, ep0: int, tx: int, rx: int) -
 
 
 def _cdc_items(cfg: dict) -> list[dict]:
-    """USB 设备的 CDC 串口设置列表：每个 CDC 一个映射，含 tx_fifo_size、rx_fifo_size 和
-    queue_size，均为整数。
-    The list of CDC serial port settings of a USB device: one mapping per CDC with
-    tx_fifo_size, rx_fifo_size and queue_size, all integers.
+    """USB 设备的 CDC 串口设置列表：每个 CDC 一个映射，含整数 tx_fifo_size、rx_fifo_size 和
+    queue_size，以及接口名 interface（未设置时为空字符串）。
+    The list of CDC serial port settings of a USB device: one mapping per CDC with the integers
+    tx_fifo_size, rx_fifo_size and queue_size and the interface name interface (an empty string
+    when it is not set).
     """
     return [
-        {name: _integer(f"cdc.{name}", item[name]) for name in _CDC_DEFAULTS} for item in cfg["cdc"]
+        {name: _integer(f"cdc.{name}", item[name]) for name in _CDC_DEFAULTS}
+        | {"interface": _text("cdc.interface", item.get("interface"))}
+        for item in cfg["cdc"]
     ]
 
 
@@ -2163,6 +2173,11 @@ class PeripheralFactory:
             cdc_names.append(cdc_name)
             data_in = 2 * index + 1
             data_out = index + 1 if is_otg else data_in
+            # 设置了 interface 时它同时作为控制接口和数据接口的名字；主机按它区分 VID:PID 相同的
+            # 各路 CDC。
+            # A set interface names both the control and the data interface; the host tells the
+            # CDCs that share VID:PID apart by it.
+            interface = cdc["interface"].replace('"', '\\"')
             lines += layout(
                 f"static USB::CDCUart {cdc_name}",
                 [
@@ -2172,7 +2187,8 @@ class PeripheralFactory:
                     str(cdc["rx_fifo_size"]),
                     str(cdc["tx_fifo_size"]),
                     str(cdc["queue_size"]),
-                ],
+                ]
+                + ([f'"{interface}"'] * 2 if interface else []),
             )
 
         def buffer(suffix: str) -> "str | Braces":
