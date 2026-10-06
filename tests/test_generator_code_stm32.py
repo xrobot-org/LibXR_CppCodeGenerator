@@ -476,6 +476,42 @@ class PeripheralObjects(GeneratorTestCase):
         self.assertIn("USB::Endpoint::EPNumber::EP2, 64, 256, 2);", code)
         self.assertIn("USB::Endpoint::EPNumber::EP4, 128, 128, 7);", code)
 
+    def test_a_cdc_interface_names_its_control_and_data_interfaces(self):
+        # interface 接在队列容量之后，作为 CDCUart 的控制接口名和数据接口名；未设置的 CDC
+        # 使用 LibXR 的默认名，不写 interface 键。
+        # interface follows the queue sizes as the control and data interface names of
+        # CDCUart; a CDC without it keeps the LibXR default names, and no interface key is
+        # written for it.
+        project = self.usb_otg_hs(cdc=[{"interface": 'Port "A"'}, {}])
+        code = self.generate(project)
+        self.assertIn(
+            "  static USB::CDCUart usb_otg_hs_cdc(\n"
+            "      USB::Endpoint::EPNumber::EP1, USB::Endpoint::EPNumber::EP1,\n"
+            '      USB::Endpoint::EPNumber::EP2, 128, 128, 3, "Port \\"A\\"", "Port \\"A\\"");\n'
+            "  static USB::CDCUart usb_otg_hs_cdc2(USB::Endpoint::EPNumber::EP3,\n"
+            "                                      USB::Endpoint::EPNumber::EP2,\n"
+            "                                      USB::Endpoint::EPNumber::EP4, 128, 128, 3);\n",
+            code,
+        )
+        self.assertEqual(
+            generator.libxr_settings["USB"]["usb_otg_hs"]["cdc"],
+            [
+                {
+                    "interface": 'Port "A"',
+                    "tx_fifo_size": 128,
+                    "rx_fifo_size": 128,
+                    "queue_size": 3,
+                },
+                {"tx_fifo_size": 128, "rx_fifo_size": 128, "queue_size": 3},
+            ],
+        )
+
+    def test_a_cdc_interface_must_be_a_string(self):
+        project = self.usb_otg_hs(cdc=[{"interface": 7}])
+        with self.assertRaises(LibXRConfigError) as raised:
+            self.generate(project)
+        self.assertIn("USB.usb_otg_hs.cdc[0].interface", str(raised.exception))
+
     def test_on_fsdev_each_cdc_has_a_data_endpoint_and_a_notification_endpoint(
         self,
     ):
