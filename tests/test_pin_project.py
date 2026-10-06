@@ -485,10 +485,10 @@ SYSCFG = textwrap.dedent("""\
 
 
 class HpmProjects(TestCase):
-    """HPM 工程：SoC 和封装取自 boards/ 下的 .hpmpc，已选信号取 main.cpp 无条件调用的 pinmux
+    """HPM 工程：SoC 和封装取自 boards/ 下的 .hpmpc，已选信号取根目录 main.c 无条件调用的 pinmux
     函数。
     An HPM project: the SoC and the package come from the .hpmpc under boards/, and the selected
-    signals from the pinmux functions main.cpp calls without a condition.
+    signals from the pinmux functions the root main.c calls without a condition.
     """
 
     HPMPC = json.dumps(
@@ -548,7 +548,7 @@ class HpmProjects(TestCase):
         return {
             "app.yaml": "dependency: []\n",
             "boards/board/tool_config.hpmpc": self.HPMPC,
-            "User/main.cpp": main,
+            "main.c": main,
         }
 
     def test_the_soc_the_package_and_the_called_functions_drive_the_overlay(self):
@@ -570,10 +570,8 @@ class HpmProjects(TestCase):
         # O2: a function inside a conditional does not count; PA04 stays out.
         self.assertNotIn("PA04", self.project(self.project_files())["project"]["assignments"])
 
-    def test_without_a_main_cpp_the_bsp_function_is_the_fallback(self):
-        files = {
-            key: value for key, value in self.project_files().items() if key != "User/main.cpp"
-        }
+    def test_without_a_main_c_the_bsp_function_is_the_fallback(self):
+        files = {key: value for key, value in self.project_files().items() if key != "main.c"}
         assignments = self.project(files)["project"]["assignments"]
         self.assertEqual(assignments["PA03"]["signal"], "I2C0_SCL")
         self.assertNotIn("PA01", assignments)

@@ -4,12 +4,12 @@ peripheral settings of libxr_config.yaml.
 
 STM32 的已选信号来自 CubeMX 的 .ioc（Pxn.Signal），MSPM0 的来自根目录 SysConfig 工程
 （.syscfg）的 $assign 行（求解器选的 $suggestSolution 作兜底），HPM 的来自 boards/ 下 .hpmpc
-里 main.cpp 调用的 pinmux 函数。信号按布局中该引脚的可选信号核对；核对不上的原样给出，
+里 main.c 调用的 pinmux 函数。信号按布局中该引脚的可选信号核对；核对不上的原样给出，
 matched 为 false。
 The selected signals of an STM32 come from the CubeMX .ioc (Pxn.Signal), those of an MSPM0 from
 the $assign lines of a SysConfig project (.syscfg) in the root (the solver's $suggestSolution
 as the fallback), and those of an HPM from the pinmux functions of the .hpmpc under boards/
-that main.cpp calls. A signal is checked against the selectable signals of its pin in the
+that the root main.c calls. A signal is checked against the selectable signals of its pin in the
 layout; one that does not match is given as it is, with matched false.
 """
 
@@ -473,18 +473,18 @@ HPM_DIRECTIVE = re.compile(r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b")
 HPM_CALL = re.compile(r"^\s*(\w+)\(\);\s*$")
 
 
-def hpm_active_functions(main_cpp: Path, functions: dict) -> list[str]:
-    """main.cpp 在预处理条件外调用的、.hpmpc 里存在的 pinmux 函数；main.cpp 不存在或没有调用
+def hpm_active_functions(main_c: Path, functions: dict) -> list[str]:
+    """main.c 在预处理条件外调用的、.hpmpc 里存在的 pinmux 函数；main.c 不存在或没有调用
     时退回 init_bsp_pins。条件编译里的调用不算（rmcs 的 JTAG 共用引脚在 #if 里，O2 的决定）。
-    The pinmux functions of the .hpmpc that main.cpp calls outside preprocessor conditions; the
-    fallback is init_bsp_pins when main.cpp does not exist or calls none. A call inside a
+    The pinmux functions of the .hpmpc that the root main.c calls outside preprocessor conditions; the
+    fallback is init_bsp_pins when main.c does not exist or calls none. A call inside a
     conditional does not count (rmcs' JTAG shared pins sit in an #if, the decision of O2).
     """
-    if not main_cpp.is_file():
+    if not main_c.is_file():
         return ["init_bsp_pins"] if "init_bsp_pins" in functions else []
     active: list[str] = []
     depth = 0
-    for line in main_cpp.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in main_c.read_text(encoding="utf-8", errors="replace").splitlines():
         directive = HPM_DIRECTIVE.match(line)
         if directive:
             if directive.group(1) in ("if", "ifdef", "ifndef"):
@@ -500,9 +500,9 @@ def hpm_active_functions(main_cpp: Path, functions: dict) -> list[str]:
     return active
 
 
-def hpm_assignments(hpmpc: Path, main_cpp: Path, layout: PinLayout) -> dict[str, dict]:
-    """.hpmpc 里 main.cpp 调用的 pinmux 函数的已选信号：引脚名 -> 信号及其识别结果。
-    The selected signals of the pinmux functions of the .hpmpc that main.cpp calls: pin name ->
+def hpm_assignments(hpmpc: Path, main_c: Path, layout: PinLayout) -> dict[str, dict]:
+    """.hpmpc 里 main.c 调用的 pinmux 函数的已选信号：引脚名 -> 信号及其识别结果。
+    The selected signals of the pinmux functions of the .hpmpc that the root main.c calls: pin name ->
     signal and what it was recognized as.
 
     信号是工具的三段式（UART0.A.TXD），化成 hpm_iomux.h 的宏名（UART0_TXD）后按引脚的信号表
@@ -514,7 +514,7 @@ def hpm_assignments(hpmpc: Path, main_cpp: Path, layout: PinLayout) -> dict[str,
     functions = json.loads(hpmpc.read_text(encoding="utf-8"))["content"]["pinmux"]["functions"]
     by_name = {pin.name: pin for pin in layout.pins}
     assigned: dict[str, dict] = {}
-    for function in hpm_active_functions(main_cpp, functions):
+    for function in hpm_active_functions(main_c, functions):
         for pad, selection in functions[function].get("selectPins", {}).items():
             pin = by_name.get(pad)
             if pin is None or not selection.get("signal"):
@@ -634,10 +634,10 @@ def layout_with_project(
                     f"{root}：boards/ 下有多个 .hpmpc；请只保留一个",
                 )
             )
-        # HPM 的工程：SoC 和封装在 .hpmpc 的 info 里，已选信号取 main.cpp 无条件调用的 pinmux
+        # HPM 的工程：SoC 和封装在 .hpmpc 的 info 里，已选信号取 main.c 无条件调用的 pinmux
         # 函数（O2：条件编译里的不算）。
         # An HPM project: the SoC and the package are in the info of the .hpmpc, and the selected
-        # signals come from the pinmux functions main.cpp calls without a condition (O2: a call
+        # signals come from the pinmux functions main.c calls without a condition (O2: a call
         # inside a conditional does not count).
         info = json.loads(hpmpcs[0].read_text(encoding="utf-8"))["content"]["info"]
         soc = model or info.get("socName")
@@ -649,7 +649,7 @@ def layout_with_project(
                 )
             )
         layout = pin_layout.layout_pins(soc, package or info.get("packageName"))
-        assigned = hpm_assignments(hpmpcs[0], root / "User" / "main.cpp", layout)
+        assigned = hpm_assignments(hpmpcs[0], root / "main.c", layout)
         source = hpmpcs[0].relative_to(root).as_posix()
         # sysconfig_file 对 HPM 是 .hpmpc 本身：外设配置就住在里面。
         # sysconfig_file is the .hpmpc itself for an HPM: the peripheral configuration lives in
