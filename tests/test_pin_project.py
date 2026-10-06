@@ -14,20 +14,6 @@ from fixtures import IOC, TestCase, run_libxr
 from libxr import pin_layout, pin_project
 from libxr.pin_project import layout_with_project
 
-# 一个 MSPM0G3507 工程的 ti_msp_dl_config.h 片段：UART0 的两个引脚和一个 GPIO 组。
-# An excerpt of the ti_msp_dl_config.h of an MSPM0G3507 project: two pins of UART0 and a GPIO
-# group.
-TI_HEADER = textwrap.dedent("""\
-    #define CONFIG_LP_MSPM0G3507
-    #define CONFIG_MSPM0G3507
-    #define GPIO_UART_0_IOMUX_RX                                      (IOMUX_PINCM2)
-    #define GPIO_UART_0_IOMUX_TX                                      (IOMUX_PINCM1)
-    #define GPIO_UART_0_IOMUX_RX_FUNC                       IOMUX_PINCM2_PF_UART0_RX
-    #define GPIO_UART_0_IOMUX_TX_FUNC                       IOMUX_PINCM1_PF_UART0_TX
-    #define GPIO_GRP_0_PORT                                                  (GPIOB)
-    #define GPIO_GRP_0_PIN_0_IOMUX                                   (IOMUX_PINCM50)
-""")
-
 CONFIG = textwrap.dedent("""\
     USART:
       usart1:
@@ -223,84 +209,18 @@ class CubeMxSpellings(TestCase):
         self.assertEqual(found["PH0-OSC_IN"]["peripheral"], "RCC")
 
 
-class Mspm0Projects(TestCase):
-    """MSPM0 工程：已选信号取自 SysConfig 生成的 ti_msp_dl_config.h。
-    An MSPM0 project: the selected signals come from the ti_msp_dl_config.h SysConfig
-    generates.
-    """
-
-    def overlay(self, package="PM", header=TI_HEADER):
-        """这个头文件的叠加结果。
-        The overlay of this header.
-        """
-        with tempfile.TemporaryDirectory() as directory:
-            write(Path(directory), "sysconfig/ti_msp_dl_config.h", header)
-            return layout_with_project(directory, None, package, None)
-
-    def test_the_device_and_the_pins_come_from_the_header(self):
-        info = self.overlay()
-        self.assertEqual((info["part"], info["package"]), ("MSPM0G3507", "LQFP-64(PM)"))
-        self.assertEqual(info["project"]["source"], "sysconfig/ti_msp_dl_config.h")
-        assignments = info["project"]["assignments"]
-        self.assertEqual(
-            assignments["PA0"],
-            {
-                "signal": "UART0.TX",
-                "peripheral": "UART0",
-                "kind": "UART",
-                "function": "TX",
-                "matched": True,
-            },
-        )
-        self.assertEqual(assignments["PA1"]["signal"], "UART0.RX")
-        self.assertEqual(
-            info["project"]["peripherals"]["UART0"]["pins"], {"TX": "PA0", "RX": "PA1"}
-        )
-
-    def test_a_gpio_is_named_by_its_label(self):
-        gpio = self.overlay()["project"]["assignments"]["PB22"]
-        self.assertEqual(
-            (gpio["peripheral"], gpio["function"], gpio["label"]),
-            ("GPIOB", "P22", "GPIO_GRP_0_PIN_0"),
-        )
-
-    def test_libxr_gen_has_no_section_for_an_mspm0(self):
-        peripherals = self.overlay()["project"]["peripherals"]
-        self.assertNotIn("config", peripherals["UART0"])
-
-    def test_the_package_is_asked_for(self):
-        with self.assertRaises(ValueError) as caught:
-            self.overlay(package=None)
-        self.assertTrue(
-            str(caught.exception).startswith("Cannot tell the package of MSPM0G3507"),
-            str(caught.exception),
-        )
-
-    def test_a_header_without_the_device_is_an_error(self):
-        with self.assertRaises(ValueError) as caught:
-            self.overlay(header="#define SOMETHING\n")
-        self.assertTrue(
-            str(caught.exception).endswith(
-                "does not name the MSPM0 device (no CONFIG_MSPM0... line)"
-            ),
-            str(caught.exception),
-        )
-
-
 class SyscfgPackage(TestCase):
     """MSPM0 的封装取自 SysConfig 工程的 .syscfg：--package，或 --board 对应的 LaunchPad。
     The package of an MSPM0 comes from the .syscfg of the SysConfig project: its --package, or the
     LaunchPad its --board names.
     """
 
-    def package(self, syscfg: str | None, option=None, header_folder="sysconfig", syscfg_path=None):
-        """给出的 .syscfg 内容下，叠加结果里的封装（syscfg 为 None 时没有 .syscfg）。
-        The package in the overlay for this .syscfg content (no .syscfg when it is None).
+    def package(self, syscfg: str, option=None):
+        """给出的根目录 .syscfg 内容下，叠加结果里的封装。
+        The package in the overlay for this root .syscfg content.
         """
         with tempfile.TemporaryDirectory() as directory:
-            write(Path(directory), f"{header_folder}/ti_msp_dl_config.h", TI_HEADER)
-            if syscfg is not None:
-                write(Path(directory), syscfg_path or "sysconfig/project.syscfg", syscfg)
+            write(Path(directory), "a.syscfg", syscfg)
             return layout_with_project(directory, None, option, None)["package"]
 
     def test_a_device_based_project_names_its_package(self):
@@ -330,23 +250,23 @@ class SyscfgPackage(TestCase):
         text = '//@cliArgs --device "MSPM0G350X" --package "LQFP-64(PM)"\n'
         self.assertEqual(self.package(text, option="VQFN-48"), "VQFN-48(RGZ)")
 
-    def test_the_syscfg_may_sit_in_the_root_while_the_header_is_in_a_build_output(self):
-        # CCS 的工程：.syscfg 在根目录，生成的头文件在 Debug/syscfg/。
-        # A CCS project: the .syscfg in the root, the generated header in Debug/syscfg/.
-        text = '//@cliArgs --device "MSPM0G350X" --package "LQFP-48(PT)"\n'
-        self.assertEqual(
-            self.package(text, header_folder="Debug/syscfg", syscfg_path="empty.syscfg"),
-            "LQFP-48(PT)",
+    def test_without_a_package_the_error_asks_for_one(self):
+        with self.assertRaises(ValueError) as caught:
+            self.package('//@cliArgs --device "MSPM0G3507"\n')
+        self.assertTrue(
+            str(caught.exception).startswith("Cannot tell the package of MSPM0G3507"),
+            str(caught.exception),
         )
 
-    def test_without_a_package_the_error_asks_for_one(self):
-        for text in (None, "// nothing here\n", "// @cliArgs --board /ti/boards/LP_UNKNOWN\n"):
-            with self.subTest(text=text), self.assertRaises(ValueError) as caught:
-                self.package(text)
-            self.assertTrue(
-                str(caught.exception).startswith("Cannot tell the package of MSPM0G3507"),
-                str(caught.exception),
-            )
+    def test_a_syscfg_without_a_device_or_a_known_board_needs_the_model(self):
+        # 板子不在表里，器件也就无从得知。
+        # The board is not in the table, so the device cannot be known either.
+        with self.assertRaises(ValueError) as caught:
+            self.package("// @cliArgs --board /ti/boards/LP_UNKNOWN\n")
+        self.assertTrue(
+            str(caught.exception).endswith("does not name a device; give the model"),
+            str(caught.exception),
+        )
 
     def test_the_board_table_has_the_launchpads_with_their_devices(self):
         boards = pin_project.load_boards()
@@ -362,6 +282,172 @@ class SyscfgPackage(TestCase):
         self.assertIn("Redistribution and use in source and binary forms", text)
         source = json.loads((pin_layout.DATA / "mspm0_boards.json").read_text(encoding="utf-8"))
         self.assertRegex(source["source"]["commit"], r"^[0-9a-f]{40}$")
+
+
+class SyscfgProjects(TestCase):
+    """MSPM0 工程：根目录的 .syscfg 直接给出器件、封装和已选信号，不需要跑 SysConfig。
+    An MSPM0 project: a root .syscfg gives the device, the package and the selected signals
+    directly; SysConfig does not have to run.
+    """
+
+    PROJECT = textwrap.dedent("""\
+        //@cliArgs --device "MSPM0G350X" --part "Default" --package "LQFP-64(PM)"
+        //@v2CliArgs --device "MSPM0G3507" --package "LQFP-64(PM)"
+        
+        const Board  = scripting.addModule("/ti/driverlib/Board", {}, false);
+        Board.peripheral.$assign          = "DEBUGSS";
+        Board.peripheral.swdioPin.$assign = "PA19";
+        
+        const pinFunction1                       = system.clockTree["HFXT"];
+        pinFunction1.peripheral.hfxInPin.$assign = "PA5";
+        
+        const GPIO  = scripting.addModule("/ti/driverlib/GPIO", {}, false);
+        const GPIO1 = GPIO.addInstance();
+        GPIO1.$name                         = "GPIO_KEYS";
+        GPIO1.associatedPins.create(1);
+        GPIO1.associatedPins[0].$name       = "PIN_KEY1";
+        GPIO1.associatedPins[0].pin.$assign = "PB22";
+        
+        const UART  = scripting.addModule("/ti/driverlib/UART", {}, false);
+        const UART1 = UART.addInstance();
+        UART1.$name                         = "UART_0";
+        UART1.peripheral.$assign            = "UART0";
+        UART1.peripheral.txPin.$assign      = "PA0";
+        UART1.peripheral.rxPin.$assign      = "PA1";
+        
+        const DAC12 = scripting.addModule("/ti/driverlib/DAC12");
+        DAC12.peripheral.$assign        = "DAC0";
+        DAC12.peripheral.OutPin.$assign = "PA15";
+        """)
+
+    def project(self, syscfg=PROJECT, model=None):
+        """这个根目录 .syscfg 的叠加结果。
+        The overlay of this root .syscfg.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            write(Path(directory), "a.syscfg", syscfg)
+            return layout_with_project(directory, model, None, None)
+
+    def test_the_device_the_package_and_the_assignments_come_from_the_syscfg(self):
+        info = self.project()
+        self.assertEqual((info["part"], info["package"]), ("MSPM0G3507", "LQFP-64(PM)"))
+        self.assertEqual(info["project"]["source"], "a.syscfg")
+        assignments = info["project"]["assignments"]
+        self.assertEqual(assignments["PA0"]["signal"], "UART0.TX")
+        self.assertTrue(assignments["PA0"]["matched"])
+        self.assertEqual(assignments["PA1"]["signal"], "UART0.RX")
+        gpio = assignments["PB22"]
+        self.assertEqual(
+            (gpio["peripheral"], gpio["function"], gpio["label"]),
+            ("GPIOB", "P22", "PIN_KEY1"),
+        )
+
+    def test_a_singleton_module_is_its_own_instance(self):
+        # DAC12 没有 addInstance，直接配在模块变量上。
+        # DAC12 has no addInstance; the module variable is configured directly.
+        self.assertEqual(self.project()["project"]["assignments"]["PA15"]["signal"], "DAC0.OUT")
+
+    def test_the_swd_pins_of_the_board_are_shown(self):
+        self.assertEqual(self.project()["project"]["assignments"]["PA19"]["peripheral"], "DEBUGSS")
+
+    def test_the_pins_of_the_clock_tree_are_left_out(self):
+        self.assertNotIn("PA5", self.project()["project"]["assignments"])
+
+    def test_a_canfd_member_matches_by_its_suffix(self):
+        # TI 的功能名是 CANRX、CANTX，成员名是 rxPin、txPin。
+        # TI names the functions CANRX and CANTX; the members are rxPin and txPin.
+        syscfg = (
+            '//@v2CliArgs --device "MSPM0G3507" --package "LQFP-64(PM)"\n'
+            'const MCAN  = scripting.addModule("/ti/driverlib/MCAN", {}, false);\n'
+            "const MCAN1 = MCAN.addInstance();\n"
+            'MCAN1.peripheral.$assign       = "CANFD0";\n'
+            'MCAN1.peripheral.rxPin.$assign = "PA13";\n'
+            'MCAN1.peripheral.txPin.$assign = "PA12";\n'
+        )
+        assignments = self.project(syscfg)["project"]["assignments"]
+        self.assertEqual(assignments["PA13"]["signal"], "CANFD0.CANRX")
+        self.assertEqual(assignments["PA12"]["signal"], "CANFD0.CANTX")
+
+    def test_a_member_the_pin_does_not_have_is_given_as_it_is(self):
+        syscfg = (
+            '//@v2CliArgs --device "MSPM0G3507" --package "LQFP-64(PM)"\n'
+            'const UART  = scripting.addModule("/ti/driverlib/UART", {}, false);\n'
+            "const UART1 = UART.addInstance();\n"
+            'UART1.peripheral.$assign       = "UART9";\n'
+            'UART1.peripheral.rxPin.$assign = "PA0";\n'
+        )
+        found = self.project(syscfg)["project"]["assignments"]["PA0"]
+        self.assertEqual((found["signal"], found["matched"]), ("UART9.RX", False))
+
+    def test_the_suggested_peripheral_is_used_without_an_assignment(self):
+        syscfg = (
+            '//@v2CliArgs --device "MSPM0G3507" --package "LQFP-64(PM)"\n'
+            'const UART  = scripting.addModule("/ti/driverlib/UART", {}, false);\n'
+            "const UART1 = UART.addInstance();\n"
+            'UART1.peripheral.$suggestSolution = "UART0";\n'
+            'UART1.peripheral.txPin.$assign    = "PA0";\n'
+        )
+        found = self.project(syscfg)["project"]["assignments"]["PA0"]
+        self.assertEqual(found["peripheral"], "UART0")
+
+    def test_dma_channels_are_not_pins(self):
+        syscfg = self.PROJECT + 'UART1.DMA_CHANNEL_TX.peripheral.$assign = "DMA_CH3";\n'
+        peripherals = self.project(syscfg)["project"]["peripherals"]
+        self.assertNotIn("DMA_CH3", peripherals)
+
+    def test_two_syscfg_files_in_the_root_are_an_error(self):
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(ValueError) as caught:
+            write(Path(directory), "a.syscfg", '//@cliArgs --device "MSPM0G3507"\n')
+            write(Path(directory), "b.syscfg", '//@cliArgs --device "MSPM0G3507"\n')
+            layout_with_project(directory, None, None, None)
+        self.assertTrue(
+            str(caught.exception).endswith("several .syscfg files in the root; keep one"),
+            str(caught.exception),
+        )
+
+    def test_a_syscfg_without_a_device_needs_the_model(self):
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(ValueError) as caught:
+            write(Path(directory), "a.syscfg", '// @cliArgs --package "LQFP-64(PM)"\n')
+            layout_with_project(directory, None, None, None)
+        self.assertTrue(
+            str(caught.exception).endswith("does not name a device; give the model"),
+            str(caught.exception),
+        )
+        info = self.project('//@cliArgs --package "LQFP-64(PM)"\n', model="MSPM0G3507")
+        self.assertEqual(info["part"], "MSPM0G3507")
+
+    def test_libxr_gen_has_no_section_for_an_mspm0(self):
+        peripherals = self.project()["project"]["peripherals"]
+        self.assertNotIn("config", peripherals["UART0"])
+
+    def test_the_pins_the_solver_picked_are_a_fallback(self):
+        # 求解器选的引脚（$suggestSolution）也算数；测试用的 PA0 是 UART0.TX。
+        # The pins the solver picked ($suggestSolution) count; PA0 is UART0.TX in the layout.
+        syscfg = (
+            '//@v2CliArgs --device "MSPM0G3507" --package "LQFP-64(PM)"\n'
+            'const UART  = scripting.addModule("/ti/driverlib/UART", {}, false);\n'
+            "const UART1 = UART.addInstance();\n"
+            'UART1.peripheral.$assign = "UART0";\n'
+            'UART1.peripheral.txPin.$suggestSolution = "PA0";\n'
+        )
+        self.assertEqual(
+            self.project(syscfg)["project"]["assignments"]["PA0"]["signal"], "UART0.TX"
+        )
+
+    def test_an_assignment_wins_over_the_suggestion(self):
+        # 同一个成员既有 $assign 又有 $suggestSolution 时，$assign 赢（PA0 被换成 PA28）。
+        # When a member has both $assign and $suggestSolution, $assign wins (PA0 becomes PA28).
+        syscfg = (
+            '//@v2CliArgs --device "MSPM0G3507" --package "LQFP-64(PM)"\n'
+            'const UART  = scripting.addModule("/ti/driverlib/UART", {}, false);\n'
+            "const UART1 = UART.addInstance();\n"
+            'UART1.peripheral.$assign = "UART0";\n'
+            'UART1.peripheral.txPin.$suggestSolution = "PA0";\n'
+            'UART1.peripheral.txPin.$assign = "PA28";\n'
+        )
+        assignments = self.project(syscfg)["project"]["assignments"]
+        self.assertEqual(assignments["PA28"]["signal"], "UART0.TX")
+        self.assertNotIn("PA0", assignments)
 
 
 SYSCFG = textwrap.dedent("""\
@@ -396,6 +482,123 @@ SYSCFG = textwrap.dedent("""\
     SYSCTL.powerPolicy = "STANDBY0";
     // UART1.targetBaudRate = 9600;
 """)
+
+
+class HpmProjects(TestCase):
+    """HPM 工程：SoC 和封装取自 boards/ 下的 .hpmpc，已选信号取 main.cpp 无条件调用的 pinmux
+    函数。
+    An HPM project: the SoC and the package come from the .hpmpc under boards/, and the selected
+    signals from the pinmux functions main.cpp calls without a condition.
+    """
+
+    HPMPC = json.dumps(
+        {
+            "content": {
+                "info": {"socName": "HPM5301", "packageName": "QFN48"},
+                "pinmux": {
+                    "functions": {
+                        "init_bsp_pins": {
+                            "selectPins": {
+                                "PA00": {"signal": "UART0.A.TXD", "padCtls": {}},
+                                "PA03": {"signal": "I2C0.A.SCL", "padCtls": {}},
+                                "PA10": {"signal": "GPIO.A.A[10]", "padCtls": {}},
+                            }
+                        },
+                        "init_uart0_pins": {
+                            "selectPins": {
+                                "PA00": {"signal": "UART0.A.TXD", "padCtls": {}},
+                                "PA01": {"signal": "UART0.A.RXD", "padCtls": {}},
+                            }
+                        },
+                        "init_jtag_pins": {
+                            "selectPins": {"PA04": {"signal": "GPIO.A.A[04]", "padCtls": {}}}
+                        },
+                    }
+                },
+            }
+        }
+    )
+    MAIN = textwrap.dedent(
+        """\
+        int main()
+        {
+          board_init();
+          init_bsp_pins();
+          init_uart0_pins();
+        #if !RMCS_KEEP_JTAG
+          init_jtag_pins();
+        #endif
+        }
+        """
+    )
+
+    def project(self, files):
+        """给定文件的 HPM 工程的叠加结果。
+        The overlay of an HPM project with these files.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            for name, text in files.items():
+                write(Path(directory), name, text)
+            return layout_with_project(directory, None, None, None)
+
+    def project_files(self, main=MAIN):
+        """一个最小 HPM 工程的文件。
+        The files of a minimal HPM project.
+        """
+        return {
+            "app.yaml": "dependency: []\n",
+            "boards/board/tool_config.hpmpc": self.HPMPC,
+            "User/main.cpp": main,
+        }
+
+    def test_the_soc_the_package_and_the_called_functions_drive_the_overlay(self):
+        info = self.project(self.project_files())
+        self.assertEqual((info["part"], info["package"]), ("HPM5301", "QFN48"))
+        self.assertEqual(info["project"]["source"], "boards/board/tool_config.hpmpc")
+        assignments = info["project"]["assignments"]
+        self.assertEqual(assignments["PA00"]["signal"], "UART0_TXD")
+        self.assertTrue(assignments["PA00"]["matched"])
+        self.assertEqual(assignments["PA01"]["signal"], "UART0_RXD")
+        gpio = assignments["PA10"]
+        self.assertEqual(
+            (gpio["peripheral"], gpio["kind"], gpio["function"], gpio["matched"]),
+            ("GPIOA", "GPIO", "P10", True),
+        )
+
+    def test_a_call_inside_a_conditional_is_not_active(self):
+        # O2：条件编译里的函数不算，PA04 不出现。
+        # O2: a function inside a conditional does not count; PA04 stays out.
+        self.assertNotIn("PA04", self.project(self.project_files())["project"]["assignments"])
+
+    def test_without_a_main_cpp_the_bsp_function_is_the_fallback(self):
+        files = {
+            key: value for key, value in self.project_files().items() if key != "User/main.cpp"
+        }
+        assignments = self.project(files)["project"]["assignments"]
+        self.assertEqual(assignments["PA03"]["signal"], "I2C0_SCL")
+        self.assertNotIn("PA01", assignments)
+
+    def test_two_hpmpc_files_are_an_error(self):
+        files = self.project_files()
+        files["boards/other/tool_config.hpmpc"] = files["boards/board/tool_config.hpmpc"]
+        with self.assertRaises(ValueError) as caught:
+            self.project(files)
+        self.assertTrue(
+            str(caught.exception).endswith("several .hpmpc files under boards/; keep one"),
+            str(caught.exception),
+        )
+
+    def test_a_hpmpc_without_a_soc_needs_the_model(self):
+        hpmpc = json.loads(self.HPMPC)
+        del hpmpc["content"]["info"]["socName"]
+        files = self.project_files()
+        files["boards/board/tool_config.hpmpc"] = json.dumps(hpmpc)
+        with self.assertRaises(ValueError) as caught:
+            self.project(files)
+        self.assertTrue(
+            str(caught.exception).endswith("does not name a SoC; give the model"),
+            str(caught.exception),
+        )
 
 
 class SysconfigSettings(TestCase):
@@ -459,29 +662,13 @@ class SysconfigSettings(TestCase):
             return layout_with_project(directory, None, "PM", None)["project"]
 
     def test_a_used_peripheral_carries_its_sysconfig_settings(self):
-        project = self.overlay(
-            {"sysconfig/ti_msp_dl_config.h": TI_HEADER, "sysconfig/p.syscfg": SYSCFG}
-        )
-        self.assertEqual(project["sysconfig_file"], "sysconfig/p.syscfg")
+        project = self.overlay({"a.syscfg": SYSCFG})
+        self.assertEqual(project["sysconfig_file"], "a.syscfg")
         uart = project["peripherals"]["UART0"]["sysconfig"]
         self.assertEqual((uart["module"], uart["name"]), ("UART", "UART_0"))
         self.assertEqual(uart["params"]["targetBaudRate"], 2000000)
-        # A peripheral the project does not use is not listed, and a GPIO has no settings.
+        # A peripheral without pins is not listed: SPI1 has no pin of its own here.
         self.assertNotIn("SPI1", project["peripherals"])
-        self.assertNotIn("sysconfig", project["peripherals"]["GPIOB"])
-
-    def test_without_a_syscfg_there_are_no_settings(self):
-        project = self.overlay({"sysconfig/ti_msp_dl_config.h": TI_HEADER})
-        self.assertIsNone(project["sysconfig_file"])
-        self.assertNotIn("sysconfig", project["peripherals"]["UART0"])
-
-    def test_a_syscfg_outside_the_project_is_not_read(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "project"
-            write(root, "ti_msp_dl_config.h", TI_HEADER)
-            write(Path(directory), "other.syscfg", SYSCFG)
-            project = layout_with_project(str(root), None, "PM", None)["project"]
-        self.assertIsNone(project["sysconfig_file"])
 
 
 class NoProject(TestCase):
@@ -494,7 +681,7 @@ class NoProject(TestCase):
             layout_with_project(directory, None, None, None)
         self.assertTrue(
             str(caught.exception).endswith(
-                ": no STM32CubeMX .ioc or SysConfig ti_msp_dl_config.h found"
+                ": no STM32CubeMX .ioc, HPM .hpmpc or root SysConfig .syscfg found"
             ),
             str(caught.exception),
         )
@@ -532,7 +719,7 @@ class CommandLine(TestCase):
                 (("pins",), "Give a chip model, or a project directory with -d"),
                 (
                     ("pins", "-d", directory),
-                    f"{directory}: no STM32CubeMX .ioc or SysConfig ti_msp_dl_config.h found",
+                    f"{directory}: no STM32CubeMX .ioc, HPM .hpmpc or root SysConfig .syscfg found",
                 ),
             ):
                 with self.subTest(argv=argv), self.assertLogs(level="ERROR") as logs:

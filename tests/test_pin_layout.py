@@ -71,6 +71,39 @@ class Stm32Models(TestCase):
         self.assertEqual(str(caught.exception), "Unknown STM32 model: STM32Q999RGT6")
 
 
+class HpmModels(TestCase):
+    """HPM 的型号即 SoC 名，封装名与 .hpmpc 的 packageName 一致；信号是 hpm_iomux.h 的宏名。
+    The model of an HPM is its SoC name, the package name matches the packageName of a
+    .hpmpc; the signals are the macro names of hpm_iomux.h.
+    """
+
+    def test_the_soc_chooses_the_data_and_the_pin_carries_its_signals(self):
+        layout = layout_pins("HPM5301", "QFN48")
+        self.assertEqual(
+            (layout.platform, layout.part, layout.package), ("hpm", "HPM5301", "QFN48")
+        )
+        self.assertEqual(layout_to_dict(layout)["pin_count"], 29)
+        pin = next(pin for pin in layout.pins if pin.name == "PA00")
+        self.assertEqual(pin.position, "12")
+        self.assertEqual(pin.extra["modes"]["UART0_TXD"], 2)
+
+    def test_a_gpio_mux_is_not_a_peripheral_signal(self):
+        self.assertIsNone(pin_layout.recognize_hpm("GPIO_A_00"))
+        self.assertEqual(pin_layout.recognize_hpm("UART0_TXD"), ("UART0", "UART", "TXD"))
+
+    def test_an_unknown_soc_or_package_is_an_error(self):
+        with self.assertRaises(ValueError) as caught:
+            layout_pins("HPM9999", "QFN48")
+        self.assertTrue(
+            str(caught.exception).startswith("Unknown HPM SoC: HPM9999"), str(caught.exception)
+        )
+        with self.assertRaises(ValueError) as caught:
+            layout_pins("HPM5301", "BGA")
+        self.assertTrue(
+            str(caught.exception).startswith("HPM5301 has no package BGA"), str(caught.exception)
+        )
+
+
 class Mspm0Models(TestCase):
     """MSPM0 型号按器件族和封装代码解析，每个引脚带 PINCM 和各信号的模式号。
     MSPM0 models resolve by family and package code; every pin carries its PINCM and the mode of
@@ -98,7 +131,7 @@ class Mspm0Models(TestCase):
         self.assertEqual(
             str(caught.exception),
             "Cannot tell the package of MSPM0G3507; give it with --package "
-            "(LQFP-64(PM), VQFN-48(RGZ), LQFP-48(PT), VSSOP-28(DGS28), VQFN-32(RHB))",
+            "(VQFN-48(RGZ), VSSOP-32(DGS32), LQFP-48(PT), LQFP-64(PM), VSSOP-28(DGS28), VQFN-32(RHB))",
         )
         with self.assertRaises(ValueError) as caught:
             layout_pins("MSPM0G3507", "BGA")
@@ -134,7 +167,7 @@ class Dispatch(TestCase):
             layout_pins("CH32V203C8T6")
         self.assertEqual(
             str(caught.exception),
-            "No supported platform for the model CH32V203C8T6 (supported: STM32, MSPM0)",
+            "No supported platform for the model CH32V203C8T6 (supported: STM32, MSPM0, HPM)",
         )
 
     def test_the_output_fields_are_the_same_for_every_platform(self):
@@ -264,7 +297,7 @@ class Recognition(TestCase):
             for pins in family["packages"].values():
                 for _, _, _, _, signals in pins:
                     for signal, _ in signals:
-                        if not re.fullmatch(r"P[A-C]\d+(/P[A-C]\d+)?", signal):
+                        if not re.fullmatch(r"P[A-C]\d+(/P[A-C]\d+)*", signal):
                             self.assertIsNotNone(pin_layout.recognize_mspm0(signal), signal)
 
 
@@ -372,7 +405,7 @@ def pin_layout_error(model):
     """没有支持的平台时的报错。
     The error for a model without a supported platform.
     """
-    return f"No supported platform for the model {model} (supported: STM32, MSPM0)"
+    return f"No supported platform for the model {model} (supported: STM32, MSPM0, HPM)"
 
 
 if __name__ == "__main__":

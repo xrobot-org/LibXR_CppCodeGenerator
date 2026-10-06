@@ -201,6 +201,55 @@ def layout_mspm0(model: str, package: str | None) -> PinLayout:
     return PinLayout("mspm0", model, part.group(0) if part else model, chosen, data["source"], pins)
 
 
+def layout_hpm(model: str, package: str | None) -> PinLayout:
+    """HPM SoC 的布局：型号即 SoC 名（HPM5301），封装名与数据一致（QFN48）。
+    The layout of an HPM SoC: the model is the SoC name (HPM5301), and the package name matches
+    the data (QFN48).
+    """
+    data = load_data("hpm")
+    socs = data["socs"]
+    soc = socs.get(model)
+    if soc is None:
+        raise ValueError(
+            tr(
+                f"Unknown HPM SoC: {model}; this data has {', '.join(socs)}",
+                f"未知的 HPM SoC：{model}；数据里有 {'、'.join(socs)}",
+            )
+        )
+    packages = soc["packages"]
+    chosen = None
+    if package is not None:
+        chosen = next((name for name in packages if package.upper() == name.upper()), None)
+        if chosen is None:
+            raise ValueError(
+                tr(
+                    f"{model} has no package {package}; this SoC has {', '.join(packages)}",
+                    f"{model} 没有封装 {package}；该 SoC 有 {'、'.join(packages)}",
+                )
+            )
+    elif len(packages) == 1:
+        chosen = next(iter(packages))
+    if chosen is None:
+        raise ValueError(
+            tr(
+                f"Cannot tell the package of {model}; give it with --package"
+                f" ({', '.join(packages)})",
+                f"无法从 {model} 判断封装；请用 --package 给出（{'、'.join(packages)}）",
+            )
+        )
+    pins = [
+        Pin(
+            position,
+            name,
+            kind,
+            [signal for signal, _ in signals],
+            {"modes": {signal: mode for signal, mode in signals}},
+        )
+        for position, name, kind, _, signals in packages[chosen]
+    ]
+    return PinLayout("hpm", model, model, chosen, data["source"], pins)
+
+
 def recognize_stm32(signal: str) -> tuple[str, str, str] | None:
     """识别 ST 的信号名：返回外设实例、外设类型和功能，不是外设信号（GPIO）时返回 None。
     Recognize an ST signal name: return the peripheral instance, the peripheral kind and the
@@ -243,9 +292,23 @@ def recognize_mspm0(signal: str) -> tuple[str, str, str] | None:
     return match.group(1), re.sub(r"\d+$", "", match.group(1)), match.group(2)
 
 
+def recognize_hpm(signal: str) -> tuple[str, str, str] | None:
+    """识别 HPM 的信号名（hpm_iomux.h 的宏名）：UART0_TXD 为 UART0、UART、TXD；GPIO 的复用
+    （GPIO_A_00）是引脚自己的普通用法，返回 None。
+    Recognize an HPM signal name (the macro name of hpm_iomux.h): UART0_TXD is UART0, UART, TXD;
+    the GPIO mux (GPIO_A_00) is the pin's own plain use, so None.
+    """
+    if signal.startswith("GPIO_"):
+        return None
+    match = re.fullmatch(r"([A-Za-z0-9]+)_(.+)", signal)
+    if match is None:
+        return None
+    return match.group(1), re.sub(r"\d+$", "", match.group(1)), match.group(2)
+
+
 # 各平台识别信号名的函数。
 # The function of each platform that recognizes a signal name.
-RECOGNIZERS = {"stm32": recognize_stm32, "mspm0": recognize_mspm0}
+RECOGNIZERS = {"stm32": recognize_stm32, "mspm0": recognize_mspm0, "hpm": recognize_hpm}
 
 
 def natural_key(name: str) -> list:
@@ -335,6 +398,7 @@ def peripheral_index(layout: PinLayout) -> dict:
 PLATFORMS = (
     ("stm32", "STM32", layout_stm32),
     ("mspm0", "MSPM0", layout_mspm0),
+    ("hpm", "HPM", layout_hpm),
 )
 
 

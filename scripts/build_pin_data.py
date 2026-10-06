@@ -139,11 +139,13 @@ def family_prefixes(family: str) -> list[str]:
     return [first] + [first[: len(first) - len(other)] + other for other in others]
 
 
-def read_mspm0_family(path: Path) -> dict:
+def read_mspm0_family(path: Path) -> tuple[dict, dict[str, int]]:
     """读取一个 MSPM0 器件族的 JSON，返回其每个封装的引脚：
-    [位置, 名称, 类型, PINCM, [[信号, 模式]...]]。
+    [位置, 名称, 类型, PINCM, [[信号, 模式]...]]；以及每个外设实例的电源域编号（0 为 PD0，
+    总线时钟是 ULPCLK；1 为 PD1，是 MCLK），UART0 -> 1。
     Read the JSON of one MSPM0 family; return the pins of each of its packages as
-    [position, name, type, PINCM, [[signal, mode]...]].
+    [position, name, type, PINCM, [[signal, mode]...]], and the power domain number of each
+    peripheral instance (0 is PD0, whose bus clock is ULPCLK; 1 is PD1, on MCLK), UART0 -> 1.
     """
     data = json.loads(path.read_text(encoding="utf-8"))
     muxes = {mux["devicePinID"]: mux["muxSetting"] for mux in data["muxes"]}
@@ -173,19 +175,28 @@ def read_mspm0_family(path: Path) -> dict:
             )
         pins.sort(key=lambda pin: (len(pin[0]), pin[0]))
         packages[package["name"]] = pins
-    return packages
+    power_domains = {
+        peripheral["name"]: attributes["POWER_DOMAIN_NUMBER"]
+        for peripheral in data["peripherals"].values()
+        if isinstance(attributes := peripheral.get("attributes", {}), dict)
+        and isinstance(attributes.get("POWER_DOMAIN_NUMBER"), int)
+    }
+    return packages, power_domains
 
 
 def build_mspm0(sysconfig: Path) -> dict:
-    """MSPM0 数据：每个器件族的型号前缀和各封装的引脚。
-    The MSPM0 data: the model prefixes of each family and the pins of its packages.
+    """MSPM0 数据：每个器件族的型号前缀、各封装的引脚和外设实例的电源域。
+    The MSPM0 data: the model prefixes of each family, the pins of its packages and the power
+    domain of each peripheral instance.
     """
     root = sysconfig / "dist" / "deviceData"
     families = {}
     for directory in sorted(root.glob("MSPM0*")):
+        packages, power_domains = read_mspm0_family(directory / f"{directory.name}.json")
         families[directory.name] = {
             "prefixes": family_prefixes(directory.name),
-            "packages": read_mspm0_family(directory / f"{directory.name}.json"),
+            "packages": packages,
+            "power_domains": power_domains,
         }
     version = (sysconfig / "dist" / "version.txt").read_text(encoding="utf-8").strip()
     return {
@@ -196,6 +207,119 @@ def build_mspm0(sysconfig: Path) -> dict:
             "license": "TI limited license (TI devices only)",
         },
         "families": families,
+    }
+
+
+HPM_IOMUX = re.compile(
+    r"^#define\s+IOC_(P[A-Z]\d+)_FUNC_CTL_(\w+)\s+IOC_PAD_FUNC_CTL_ALT_SELECT_SET\((\d+)\)", re.M
+)
+HPM_PAD = re.compile(r"P[A-Z]\d+")
+
+
+def read_hpm_signals(soc_dir: Path) -> dict[str, list[list]]:
+    """一个 HPM SoC 的 hpm_iomux.h：焊盘 -> [[信号名, ALT 编号]...]，信号名与头文件的宏一致
+    （UART0_TXD、GPTMR1_COMP_0、GPIO_A_00）。
+    The hpm_iomux.h of one HPM SoC: pad -> [[signal name, ALT number]...], the names as the
+    header's macros spell them (UART0_TXD, GPTMR1_COMP_0, GPIO_A_00).
+    """
+    signals: dict[str, list[list]] = {}
+    for pad, name, alt in HPM_IOMUX.findall((soc_dir / "hpm_iomux.h").read_text(encoding="utf-8")):
+        signals.setdefault(pad, []).append([name, int(alt)])
+    return signals
+
+
+def read_hpm_balls(datasheet: Path) -> tuple[dict[str, dict[str, str]], dict[str, list[str]]]:
+    """数据手册 PINMUX 表里的焊盘封装映射：焊盘 -> 封装 -> 球号；以及每个焊盘的模拟功能
+    （ADC0_IN2 等，数字的 hpm_iomux.h 里没有它们；单元格里折行的名字拼回去）。
+    The pad-package map from the PINMUX table of a datasheet: pad -> package -> ball; and the
+    analog functions of each pad (ADC0_IN2, ...; the digital hpm_iomux.h does not have them,
+    names wrapped inside a cell are joined back).
+    """
+    import pdfplumber
+
+    balls: dict[str, dict[str, str]] = {}
+    analog: dict[str, list[str]] = {}
+    with pdfplumber.open(datasheet) as pdf:
+        for page in pdf.pages:
+            for table in page.extract_tables():
+                if (
+                    len(table) < 3
+                    or len(table[1]) < 5
+                    or not table[1][4]
+                    or table[1][4] != "PINNAME"
+                ):
+                    continue
+                packages = [re.sub(r"[^A-Z0-9]", "", str(name).upper()) for name in table[1][:4]]
+                for row in table[2:]:
+                    pad = str(row[4]).strip() if row[4] else ""
+                    if not HPM_PAD.fullmatch(pad):
+                        continue
+                    for index, package in enumerate(packages):
+                        ball = str(row[index]).strip() if row[index] else ""
+                        if not ball or ball == "-":
+                            continue
+                        balls.setdefault(pad, {})[package] = ball
+                    names: list[str] = []
+                    for part in str(row[6] or "").split("\n"):
+                        if part in ("", "-"):
+                            continue
+                        # 名字在单元格里折行：下半段以下划线开头，拼回上一个名字。
+                        # A name wraps inside the cell: the second half starts with an
+                        # underscore and continues the previous name.
+                        if part.startswith("_") and names:
+                            names[-1] += part
+                        else:
+                            names.append(part)
+                    if names:
+                        known = analog.setdefault(pad, [])
+                        known.extend(name for name in names if name not in known)
+    return balls, analog
+
+
+def build_hpm(sdk: Path, datasheet: Path, series: str) -> dict:
+    """HPM 数据：一个系列（HPM5300）里每个 SoC 的各封装引脚；信号取自 SDK 的 hpm_iomux.h
+    （BSD-3-Clause），球号取自该系列的数据手册 PINMUX 表（hpmicro.com）。
+    The HPM data: the pins of each package of every SoC of one series (HPM5300); the signals
+    come from the SDK's hpm_iomux.h (BSD-3-Clause), the balls from that series' datasheet PINMUX
+    table (hpmicro.com).
+    """
+    balls, analog = read_hpm_balls(datasheet)
+    socs = {}
+    for soc_dir in sorted((sdk / "soc" / series).glob("*")):
+        if not (soc_dir / "hpm_iomux.h").is_file():
+            continue
+        signals = read_hpm_signals(soc_dir)
+        # 模拟功能（ADC、ACMP、OPA 的输入输出）补进信号表；数字头文件里没有它们。
+        # The analog functions (the inputs and outputs of ADC, ACMP and OPA) join the signal
+        # lists; the digital header does not have them.
+        for pad, names in analog.items():
+            known = {name for name, _ in signals.get(pad, [])}
+            signals.setdefault(pad, []).extend([name, None] for name in names if name not in known)
+        packages = {}
+        for package in balls[next(iter(balls))]:
+            pins = [
+                [
+                    ball,
+                    pad,
+                    "GPIO",
+                    None,
+                    signals.get(pad, []),
+                ]
+                for pad, package_balls in sorted(balls.items())
+                for ball in [package_balls.get(package)]
+                if ball and pad in signals
+            ]
+            pins.sort(key=lambda pin: (len(pin[0]), pin[0]))
+            packages[package] = pins
+        socs[soc_dir.name] = {"packages": packages}
+    return {
+        "source": {
+            "vendor": "HPMicro",
+            "dataset": f"hpm_sdk soc/{series}/*/hpm_iomux.h; {datasheet.stem} pin tables",
+            "commit": git_commit(sdk),
+            "license": "BSD-3-Clause",
+        },
+        "socs": socs,
     }
 
 
@@ -250,45 +374,71 @@ def main() -> None:
     Parse the arguments and write the data files and the license texts.
     """
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--st-data", type=Path, required=True, help="STM32_open_pin_data checkout")
-    parser.add_argument("--sysconfig", type=Path, required=True, help="TI SysConfig installation")
-    parser.add_argument("--mspm0-sdk", type=Path, required=True, help="TI MSPM0 SDK checkout")
+    parser.add_argument("--st-data", type=Path, help="STM32_open_pin_data checkout")
+    parser.add_argument("--sysconfig", type=Path, help="TI SysConfig installation")
+    parser.add_argument("--mspm0-sdk", type=Path, help="TI MSPM0 SDK checkout")
+    parser.add_argument("--hpm-sdk", type=Path, help="HPM SDK checkout")
+    parser.add_argument("--hpm-datasheet", type=Path, help="HPM series datasheet PDF")
+    parser.add_argument("--hpm-series", help="the HPM series the datasheet covers (HPM5300)")
     parser.add_argument(
         "--output", type=Path, default=REPOSITORY / "src" / "libxr" / "pin_data", help="output dir"
     )
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    # 先清掉旧的数据文件，不留下已经不存在的分片。
-    # Remove the old data files first, so no shard that no longer exists stays.
-    for old in args.output.glob("*.json.gz"):
-        old.unlink()
-    index, shards = build_stm32(args.st_data)
-    write_gzip_json(args.output / "stm32.json.gz", index)
-    for shard, sets in shards.items():
-        write_gzip_json(args.output / f"stm32-{shard}.json.gz", sets)
-    write_gzip_json(args.output / "mspm0.json.gz", build_mspm0(args.sysconfig))
-    boards = {
-        "source": {
-            "vendor": "Texas Instruments",
-            "dataset": "MSPM0 SDK source/ti/boards/.meta",
-            "commit": git_commit(args.mspm0_sdk),
-            "license": "BSD-3-Clause",
-        },
-        "boards": read_boards(args.mspm0_sdk),
-    }
-    (args.output / "mspm0_boards.json").write_text(
-        json.dumps(boards, indent=1, sort_keys=True) + "\n", encoding="utf-8", newline="\n"
-    )
-    (args.output / "LICENSE-TI-BOARDS.txt").write_text(
-        board_license(args.mspm0_sdk), encoding="utf-8", newline="\n"
-    )
-    # 许可证原文随数据分发。TI 的文件不是 UTF-8，转成 UTF-8 写出。
-    # The license texts are distributed with the data. TI's file is not UTF-8; it is written as
-    # UTF-8.
-    (args.output / "LICENSE-ST.txt").write_bytes((args.st_data / "LICENSE").read_bytes())
-    ti_bytes = (args.sysconfig / "dist" / "license.txt").read_bytes()
-    ti_text = ti_bytes.decode("cp1252").replace("\r\n", "\n")
-    (args.output / "LICENSE-TI.txt").write_text(ti_text, encoding="utf-8", newline="\n")
+    if (args.sysconfig is None) != (args.mspm0_sdk is None):
+        parser.error("--sysconfig and --mspm0-sdk go together")
+    if (args.hpm_sdk is None) != (args.hpm_datasheet is None):
+        parser.error("--hpm-sdk and --hpm-datasheet go together")
+    if args.hpm_sdk is not None and not args.hpm_series:
+        parser.error("--hpm-series names the series the datasheet covers (HPM5300)")
+    if args.st_data is None and args.sysconfig is None and args.hpm_sdk is None:
+        parser.error(
+            "give --st-data, --sysconfig with --mspm0-sdk, or --hpm-datasheet with --hpm-sdk"
+        )
+    if args.st_data is not None:
+        # 先清掉旧的分片，不留下已经不存在的系列。
+        # Remove the old shards first, so no series that no longer exists stays.
+        for old in args.output.glob("stm32*.json.gz"):
+            old.unlink()
+        index, shards = build_stm32(args.st_data)
+        write_gzip_json(args.output / "stm32.json.gz", index)
+        for shard, sets in shards.items():
+            write_gzip_json(args.output / f"stm32-{shard}.json.gz", sets)
+        (args.output / "LICENSE-ST.txt").write_bytes((args.st_data / "LICENSE").read_bytes())
+    if args.sysconfig is not None:
+        for old in ("mspm0.json.gz", "mspm0_boards.json", "LICENSE-TI-BOARDS.txt"):
+            (args.output / old).unlink(missing_ok=True)
+        write_gzip_json(args.output / "mspm0.json.gz", build_mspm0(args.sysconfig))
+        boards = {
+            "source": {
+                "vendor": "Texas Instruments",
+                "dataset": "MSPM0 SDK source/ti/boards/.meta",
+                "commit": git_commit(args.mspm0_sdk),
+                "license": "BSD-3-Clause",
+            },
+            "boards": read_boards(args.mspm0_sdk),
+        }
+        (args.output / "mspm0_boards.json").write_text(
+            json.dumps(boards, indent=1, sort_keys=True) + "\n", encoding="utf-8", newline="\n"
+        )
+        (args.output / "LICENSE-TI-BOARDS.txt").write_text(
+            board_license(args.mspm0_sdk), encoding="utf-8", newline="\n"
+        )
+        # 许可证原文随数据分发。TI 的文件不是 UTF-8，转成 UTF-8 写出。
+        # The license texts are distributed with the data. TI's file is not UTF-8; it is written
+        # as UTF-8.
+        ti_bytes = (args.sysconfig / "dist" / "license.txt").read_bytes()
+        ti_text = ti_bytes.decode("cp1252").replace("\r\n", "\n")
+        (args.output / "LICENSE-TI.txt").write_text(ti_text, encoding="utf-8", newline="\n")
+    if args.hpm_sdk is not None:
+        (args.output / "hpm.json.gz").unlink(missing_ok=True)
+        write_gzip_json(
+            args.output / "hpm.json.gz",
+            build_hpm(args.hpm_sdk, args.hpm_datasheet, args.hpm_series),
+        )
+        # SDK 的许可证原文随数据分发。
+        # The SDK's license text is distributed with the data.
+        (args.output / "LICENSE-HPM.txt").write_bytes((args.hpm_sdk / "LICENSE").read_bytes())
 
 
 if __name__ == "__main__":
