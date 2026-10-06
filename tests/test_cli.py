@@ -42,7 +42,8 @@ class Platforms(TestCase):
             logs.output,
             [
                 f"ERROR:root:{self.root}: no supported platform recognized "
-                "(stm32: a directory with an STM32CubeMX .ioc file)"
+                "(stm32: a directory with an STM32CubeMX .ioc file; mspm0: a directory with "
+                "a SysConfig .syscfg file in its root)"
             ],
         )
 
@@ -95,7 +96,8 @@ class Platforms(TestCase):
             logs.output,
             [
                 "ERROR:root:.: no supported platform recognized "
-                "(stm32: a directory with an STM32CubeMX .ioc file)"
+                "(stm32: a directory with an STM32CubeMX .ioc file; mspm0: a directory with "
+                "a SysConfig .syscfg file in its root)"
             ],
         )
         self.assertFalse(output.exists())
@@ -111,7 +113,8 @@ class Platforms(TestCase):
             logs.output,
             [
                 f"ERROR:root:{config}: platform 'zephyr' is not supported "
-                "(stm32: a directory with an STM32CubeMX .ioc file)"
+                "(stm32: a directory with an STM32CubeMX .ioc file; mspm0: a directory with "
+                "a SysConfig .syscfg file in its root)"
             ],
         )
 

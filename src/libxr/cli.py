@@ -52,6 +52,17 @@ def _has_ioc(directory: str) -> bool:
         return False
 
 
+def _has_syscfg(directory: str) -> bool:
+    """directory 的根目录中有 .syscfg 文件（SysConfig 工程）时为 True；目录无法列出时为 False。
+    True when the root of directory holds a .syscfg file (a SysConfig project); False when the
+    directory cannot be listed.
+    """
+    try:
+        return any(name.endswith(".syscfg") for name in os.listdir(directory))
+    except OSError:
+        return False
+
+
 def _stm32_parse(args: argparse.Namespace) -> None:
     """用 STM32 解析器运行 libxr parse。
     Run libxr parse with the STM32 parser.
@@ -86,6 +97,40 @@ def _stm32_gen(args: argparse.Namespace) -> None:
     generate(args.input, args.output, use_xrobot, args.libxr_config)
 
 
+def _mspm0_parse(args: argparse.Namespace) -> None:
+    """用 MSPM0 解析器运行 libxr parse。
+    Run libxr parse with the MSPM0 parser.
+    """
+    from libxr.peripheral_analyzer_mspm0 import parse_project
+
+    parse_project(args.directory, args.output)
+
+
+def _mspm0_gen(args: argparse.Namespace) -> None:
+    """用 MSPM0 生成器运行 libxr gen。
+    Run libxr gen with the MSPM0 generator.
+
+    args.xrobot 为 None 时沿用输出文件现在的选择：它由 --xrobot 生成时继续生成 XRobot 代码。
+    With args.xrobot None the output file keeps its choice: XRobot code is generated again when
+    it was generated with --xrobot.
+    """
+    from libxr.generator_code_mspm0 import generate
+    from libxr.generator_stm32_cmake import uses_xrobot
+
+    use_xrobot = args.xrobot
+    if use_xrobot is None:
+        use_xrobot = uses_xrobot(args.output)
+        if use_xrobot:
+            logging.info(
+                tr(
+                    f"{args.output} uses XRobot; generating with --xrobot "
+                    "(--no-xrobot turns it off).",
+                    f"{args.output} 使用了 XRobot，继续按 --xrobot 生成（--no-xrobot 可关闭）。",
+                )
+            )
+    generate(args.input, args.output, use_xrobot, args.libxr_config)
+
+
 PLATFORMS = (
     Platform(
         "stm32",
@@ -93,6 +138,16 @@ PLATFORMS = (
         _has_ioc,
         _stm32_parse,
         _stm32_gen,
+    ),
+    Platform(
+        "mspm0",
+        lambda: tr(
+            "a directory with a SysConfig .syscfg file in its root",
+            "根目录中含有 SysConfig .syscfg 文件的目录",
+        ),
+        _has_syscfg,
+        _mspm0_parse,
+        _mspm0_gen,
     ),
 )
 
@@ -324,9 +379,10 @@ def _add_parse(commands) -> None:
         "--directory",
         default=".",
         help=tr(
-            "project directory; an STM32CubeMX project holds one .ioc file (default: current "
-            "directory)",
-            "工程目录，STM32CubeMX 工程含有一个 .ioc 文件（默认：当前目录）",
+            "project directory: an STM32CubeMX project holds one .ioc file, an MSPM0 project "
+            "one .syscfg file in its root (default: current directory)",
+            "工程目录：STM32CubeMX 工程含有一个 .ioc 文件，MSPM0 工程的根目录含有一个 .syscfg "
+            "文件（默认：当前目录）",
         ),
     )
     parser.add_argument(
