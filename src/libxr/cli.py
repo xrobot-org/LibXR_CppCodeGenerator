@@ -328,40 +328,61 @@ def cmd_stm32_setup(args: argparse.Namespace) -> None:
     )
 
 
+def _setup_without_cubemx(args: argparse.Namespace, parse, generate) -> None:
+    """没有 CubeMX 步骤的平台（HPM、MSPM0）的 setup，规则与 libxr stm32 setup 相同：写
+    .gitignore（已有的不动），解析工程到 .config.yaml，生成 User/app_main.cpp（或 -o 给出的
+    文件）。--xrobot 和 --no-xrobot 都不给时沿用输出文件现在的选择，新文件不用 XRobot。结束时，
+    XRobot 工程还没有 Modules/modules.yaml 就给出 XRobot 的设置步骤；与 stm32 setup 一样不改
+    User/xrobot_main.hpp，它由 xrobot setup / xrobot gen 生成。
+    The setup of a platform without a CubeMX step (HPM, MSPM0), with the rules of libxr stm32
+    setup: write .gitignore (an existing one stays), parse the project into .config.yaml and
+    generate User/app_main.cpp (or the file -o names). With neither --xrobot nor --no-xrobot
+    the output file keeps its choice, and a new file does not use XRobot. At the end an XRobot
+    project without Modules/modules.yaml gets the XRobot setup steps; like stm32 setup it
+    leaves User/xrobot_main.hpp alone, which xrobot setup / xrobot gen generates.
+    """
+    from libxr.config_cubemx_project import create_gitignore_file, report_xrobot_steps
+    from libxr.generator_stm32_cmake import uses_xrobot
+
+    output = args.output or os.path.join(args.directory, "User", "app_main.cpp")
+    use_xrobot = args.xrobot
+    if use_xrobot is None:
+        use_xrobot = uses_xrobot(output)
+        if use_xrobot:
+            logging.info(
+                tr(
+                    f"{output} uses XRobot; generating with --xrobot (--no-xrobot turns it off).",
+                    f"{output} 使用了 XRobot，继续按 --xrobot 生成（--no-xrobot 可关闭）。",
+                )
+            )
+    create_gitignore_file(args.directory)
+    parse(args.directory, None)
+    generate(os.path.join(args.directory, ".config.yaml"), output, use_xrobot, args.libxr_config)
+    report_xrobot_steps(args.directory, use_xrobot)
+
+
 def cmd_hpm_setup(args: argparse.Namespace) -> None:
-    """libxr hpm setup：解析 HPM 工程并生成 User/app_main.cpp；没有 CubeMX 步骤。
+    """libxr hpm setup：解析 HPM 工程并生成 User/app_main.cpp；没有 CubeMX 步骤（见
+    _setup_without_cubemx()）。
     libxr hpm setup: parse an HPM project and generate User/app_main.cpp; there is no CubeMX
-    step.
+    step (see _setup_without_cubemx()).
     """
     from libxr.generator_code_hpm import generate
     from libxr.peripheral_analyzer_hpm import parse_project
 
-    parse_project(args.directory, None)
-    output = args.output or os.path.join(args.directory, "User", "app_main.cpp")
-    generate(
-        os.path.join(args.directory, ".config.yaml"),
-        output,
-        True if args.xrobot is None else args.xrobot,
-        args.libxr_config,
-    )
+    _setup_without_cubemx(args, parse_project, generate)
 
 
 def cmd_mspm0_setup(args: argparse.Namespace) -> None:
-    """libxr mspm0 setup：解析 SysConfig 工程并生成 User/app_main.cpp；没有 CubeMX 步骤。
+    """libxr mspm0 setup：解析 SysConfig 工程并生成 User/app_main.cpp；没有 CubeMX 步骤（见
+    _setup_without_cubemx()）。
     libxr mspm0 setup: parse a SysConfig project and generate User/app_main.cpp; there is no
-    CubeMX step.
+    CubeMX step (see _setup_without_cubemx()).
     """
     from libxr.generator_code_mspm0 import generate
     from libxr.peripheral_analyzer_mspm0 import parse_project
 
-    parse_project(args.directory, None)
-    output = args.output or os.path.join(args.directory, "User", "app_main.cpp")
-    generate(
-        os.path.join(args.directory, ".config.yaml"),
-        output,
-        True if args.xrobot is None else args.xrobot,
-        args.libxr_config,
-    )
+    _setup_without_cubemx(args, parse_project, generate)
 
 
 def cmd_stm32_cubemx_gen(args: argparse.Namespace) -> None:
@@ -646,7 +667,10 @@ def _add_hpm_setup(commands) -> None:
     )
     _add_xrobot_choice(
         parser,
-        tr(" (default: generate XRobot registrations)", "（默认：生成 XRobot 注册代码）"),
+        tr(
+            " (default: keep the choice of the existing output file; a new file uses no XRobot)",
+            "（默认：沿用已有输出文件的选择；新文件不使用 XRobot）",
+        ),
     )
     parser.add_argument(
         "--libxr-config",
@@ -693,7 +717,10 @@ def _add_mspm0_setup(commands) -> None:
     )
     _add_xrobot_choice(
         parser,
-        tr(" (default: generate XRobot registrations)", "（默认：生成 XRobot 注册代码）"),
+        tr(
+            " (default: keep the choice of the existing output file; a new file uses no XRobot)",
+            "（默认：沿用已有输出文件的选择；新文件不使用 XRobot）",
+        ),
     )
     parser.add_argument(
         "--libxr-config",

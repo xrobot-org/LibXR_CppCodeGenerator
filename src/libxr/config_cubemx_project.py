@@ -882,6 +882,20 @@ def _report_next_steps(project_dir: str, xrobot: bool = False) -> None:
             english = f'Next: #include "app_main.h" and call app_main() {where_en}, {keep_en}'
             chinese = f'下一步：{where_zh} #include "app_main.h" 并调用 app_main()，{keep_zh}'
         logging.info(tr(english, chinese))
+    report_xrobot_steps(project_dir, xrobot)
+    preset = _build_preset(os.path.join(project_dir, "CMakePresets.json"))
+    if preset:
+        command = f"cmake --preset {preset} && cmake --build --preset {preset}"
+        logging.info(tr(f"Build: {command}", f"构建：{command}"))
+
+
+def report_xrobot_steps(project_dir: str, xrobot: bool) -> None:
+    """XRobot 工程（xrobot 为真）还没有 Modules/modules.yaml 时依次给出 XRobot 的设置命令
+    （XROBOT_STEPS，其中 xrobot setup 生成 User/xrobot_main.hpp）；各平台的 setup 共用。
+    Give the XRobot setup commands in order (XROBOT_STEPS, where xrobot setup generates
+    User/xrobot_main.hpp) when an XRobot project (xrobot true) has no Modules/modules.yaml
+    yet; the setup of every platform shares this.
+    """
     if xrobot and not os.path.isfile(os.path.join(project_dir, "Modules", "modules.yaml")):
         logging.info(
             tr(
@@ -891,10 +905,6 @@ def _report_next_steps(project_dir: str, xrobot: bool = False) -> None:
         )
         for command, english, chinese in XROBOT_STEPS:
             logging.info(f"  {command:<36}  " + tr(english, chinese))
-    preset = _build_preset(os.path.join(project_dir, "CMakePresets.json"))
-    if preset:
-        command = f"cmake --preset {preset} && cmake --build --preset {preset}"
-        logging.info(tr(f"Build: {command}", f"构建：{command}"))
 
 
 def _build_preset(path: str) -> str:

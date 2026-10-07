@@ -31,7 +31,7 @@ from pathlib import Path
 from unittest import mock
 
 import yaml
-from fixtures import DATA, TestCase
+from fixtures import DATA, TestCase, run_libxr
 
 from libxr import generator_code_mspm0 as generator
 from libxr import peripheral_analyzer_mspm0 as analyzer
@@ -731,6 +731,75 @@ class Generation(MSPM0TestCase):
         # A generated file is not warned about any more.
         with self.assertNoLogs(level="WARNING"):
             self.regenerate(root)
+
+
+class Setup(MSPM0TestCase):
+    """libxr mspm0 setup 和 libxr hpm setup（M5、HPM 17）：XRobot 的选择、.gitignore 和下一步。
+    libxr mspm0 setup and libxr hpm setup (M5, HPM 17): the XRobot choice, .gitignore and the
+    next steps.
+    """
+
+    def setUp(self):
+        super().setUp()
+        generator.initialize_registry()
+        generator.reset_settings()
+
+    def setup(self, root: Path, *options) -> tuple[int, str]:
+        """在 root 上运行 libxr mspm0 setup，返回退出码和生成的 app_main 源文件。
+        Run libxr mspm0 setup on root and return the exit code and the generated app_main.
+        """
+        with self.assertLogs(level="INFO") as logs:
+            code, _out, _err = run_libxr("mspm0", "setup", "-d", str(root), *options)
+        self.logs = logs.output
+        return code, (root / "User" / "app_main.cpp").read_text(encoding="utf-8")
+
+    def test_a_new_project_uses_no_xrobot_and_an_existing_one_keeps_its_choice(self):
+        root = self.project("variants")
+        code, app_main = self.setup(root)
+        self.assertEqual(code, 0)
+        self.assertNotIn("xrobot_main.hpp", app_main)
+        self.assertIn(".config.yaml", (root / ".gitignore").read_text(encoding="utf-8"))
+        _code, app_main = self.setup(root, "--xrobot")
+        self.assertIn('#include "xrobot_main.hpp"', app_main)
+        _code, app_main = self.setup(root)
+        self.assertIn('#include "xrobot_main.hpp"', app_main)
+        self.assertIn(
+            f"INFO:root:{root / 'User' / 'app_main.cpp'} uses XRobot; generating with --xrobot "
+            "(--no-xrobot turns it off).",
+            self.logs,
+        )
+        # HPM 17：与 stm32 setup 一样，还没有 Modules/modules.yaml 时给出 XRobot 的设置步骤，
+        # 其中 xrobot setup 生成 User/xrobot_main.hpp。
+        # HPM 17: as stm32 setup does, the XRobot setup steps are given while there is no
+        # Modules/modules.yaml; xrobot setup among them generates User/xrobot_main.hpp.
+        self.assertIn(
+            "INFO:root:Next: Modules/modules.yaml does not exist yet; set up XRobot in this order:",
+            self.logs,
+        )
+        _code, app_main = self.setup(root, "--no-xrobot")
+        self.assertNotIn("xrobot_main.hpp", app_main)
+        _code, app_main = self.setup(root)
+        self.assertNotIn("xrobot_main.hpp", app_main)
+
+    def test_an_existing_gitignore_is_kept(self):
+        root = self.project("variants")
+        (root / ".gitignore").write_text("mine\n", encoding="utf-8")
+        self.setup(root)
+        self.assertEqual((root / ".gitignore").read_text(encoding="utf-8"), "mine\n")
+
+    def test_hpm_setup_keeps_the_choice_of_the_output_file_as_well(self):
+        root = Path(tempfile.mkdtemp(prefix="libxr-hpm-setup-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        (root / "User").mkdir()
+        (root / "User" / "app_main.cpp").write_text("int x;\n", encoding="utf-8")
+        with (
+            mock.patch("libxr.peripheral_analyzer_hpm.parse_project"),
+            mock.patch("libxr.generator_code_hpm.generate") as generate,
+            self.assertLogs(level="INFO"),
+        ):
+            self.assertEqual(run_libxr("hpm", "setup", "-d", str(root))[0], 0)
+        self.assertIs(generate.call_args.args[2], False)
+        self.assertTrue((root / ".gitignore").is_file())
 
 
 class Analyzer(TestCase):
