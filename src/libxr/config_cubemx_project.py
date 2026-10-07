@@ -890,21 +890,35 @@ def _report_next_steps(project_dir: str, xrobot: bool = False) -> None:
 
 
 def report_xrobot_steps(project_dir: str, xrobot: bool) -> None:
-    """XRobot 工程（xrobot 为真）还没有 Modules/modules.yaml 时依次给出 XRobot 的设置命令
-    （XROBOT_STEPS，其中 xrobot setup 生成 User/xrobot_main.hpp）；各平台的 setup 共用。
-    Give the XRobot setup commands in order (XROBOT_STEPS, where xrobot setup generates
-    User/xrobot_main.hpp) when an XRobot project (xrobot true) has no Modules/modules.yaml
-    yet; the setup of every platform shares this.
+    """XRobot 工程（xrobot 为真）的后续步骤，各平台的 setup 共用：还没有 Modules/modules.yaml
+    时依次给出 XRobot 的设置命令（XROBOT_STEPS，其中 xrobot setup 生成 User/xrobot_main.hpp）；
+    已经有了时提醒运行 xrobot gen，因为 libxr 的 setup 不更新 User/xrobot_main.hpp（用户
+    2026-10-07 决定统一提醒）。
+    The next steps of an XRobot project (xrobot true), shared by the setup of every platform:
+    without Modules/modules.yaml the XRobot setup commands in order (XROBOT_STEPS, where xrobot
+    setup generates User/xrobot_main.hpp); with it a reminder to run xrobot gen, because the
+    libxr setup does not update User/xrobot_main.hpp (the user decided on 2026-10-07 to remind
+    on every platform).
     """
-    if xrobot and not os.path.isfile(os.path.join(project_dir, "Modules", "modules.yaml")):
+    if not xrobot:
+        return
+    if os.path.isfile(os.path.join(project_dir, "Modules", "modules.yaml")):
         logging.info(
             tr(
-                "Next: Modules/modules.yaml does not exist yet; set up XRobot in this order:",
-                "下一步：还没有 Modules/modules.yaml，按以下顺序完成 XRobot 的设置：",
+                "Next: run `xrobot gen` to bring User/xrobot_main.hpp up to date; libxr setup "
+                "does not update it",
+                "下一步：运行 `xrobot gen` 更新 User/xrobot_main.hpp；libxr 的 setup 不更新它",
             )
         )
-        for command, english, chinese in XROBOT_STEPS:
-            logging.info(f"  {command:<36}  " + tr(english, chinese))
+        return
+    logging.info(
+        tr(
+            "Next: Modules/modules.yaml does not exist yet; set up XRobot in this order:",
+            "下一步：还没有 Modules/modules.yaml，按以下顺序完成 XRobot 的设置：",
+        )
+    )
+    for command, english, chinese in XROBOT_STEPS:
+        logging.info(f"  {command:<36}  " + tr(english, chinese))
 
 
 def _build_preset(path: str) -> str:

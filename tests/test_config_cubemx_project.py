@@ -594,10 +594,21 @@ class SetupProject(GeneratorTestCase):
         with self.assertLogs(level="INFO") as logs:
             cubemx_cfg._report_next_steps(str(self.root), xrobot=True)
         self.assertEqual(logs.output, steps)
+        # 已有 Modules/modules.yaml：libxr 的 setup 不更新 xrobot_main.hpp，提醒运行 xrobot gen
+        # （用户 2026-10-07 决定，各平台统一）。
+        # With Modules/modules.yaml: the libxr setup does not update xrobot_main.hpp, so it
+        # reminds to run xrobot gen (the user's decision of 2026-10-07, on every platform).
         (self.root / "Modules").mkdir()
         (self.root / "Modules" / "modules.yaml").write_text("modules: []\n", encoding="utf-8")
-        with self.assertNoLogs(level="INFO"):
+        with self.assertLogs(level="INFO") as logs:
             cubemx_cfg._report_next_steps(str(self.root), xrobot=True)
+        self.assertEqual(
+            logs.output,
+            [
+                "INFO:root:Next: run `xrobot gen` to bring User/xrobot_main.hpp up to date; "
+                "libxr setup does not update it"
+            ],
+        )
         (self.root / "Modules" / "modules.yaml").unlink()
         with self.assertNoLogs(level="INFO"):
             cubemx_cfg._report_next_steps(str(self.root), xrobot=False)

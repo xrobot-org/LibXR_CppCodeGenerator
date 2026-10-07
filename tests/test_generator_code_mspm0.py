@@ -846,8 +846,20 @@ class Setup(MSPM0TestCase):
             "INFO:root:Next: Modules/modules.yaml does not exist yet; set up XRobot in this order:",
             self.logs,
         )
+        # 有了 Modules/modules.yaml 之后提醒运行 xrobot gen：setup 不更新 xrobot_main.hpp。
+        # Once Modules/modules.yaml exists, the reminder to run xrobot gen: setup does not
+        # update xrobot_main.hpp.
+        (root / "Modules").mkdir(exist_ok=True)
+        (root / "Modules" / "modules.yaml").write_text("modules: []\n", encoding="utf-8")
+        self.setup(root, "--xrobot")
+        self.assertIn(
+            "INFO:root:Next: run `xrobot gen` to bring User/xrobot_main.hpp up to date; libxr "
+            "setup does not update it",
+            self.logs,
+        )
         _code, app_main = self.setup(root, "--no-xrobot")
         self.assertNotIn("xrobot_main.hpp", app_main)
+        self.assertFalse(any("xrobot gen" in line for line in self.logs))
         _code, app_main = self.setup(root)
         self.assertNotIn("xrobot_main.hpp", app_main)
 
