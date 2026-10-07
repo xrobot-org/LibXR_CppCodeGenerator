@@ -565,6 +565,24 @@ class HpmProjects(TestCase):
             ("GPIOA", "GPIO", "P10", True),
         )
 
+    def test_two_functions_on_one_pad_are_reported(self):
+        # P3 遗留：init_bsp_pins 和 init_uart0_pins 都选了 PA00；冲突要报告（以前静默后写赢）。
+        # P3 leftover: init_bsp_pins and init_uart0_pins both select PA00; the conflict is
+        # reported (it used to be a silent last-wins).
+        with self.assertLogs(level="WARNING") as logs:
+            info = self.project(self.project_files())
+        self.assertEqual(len(logs.output), 1)
+        # 路径是绝对临时目录，Windows 下分隔符是反斜杠；只核对路径之后的部分。
+        # The path is an absolute temporary directory whose separator is a backslash on
+        # Windows; check the part after the path only.
+        self.assertTrue(
+            logs.output[0].endswith(
+                ": PA00 is selected by both init_bsp_pins (UART0.A.TXD) and "
+                "init_uart0_pins (UART0.A.TXD); the later one wins"
+            )
+        )
+        self.assertEqual(info["project"]["assignments"]["PA00"]["signal"], "UART0_TXD")
+
     def test_a_call_inside_a_conditional_is_not_active(self):
         # O2：条件编译里的函数不算，PA04 不出现。
         # O2: a function inside a conditional does not count; PA04 stays out.

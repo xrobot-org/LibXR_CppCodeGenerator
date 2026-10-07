@@ -306,6 +306,26 @@ def recognize_hpm(signal: str) -> tuple[str, str, str] | None:
     return match.group(1), re.sub(r"\d+$", "", match.group(1)), match.group(2)
 
 
+@cache
+def hpm_soc_has_pwm(model: str) -> bool:
+    """SoC 的引脚数据里有没有 PWM 外设的信号（HPM5361 有 20 个，HPM5301 没有）：有的 SoC 上
+    GPTMR 只作展示，没有的才生成 HPMPWM 的 fallback 对象。
+    Whether the pin data of the SoC has PWM peripheral signals (HPM5361 has 20, HPM5301 has
+    none): on a SoC with them a GPTMR is display-only, and only a SoC without them generates
+    the HPMPWM fallback objects.
+    """
+    soc = load_data("hpm")["socs"].get(model)
+    if soc is None:
+        return False
+    for package in soc["packages"].values():
+        for _position, _name, _kind, _x, signals in package:
+            for signal, _mode in signals:
+                recognized = recognize_hpm(signal)
+                if recognized is not None and recognized[1] == "PWM":
+                    return True
+    return False
+
+
 # 各平台识别信号名的函数。
 # The function of each platform that recognizes a signal name.
 RECOGNIZERS = {"stm32": recognize_stm32, "mspm0": recognize_mspm0, "hpm": recognize_hpm}

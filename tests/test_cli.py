@@ -6,6 +6,7 @@ import contextlib
 import io
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from fixtures import IOC, TestCase, run_libxr
+from fixtures import DATA, IOC, TestCase, run_libxr
 
 from libxr import cli, update_notice
 
@@ -43,7 +44,8 @@ class Platforms(TestCase):
             [
                 f"ERROR:root:{self.root}: no supported platform recognized "
                 "(stm32: a directory with an STM32CubeMX .ioc file; mspm0: a directory with "
-                "a SysConfig .syscfg file in its root)"
+                "a SysConfig .syscfg file in its root; hpm: a directory with an app.yaml and "
+                "a .hpmpc under boards/)"
             ],
         )
 
@@ -97,7 +99,8 @@ class Platforms(TestCase):
             [
                 "ERROR:root:.: no supported platform recognized "
                 "(stm32: a directory with an STM32CubeMX .ioc file; mspm0: a directory with "
-                "a SysConfig .syscfg file in its root)"
+                "a SysConfig .syscfg file in its root; hpm: a directory with an app.yaml and "
+                "a .hpmpc under boards/)"
             ],
         )
         self.assertFalse(output.exists())
@@ -114,8 +117,24 @@ class Platforms(TestCase):
             [
                 f"ERROR:root:{config}: platform 'zephyr' is not supported "
                 "(stm32: a directory with an STM32CubeMX .ioc file; mspm0: a directory with "
-                "a SysConfig .syscfg file in its root)"
+                "a SysConfig .syscfg file in its root; hpm: a directory with an app.yaml and "
+                "a .hpmpc under boards/)"
             ],
+        )
+
+    def test_an_hpm_project_is_detected(self):
+        project = self.root / "hpm"
+        (project / "boards" / "hpm5301evklite").mkdir(parents=True)
+        shutil.copy(
+            DATA / "hpm" / "hpm5301evklite.hpmpc",
+            project / "boards" / "hpm5301evklite" / "tool_config.hpmpc",
+        )
+        (project / "app.yaml").write_text("dependency: []\n", encoding="utf-8")
+        (project / "main.c").write_text("int main(void) { init_bsp_pins(); }\n", encoding="utf-8")
+        self.assertEqual(run_libxr("parse", "-d", str(project))[0], 0)
+        self.assertEqual(
+            (project / ".config.yaml").read_text(encoding="utf-8").splitlines()[1],
+            "Platform: hpm",
         )
 
     def test_a_missing_directory_is_an_error(self):
@@ -325,6 +344,29 @@ class Options(TestCase):
             (
                 ["stm32", "toolchain", "clang", "-p"],
                 {"directory": ".", "compiler": "clang", "std": "picolibc", **quiet, **toolchain},
+            ),
+            (
+                ["hpm", "setup"],
+                {
+                    "directory": ".",
+                    "output": "",
+                    "xrobot": None,
+                    "libxr_config": "",
+                    **quiet,
+                    "run": "cmd_hpm_setup",
+                },
+            ),
+            (
+                ["hpm", "setup", "-d", "p", "-o", "o.cpp", "--xrobot"]
+                + ["--libxr-config", "c.yaml", "--verbose"],
+                {
+                    "directory": "p",
+                    "output": "o.cpp",
+                    "xrobot": True,
+                    "libxr_config": "c.yaml",
+                    **loud,
+                    "run": "cmd_hpm_setup",
+                },
             ),
         ):
             with self.subTest(argv=argv):

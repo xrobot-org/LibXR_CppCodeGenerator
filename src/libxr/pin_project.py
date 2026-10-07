@@ -14,6 +14,7 @@ layout; one that does not match is given as it is, with matched false.
 """
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from functools import cache
@@ -473,16 +474,16 @@ HPM_DIRECTIVE = re.compile(r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b")
 HPM_CALL = re.compile(r"^\s*(\w+)\(\);\s*$")
 
 
-def hpm_active_functions(main_c: Path, functions: dict) -> list[str]:
-    """main.c 在预处理条件外调用的、.hpmpc 里存在的 pinmux 函数；main.c 不存在或没有调用
-    时退回 init_bsp_pins。条件编译里的调用不算（rmcs 的 JTAG 共用引脚在 #if 里，O2 的决定）。
-    The pinmux functions of the .hpmpc that the root main.c calls outside preprocessor conditions; the
-    fallback is init_bsp_pins when main.c does not exist or calls none. A call inside a
-    conditional does not count (rmcs' JTAG shared pins sit in an #if, the decision of O2).
+def hpm_called_functions(main_c: Path, functions: dict) -> list[str]:
+    """main.c 在预处理条件外调用的 pinmux 函数，按调用顺序；main.c 不存在时为空。条件编译里的
+    调用不算（rmcs 的 JTAG 共用引脚在 #if 里，O2 的决定）。
+    The pinmux functions main.c calls outside preprocessor conditions, in call order; empty
+    when main.c does not exist. A call inside a conditional does not count (rmcs' JTAG shared
+    pins sit in an #if, the decision of O2).
     """
     if not main_c.is_file():
-        return ["init_bsp_pins"] if "init_bsp_pins" in functions else []
-    active: list[str] = []
+        return []
+    called: list[str] = []
     depth = 0
     for line in main_c.read_text(encoding="utf-8", errors="replace").splitlines():
         directive = HPM_DIRECTIVE.match(line)
@@ -493,11 +494,21 @@ def hpm_active_functions(main_c: Path, functions: dict) -> list[str]:
                 depth = max(0, depth - 1)
             continue
         call = HPM_CALL.match(line)
-        if call and depth == 0 and call.group(1) in functions and call.group(1) not in active:
-            active.append(call.group(1))
-    if not active and "init_bsp_pins" in functions:
-        active = ["init_bsp_pins"]
-    return active
+        if call and depth == 0 and call.group(1) in functions and call.group(1) not in called:
+            called.append(call.group(1))
+    return called
+
+
+def hpm_active_functions(main_c: Path, functions: dict) -> list[str]:
+    """main.c 在预处理条件外调用的、.hpmpc 里存在的 pinmux 函数；main.c 不存在或没有调用
+    时退回 init_bsp_pins。
+    The pinmux functions of the .hpmpc that the root main.c calls outside preprocessor
+    conditions; the fallback is init_bsp_pins when main.c does not exist or calls none.
+    """
+    called = hpm_called_functions(main_c, functions)
+    if called:
+        return called
+    return ["init_bsp_pins"] if "init_bsp_pins" in functions else []
 
 
 def hpm_assignments(hpmpc: Path, main_c: Path, layout: PinLayout) -> dict[str, dict]:
@@ -514,8 +525,20 @@ def hpm_assignments(hpmpc: Path, main_c: Path, layout: PinLayout) -> dict[str, d
     functions = json.loads(hpmpc.read_text(encoding="utf-8"))["content"]["pinmux"]["functions"]
     by_name = {pin.name: pin for pin in layout.pins}
     assigned: dict[str, dict] = {}
+    owners: dict[str, tuple[str, str]] = {}
     for function in hpm_active_functions(main_c, functions):
         for pad, selection in functions[function].get("selectPins", {}).items():
+            if pad in owners and owners[pad][0] != function:
+                logging.warning(
+                    tr(
+                        f"{hpmpc}: {pad} is selected by both {owners[pad][0]} "
+                        f"({owners[pad][1]}) and {function} ({selection.get('signal')}); "
+                        "the later one wins",
+                        f"{hpmpc}：{pad} 同时被 {owners[pad][0]}（{owners[pad][1]}）和 "
+                        f"{function}（{selection.get('signal')}）选中；以后一个为准",
+                    )
+                )
+            owners[pad] = (function, selection.get("signal") or "")
             pin = by_name.get(pad)
             if pin is None or not selection.get("signal"):
                 continue
@@ -531,12 +554,12 @@ def hpm_assignments(hpmpc: Path, main_c: Path, layout: PinLayout) -> dict[str, d
                 }
                 continue
             recognized = pin_layout.recognize_hpm(canonical)
-            instance, kind, function = recognized or (canonical, "", "")
+            instance, kind, pin_function = recognized or (canonical, "", "")
             assigned[pin.name] = {
                 "signal": canonical,
                 "peripheral": instance,
                 "kind": kind,
-                "function": function,
+                "function": pin_function,
                 "matched": canonical in pin.signals,
             }
     return assigned
