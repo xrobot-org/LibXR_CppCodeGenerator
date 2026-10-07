@@ -52,6 +52,40 @@ def _has_ioc(directory: str) -> bool:
         return False
 
 
+def _has_syscfg(directory: str) -> bool:
+    """directory 的根目录中有 .syscfg 文件（SysConfig 工程）时为 True；目录无法列出时为 False。
+    True when the root of directory holds a .syscfg file (a SysConfig project); False when the
+    directory cannot be listed.
+    """
+    try:
+        return any(name.endswith(".syscfg") for name in os.listdir(directory))
+    except OSError:
+        return False
+
+
+def _has_hpmpc(directory: str) -> bool:
+    """directory 是 HPM 工程（根目录有 app.yaml 且 boards/ 的某个板子目录里有 .hpmpc）时为
+    True；目录无法列出时为 False。
+    True when directory holds an HPM project (an app.yaml in the root and a .hpmpc in a board
+    directory under boards/); False when the directory cannot be listed.
+    """
+    if not os.path.isfile(os.path.join(directory, "app.yaml")):
+        return False
+    try:
+        boards = os.listdir(os.path.join(directory, "boards"))
+    except OSError:
+        return False
+    for name in boards:
+        board = os.path.join(directory, "boards", name)
+        if os.path.isdir(board):
+            try:
+                if any(file.endswith(".hpmpc") for file in os.listdir(board)):
+                    return True
+            except OSError:
+                continue
+    return False
+
+
 def _stm32_parse(args: argparse.Namespace) -> None:
     """用 STM32 解析器运行 libxr parse。
     Run libxr parse with the STM32 parser.
@@ -86,6 +120,78 @@ def _stm32_gen(args: argparse.Namespace) -> None:
     generate(args.input, args.output, use_xrobot, args.libxr_config)
 
 
+def _mspm0_parse(args: argparse.Namespace) -> None:
+    """用 MSPM0 解析器运行 libxr parse。
+    Run libxr parse with the MSPM0 parser.
+    """
+    from libxr.peripheral_analyzer_mspm0 import parse_project
+
+    parse_project(args.directory, args.output)
+
+
+def _mspm0_gen(args: argparse.Namespace) -> None:
+    """用 MSPM0 生成器运行 libxr gen。
+    Run libxr gen with the MSPM0 generator.
+
+    args.xrobot 为 None 时沿用输出文件现在的选择：它由 --xrobot 生成时继续生成 XRobot 代码。
+    With args.xrobot None the output file keeps its choice: XRobot code is generated again when
+    it was generated with --xrobot.
+    """
+    from libxr.generator_code_mspm0 import generate
+    from libxr.generator_stm32_cmake import uses_xrobot
+
+    use_xrobot = args.xrobot
+    if use_xrobot is None:
+        use_xrobot = uses_xrobot(args.output)
+        if use_xrobot:
+            logging.info(
+                tr(
+                    f"{args.output} uses XRobot; generating with --xrobot "
+                    "(--no-xrobot turns it off).",
+                    f"{args.output} 使用了 XRobot，继续按 --xrobot 生成（--no-xrobot 可关闭）。",
+                )
+            )
+    generate(args.input, args.output, use_xrobot, args.libxr_config)
+
+
+def _hpm_parse(args: argparse.Namespace) -> None:
+    """用 HPM 解析器运行 libxr parse。
+    Run libxr parse with the HPM parser.
+    """
+    from libxr.peripheral_analyzer_hpm import parse_project
+
+    parse_project(args.directory, args.output)
+
+
+def _hpm_gen(args: argparse.Namespace) -> None:
+    """用 HPM 生成器运行 libxr gen。
+    Run libxr gen with the HPM generator.
+
+    args.xrobot 为 None 时沿用输出文件现在的选择：它由 --xrobot 生成时继续生成 XRobot 代码。
+    With args.xrobot None the output file keeps its choice: XRobot code is generated again when
+    it was generated with --xrobot.
+    """
+    from libxr.generator_code_hpm import generate
+    from libxr.generator_stm32_cmake import uses_xrobot
+
+    use_xrobot = args.xrobot
+    if use_xrobot is None:
+        use_xrobot = uses_xrobot(args.output)
+        if use_xrobot:
+            logging.info(
+                tr(
+                    f"{args.output} uses XRobot; generating with --xrobot "
+                    "(--no-xrobot turns it off).",
+                    f"{args.output} 使用了 XRobot，继续按 --xrobot 生成（--no-xrobot 可关闭）。",
+                )
+            )
+    generate(args.input, args.output, use_xrobot, args.libxr_config)
+
+
+# 识别顺序与 libxr pins 和 VS Code 扩展一致：一个 HPM 工程（app.yaml 加 boards/ 下的 .hpmpc）
+# 即使根目录还有 .syscfg 也是 HPM。
+# The order of recognition matches libxr pins and the VS Code extension: an HPM project (an
+# app.yaml with a .hpmpc under boards/) is HPM even when its root also holds a .syscfg.
 PLATFORMS = (
     Platform(
         "stm32",
@@ -93,6 +199,26 @@ PLATFORMS = (
         _has_ioc,
         _stm32_parse,
         _stm32_gen,
+    ),
+    Platform(
+        "hpm",
+        lambda: tr(
+            "a directory with an app.yaml and a .hpmpc under boards/",
+            "根目录有 app.yaml 且 boards/ 下有 .hpmpc 文件的目录",
+        ),
+        _has_hpmpc,
+        _hpm_parse,
+        _hpm_gen,
+    ),
+    Platform(
+        "mspm0",
+        lambda: tr(
+            "a directory with a SysConfig .syscfg file in its root",
+            "根目录中含有 SysConfig .syscfg 文件的目录",
+        ),
+        _has_syscfg,
+        _mspm0_parse,
+        _mspm0_gen,
     ),
 )
 
@@ -206,6 +332,63 @@ def cmd_stm32_setup(args: argparse.Namespace) -> None:
     )
 
 
+def _setup_without_cubemx(args: argparse.Namespace, parse, generate) -> None:
+    """没有 CubeMX 步骤的平台（HPM、MSPM0）的 setup，规则与 libxr stm32 setup 相同：写
+    .gitignore（已有的不动），解析工程到 .config.yaml，生成 User/app_main.cpp（或 -o 给出的
+    文件）。--xrobot 和 --no-xrobot 都不给时沿用输出文件现在的选择，新文件不用 XRobot。结束时，
+    XRobot 工程还没有 Modules/modules.yaml 就给出 XRobot 的设置步骤；与 stm32 setup 一样不改
+    User/xrobot_main.hpp，它由 xrobot setup / xrobot gen 生成。
+    The setup of a platform without a CubeMX step (HPM, MSPM0), with the rules of libxr stm32
+    setup: write .gitignore (an existing one stays), parse the project into .config.yaml and
+    generate User/app_main.cpp (or the file -o names). With neither --xrobot nor --no-xrobot
+    the output file keeps its choice, and a new file does not use XRobot. At the end an XRobot
+    project without Modules/modules.yaml gets the XRobot setup steps; like stm32 setup it
+    leaves User/xrobot_main.hpp alone, which xrobot setup / xrobot gen generates.
+    """
+    from libxr.config_cubemx_project import create_gitignore_file, report_xrobot_steps
+    from libxr.generator_stm32_cmake import uses_xrobot
+
+    output = args.output or os.path.join(args.directory, "User", "app_main.cpp")
+    use_xrobot = args.xrobot
+    if use_xrobot is None:
+        use_xrobot = uses_xrobot(output)
+        if use_xrobot:
+            logging.info(
+                tr(
+                    f"{output} uses XRobot; generating with --xrobot (--no-xrobot turns it off).",
+                    f"{output} 使用了 XRobot，继续按 --xrobot 生成（--no-xrobot 可关闭）。",
+                )
+            )
+    create_gitignore_file(args.directory)
+    parse(args.directory, None)
+    generate(os.path.join(args.directory, ".config.yaml"), output, use_xrobot, args.libxr_config)
+    report_xrobot_steps(args.directory, use_xrobot)
+
+
+def cmd_hpm_setup(args: argparse.Namespace) -> None:
+    """libxr hpm setup：解析 HPM 工程并生成 User/app_main.cpp；没有 CubeMX 步骤（见
+    _setup_without_cubemx()）。
+    libxr hpm setup: parse an HPM project and generate User/app_main.cpp; there is no CubeMX
+    step (see _setup_without_cubemx()).
+    """
+    from libxr.generator_code_hpm import generate
+    from libxr.peripheral_analyzer_hpm import parse_project
+
+    _setup_without_cubemx(args, parse_project, generate)
+
+
+def cmd_mspm0_setup(args: argparse.Namespace) -> None:
+    """libxr mspm0 setup：解析 SysConfig 工程并生成 User/app_main.cpp；没有 CubeMX 步骤（见
+    _setup_without_cubemx()）。
+    libxr mspm0 setup: parse a SysConfig project and generate User/app_main.cpp; there is no
+    CubeMX step (see _setup_without_cubemx()).
+    """
+    from libxr.generator_code_mspm0 import generate
+    from libxr.peripheral_analyzer_mspm0 import parse_project
+
+    _setup_without_cubemx(args, parse_project, generate)
+
+
 def cmd_stm32_cubemx_gen(args: argparse.Namespace) -> None:
     """libxr stm32 cubemx-gen：以脚本模式运行 STM32CubeMX 生成工程；出错时记录错误（调试日志另记
     调用栈）并以状态 1 退出。
@@ -253,6 +436,15 @@ def cmd_stm32_flash_info(args: argparse.Namespace) -> None:
     from libxr.stm32_flash_generator import print_flash_info
 
     print_flash_info(args.model)
+
+
+def cmd_pins(args: argparse.Namespace) -> None:
+    """libxr pins：打印一个型号的封装和引脚布局。
+    libxr pins: print the package and pin layout of a model.
+    """
+    from libxr.pin_layout import print_pin_layout
+
+    print_pin_layout(args.model, args.package, args.format, args.directory, args.libxr_config)
 
 
 def cmd_stm32_toolchain(args: argparse.Namespace) -> None:
@@ -315,9 +507,11 @@ def _add_parse(commands) -> None:
         "--directory",
         default=".",
         help=tr(
-            "project directory; an STM32CubeMX project holds one .ioc file (default: current "
-            "directory)",
-            "工程目录，STM32CubeMX 工程含有一个 .ioc 文件（默认：当前目录）",
+            "project directory: an STM32CubeMX project holds one .ioc file, an MSPM0 project "
+            "one .syscfg file in its root and an HPM project an app.yaml plus a .hpmpc under "
+            "boards/ (default: current directory)",
+            "工程目录：STM32CubeMX 工程含有一个 .ioc 文件，MSPM0 工程的根目录含有一个 .syscfg "
+            "文件，HPM 工程有 app.yaml 且 boards/ 下有一个 .hpmpc（默认：当前目录）",
         ),
     )
     parser.add_argument(
@@ -437,6 +631,107 @@ def _add_stm32_setup(commands) -> None:
         help=tr(
             "comma-separated mirror base or repository URLs, tried with --git-source auto",
             "以逗号分隔的镜像基础地址或仓库地址，--git-source 为 auto 时参与选择",
+        ),
+    )
+
+
+def _add_hpm_setup(commands) -> None:
+    """加入 hpm setup 子命令。
+    Add the hpm setup subcommand.
+    """
+    parser = _command(
+        commands,
+        "setup",
+        tr(
+            "set up an HPM project for LibXR: parse the Pinmux Tool project and generate "
+            "User/app_main.cpp (there is no CubeMX step)",
+            "把 HPM 工程配置为使用 LibXR：解析 Pinmux Tool 工程并生成 User/app_main.cpp"
+            "（没有 CubeMX 步骤）",
+        ),
+        cmd_hpm_setup,
+    )
+    parser.add_argument(
+        "-d",
+        "--directory",
+        default=".",
+        help=tr(
+            "project directory: an app.yaml in the root and one .hpmpc under boards/ "
+            "(default: current directory)",
+            "工程目录：根目录有 app.yaml，boards/ 下有一个 .hpmpc（默认：当前目录）",
+        ),
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default="",
+        help=tr(
+            "output C++ file (default: User/app_main.cpp in DIRECTORY)",
+            "输出的 C++ 文件（默认：DIRECTORY 中的 User/app_main.cpp）",
+        ),
+    )
+    _add_xrobot_choice(
+        parser,
+        tr(
+            " (default: keep the choice of the existing output file; a new file uses no XRobot)",
+            "（默认：沿用已有输出文件的选择；新文件不使用 XRobot）",
+        ),
+    )
+    parser.add_argument(
+        "--libxr-config",
+        default="",
+        help=tr(
+            "path or URL of libxr_config.yaml (default: libxr_config.yaml next to the output)",
+            "libxr_config.yaml 的路径或 URL（默认：输出文件所在目录中的 libxr_config.yaml）",
+        ),
+    )
+
+
+def _add_mspm0_setup(commands) -> None:
+    """加入 mspm0 setup 子命令。
+    Add the mspm0 setup subcommand.
+    """
+    parser = _command(
+        commands,
+        "setup",
+        tr(
+            "set up an MSPM0 project for LibXR: parse the SysConfig project and generate "
+            "User/app_main.cpp (there is no CubeMX step)",
+            "把 MSPM0 工程配置为使用 LibXR：解析 SysConfig 工程并生成 User/app_main.cpp"
+            "（没有 CubeMX 步骤）",
+        ),
+        cmd_mspm0_setup,
+    )
+    parser.add_argument(
+        "-d",
+        "--directory",
+        default=".",
+        help=tr(
+            "project directory: a .syscfg file in its root (default: current directory)",
+            "工程目录：根目录有一个 .syscfg 文件（默认：当前目录）",
+        ),
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default="",
+        help=tr(
+            "output C++ file (default: User/app_main.cpp in DIRECTORY)",
+            "输出的 C++ 文件（默认：DIRECTORY 中的 User/app_main.cpp）",
+        ),
+    )
+    _add_xrobot_choice(
+        parser,
+        tr(
+            " (default: keep the choice of the existing output file; a new file uses no XRobot)",
+            "（默认：沿用已有输出文件的选择；新文件不使用 XRobot）",
+        ),
+    )
+    parser.add_argument(
+        "--libxr-config",
+        default="",
+        help=tr(
+            "path or URL of libxr_config.yaml (default: libxr_config.yaml next to the output)",
+            "libxr_config.yaml 的路径或 URL（默认：输出文件所在目录中的 libxr_config.yaml）",
         ),
     )
 
@@ -603,6 +898,70 @@ def _add_project_directory(parser) -> None:
     )
 
 
+def _add_pins(commands) -> None:
+    """加入 pins 子命令。
+    Add the pins subcommand.
+    """
+    parser = _command(
+        commands,
+        "pins",
+        tr(
+            "print the package and pin layout of a chip model (STM32, MSPM0)",
+            "打印芯片型号的封装和引脚布局（STM32、MSPM0）",
+        ),
+        cmd_pins,
+        epilog=tr("examples:", "示例：")
+        + "\n  libxr pins STM32H723VGT6\n  libxr pins MSPM0G3507SPMR"
+        + "\n  libxr pins MSPM0G3507 --package LQFP-64 --format json"
+        + "\n  libxr pins -d path/to/project",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "model",
+        nargs="?",
+        help=tr(
+            "chip model (default: the one of the project given with -d)",
+            "芯片型号（默认：-d 给出的工程的型号）",
+        ),
+    )
+    parser.add_argument(
+        "-d",
+        "--directory",
+        help=tr(
+            "project directory: overlay the signals it has selected (an STM32CubeMX .ioc, or a "
+            "SysConfig ti_msp_dl_config.h) and their libxr_config.yaml settings",
+            "工程目录：叠加其中已选的信号（STM32CubeMX 的 .ioc 或 SysConfig 的 "
+            "ti_msp_dl_config.h）和它们在 libxr_config.yaml 中的设置",
+        ),
+    )
+    parser.add_argument(
+        "-c",
+        "--libxr-config",
+        help=tr(
+            "libxr_config.yaml to read the settings from (default: User/libxr_config.yaml in "
+            "the project)",
+            "读取设置的 libxr_config.yaml（默认：工程中的 User/libxr_config.yaml）",
+        ),
+    )
+    parser.add_argument(
+        "-p",
+        "--package",
+        help=tr(
+            "package, for a model that does not name it (MSPM0: LQFP-64, PM, ...); with -d an "
+            "MSPM0 takes it from the SysConfig project",
+            "封装，用于型号中没有封装的情况（MSPM0：LQFP-64、PM 等）；用 -d 时 MSPM0 取自 "
+            "SysConfig 工程",
+        ),
+    )
+    parser.add_argument(
+        "-f",
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help=tr("output format (default: yaml)", "输出格式（默认：yaml）"),
+    )
+
+
 def _add_stm32_flash_info(commands) -> None:
     """加入 stm32 flash-info 子命令。
     Add the stm32 flash-info subcommand.
@@ -704,6 +1063,7 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(metavar="<command>", required=True)
     _add_parse(commands)
     _add_gen(commands)
+    _add_pins(commands)
     stm32 = commands.add_parser(
         "stm32",
         help=tr("commands for STM32CubeMX projects", "STM32CubeMX 工程的命令"),
@@ -715,11 +1075,25 @@ def build_parser() -> argparse.ArgumentParser:
     _add_stm32_cmake(stm32_commands)
     _add_stm32_flash_info(stm32_commands)
     _add_stm32_toolchain(stm32_commands)
+    hpm = commands.add_parser(
+        "hpm",
+        help=tr("commands for HPM Pinmux Tool projects", "HPM Pinmux Tool 工程的命令"),
+        description=tr("Commands for HPM Pinmux Tool projects.", "HPM Pinmux Tool 工程的命令。"),
+    )
+    hpm_commands = hpm.add_subparsers(metavar="<command>", required=True)
+    _add_hpm_setup(hpm_commands)
+    mspm0 = commands.add_parser(
+        "mspm0",
+        help=tr("commands for TI SysConfig projects", "TI SysConfig 工程的命令"),
+        description=tr("Commands for TI SysConfig projects.", "TI SysConfig 工程的命令。"),
+    )
+    mspm0_commands = mspm0.add_subparsers(metavar="<command>", required=True)
+    _add_mspm0_setup(mspm0_commands)
     # 每个子命令最后都有 --verbose。
     # Every subcommand ends with --verbose.
-    for group in (commands, stm32_commands):
+    for group in (commands, stm32_commands, hpm_commands, mspm0_commands):
         for name, command in group.choices.items():
-            if name != "stm32":
+            if name not in ("stm32", "hpm", "mspm0"):
                 command.add_argument(
                     "--verbose",
                     action="store_true",

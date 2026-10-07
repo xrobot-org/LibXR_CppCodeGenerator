@@ -644,6 +644,54 @@ sectors:
 
 ---
 
+## 📌 引脚布局 / Pin Layout
+
+`libxr pins` 按型号给出芯片的封装和引脚布局：每个引脚的封装位置、名称、类型和全部可选信号。型号的前缀决定平台，目前支持 STM32 和 MSPM0；输出为 YAML，`--format json` 输出 JSON。
+
+`libxr pins` prints the package and pin layout of a chip model: for each pin its position on the package, name, type and all selectable signals. The prefix of the model chooses the platform; STM32 and MSPM0 are supported. The output is YAML, or JSON with `--format json`.
+
+```bash
+$ libxr pins MSPM0G3507SPMR
+model: MSPM0G3507SPMR
+platform: mspm0
+part: MSPM0G3507
+package: LQFP-64(PM)
+pin_count: 64
+# ...
+- position: '33'
+  name: PA0
+  type: Default
+  signals:
+  - PA0
+  - UART0.TX
+  - I2C0.SDA
+  # ...
+  iomux_pincm: 1
+  modes:
+    PA0: 1
+    UART0.TX: 2
+    I2C0.SDA: 3
+    # ...
+```
+
+- `libxr pins -d <工程目录>` 叠加工程已选的信号：STM32 读 CubeMX 的 `.ioc`，MSPM0 读 SysConfig 生成的 `ti_msp_dl_config.h`（型号取自工程；MSPM0 的封装取自 `.syscfg` 的 `--package`，或其 `--board` 对应的 LaunchPad，也可以用 `--package` 指定）。输出多一个 `project` 段：`assignments` 是每个引脚选了什么（信号、外设、功能、GPIO 标签），`peripherals` 是每个外设用到的引脚；STM32 的外设还给出它在 `libxr_config.yaml` 中的段和键（如 `USART.usart1`）和当前参数，文件默认为 `User/libxr_config.yaml`，可用 `-c` 指定。
+- STM32 的封装由型号决定（`STM32H723VGT6` 为 LQFP100）；MSPM0 的封装取自型号后缀中的代码（`MSPM0G3507SPMR` 的 `PM`），型号中没有时用 `--package` 给出（`LQFP-64`、`PM` 或 `LQFP-64(PM)`）。
+- `pin_count` 是封装上的位置数。一个位置可以有多个条目：STM32G0 的 PA9 和 PA11 可以互换，共用一个位置。
+- `peripherals` 列出从信号名识别出的全部外设和每个功能可选的引脚（`USART1` 的 `TX` 可以接 `PA9`、`PB6`、`PB14`）。识别只看信号名，ETH、FMC、OctoSPI 这些 LibXR 没有对应抽象的外设也会列出。普通 GPIO 按端口列出（`GPIOA` 的 `P9` 是 `PA9`）；STM32 的外部中断列为 `EXTI`，`LINE9` 可以来自任一端口的第 9 脚，STM32 的引脚另有 `gpio_modes`（Input、Output、Analog、EXTI 等）；有输出通道的定时器带 `capabilities: [pwm]`。TI 的器件数据没有中断信息，所以 MSPM0 不列 `EXTI`。
+- MSPM0 的引脚还有 `iomux_pincm` 和每个信号的模式号 `modes`。
+- MSPM0 外设的设置取自 `.syscfg`（SysConfig 的配置脚本）：每个已选外设的 `sysconfig` 有它的模块、名字（`UART_0`）和参数（`targetBaudRate`、`enabledInterrupts` 等），`project.sysconfig_file` 是读取的文件。只读，修改在 SysConfig 里进行；表达式原样保留为字符串，引脚的指定和求解器内部的项不收。
+- 数据来自厂商：STM32 来自 ST 的 [STM32_open_pin_data](https://github.com/STMicroelectronics/STM32_open_pin_data)（BSD-3-Clause），MSPM0 来自 TI SysConfig 的器件数据（TI 有限许可，只可用于 TI 器件）。数据文件和两份许可证文本在 `src/libxr/pin_data/`，随包分发；用 `scripts/build_pin_data.py` 重新生成。 MSPM0 的 `.syscfg` 里可能只写了 `--board`（LaunchPad），封装由 MSPM0 SDK 的板子定义得到（`mspm0_boards.json`，BSD-3-Clause，许可证文本为 `LICENSE-TI-BOARDS.txt`）。
+
+- `libxr pins -d <project directory>` overlays the signals a project has selected: the CubeMX `.ioc` for an STM32, the `ti_msp_dl_config.h` SysConfig generates for an MSPM0 (the model comes from the project; the package of an MSPM0 comes from the `.syscfg`, or from `--package`). The output gets a `project` section: `assignments` is what each pin selected (signal, peripheral, function, GPIO label) and `peripherals` the pins each peripheral uses; an STM32 peripheral also gets its section and key in `libxr_config.yaml` (such as `USART.usart1`) and its current parameters, from `User/libxr_config.yaml` by default or the file given with `-c`.
+- The package of an STM32 is part of the model (`STM32H723VGT6` is LQFP100); that of an MSPM0 comes from the code in the model suffix (`PM` of `MSPM0G3507SPMR`), or from `--package` when the model has none (`LQFP-64`, `PM` or `LQFP-64(PM)`).
+- `pin_count` is the number of positions on the package. A position can have several entries: PA9 and PA11 of an STM32G0 can be swapped and share one position.
+- `peripherals` lists every peripheral recognized from the signal names, with the pins that can carry each function (`TX` of `USART1` can use `PA9`, `PB6` or `PB14`). Recognition looks at the signal names only, so peripherals LibXR has no abstraction for, such as ETH, FMC and OctoSPI, are listed too. Plain GPIO is listed by port (`P9` of `GPIOA` is `PA9`); the external interrupts of an STM32 are listed as `EXTI`, where `LINE9` can come from pin 9 of any port, and an STM32 pin also has `gpio_modes` (Input, Output, Analog, EXTI, ...); a timer with output channels carries `capabilities: [pwm]`. TI's device data has no interrupt information, so an MSPM0 lists no `EXTI`.
+- An MSPM0 pin also has `iomux_pincm` and `modes`, the mode of each signal.
+- The settings of an MSPM0 peripheral come from the `.syscfg`, the configuration script of SysConfig: each selected peripheral has a `sysconfig` with its module, its name (`UART_0`) and its parameters (`targetBaudRate`, `enabledInterrupts`, ...), and `project.sysconfig_file` is the file read. They are read-only, edited in SysConfig; an expression is kept as written, as a string, and pin assignments and the solver's own items are left out.
+- The data comes from the vendors: STM32 from ST's [STM32_open_pin_data](https://github.com/STMicroelectronics/STM32_open_pin_data) (BSD-3-Clause), MSPM0 from the device data of TI SysConfig (TI limited license, for TI devices only). The data files and both license texts are in `src/libxr/pin_data/` and are distributed with the package; `scripts/build_pin_data.py` rebuilds them. A `.syscfg` of an MSPM0 may name only a `--board` (a LaunchPad); the package then comes from the board definitions of the MSPM0 SDK (`mspm0_boards.json`, BSD-3-Clause, license text in `LICENSE-TI-BOARDS.txt`).
+
+---
+
 ## 🚀 命令一览 / Commands
 
 `parse` 和 `gen` 按工程所属的平台选择解析器和生成器，只属于某个平台的命令放在平台名之下。
@@ -655,6 +703,7 @@ belong to one platform sit under its name.
 | --- | --- | --- |
 | `libxr parse` | 解析工程，写出工程 YAML | Parse a project into the project YAML |
 | `libxr gen` | 由工程 YAML 生成入口源文件 | Generate the entry source from the project YAML |
+| `libxr pins` | 打印某个型号的封装和引脚布局 | Print the package and pin layout of a model |
 | `libxr stm32 setup` | 为 CubeMX 工程加入 LibXR，生成代码并接入 CMake | Add LibXR to a CubeMX project, generate the code and integrate CMake |
 | `libxr stm32 cubemx-gen` | 以脚本模式运行 STM32CubeMX，由 `.ioc` 重新生成 CubeMX 工程 | Run STM32CubeMX in script mode to regenerate the CubeMX project from the `.ioc` file |
 | `libxr stm32 cmake` | 把 LibXR 接入 CubeMX 的 CMake 工程 | Integrate LibXR into the CubeMX CMake project |

@@ -1,0 +1,54 @@
+{
+ "boards": {
+  "LP_MSPM0C1104": {
+   "device": "MSPM0C1104",
+   "package": "VSSOP-20(DGS20)"
+  },
+  "LP_MSPM0C1106": {
+   "device": "MSPM0C1106",
+   "package": "VQFN-48(RGZ)"
+  },
+  "LP_MSPM0G3218": {
+   "device": "MSPM0G3218",
+   "package": "LQFP-64(PM)"
+  },
+  "LP_MSPM0G3507": {
+   "device": "MSPM0G3507",
+   "package": "LQFP-64(PM)"
+  },
+  "LP_MSPM0G3519": {
+   "device": "MSPM0G3519",
+   "package": "LQFP-100(PZ)"
+  },
+  "LP_MSPM0G5187": {
+   "device": "MSPM0G5187",
+   "package": "LQFP-64(PM)"
+  },
+  "LP_MSPM0H3216": {
+   "device": "MSPM0H3216",
+   "package": "LQFP-48(PT)"
+  },
+  "LP_MSPM0L1117": {
+   "device": "MSPM0L1117",
+   "package": "LQFP-48(PT)"
+  },
+  "LP_MSPM0L1306": {
+   "device": "MSPM0L1306",
+   "package": "VQFN-32(RHB)"
+  },
+  "LP_MSPM0L2117": {
+   "device": "MSPM0L2117",
+   "package": "LQFP-64(PM)"
+  },
+  "LP_MSPM0L2228": {
+   "device": "MSPM0L2228",
+   "package": "LQFP-80(PN)"
+  }
+ },
+ "source": {
+  "commit": "20807db79aa17b49f87ab8ec87f6b6d63ee2cb32",
+  "dataset": "MSPM0 SDK source/ti/boards/.meta",
+  "license": "BSD-3-Clause",
+  "vendor": "Texas Instruments"
+ }
+}
