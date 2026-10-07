@@ -15,27 +15,43 @@ values that are already there).
 
 时钟（M5）：PD1 的 BUSCLK 是 CPUCLK_FREQ；PD0 的是 CPUCLK_FREQ / ULPCLK 分频（生成代码里的
 DL_SYSCTL_setULPCLKDivider，默认 1）。I2C 驱动自己重设时钟（BUSCLK、分频 1），传电源域的
-BUSCLK 即可；SPI 驱动沿用 SysConfig 写下的时钟配置，传入时钟要除以 SysConfig 的 divideRatio
-（时钟源为 MFCLK 时按 4 MHz 计算）。UART 用 SysConfig 的 INST_FREQUENCY 宏，PWM 的源时钟由
-驱动从 INST_CLK_FREQ 求出，都不需要生成器计算。
+BUSCLK 即可；SPI 驱动沿用 SysConfig 写下的时钟配置，传入时钟是 SysConfig 选的时钟源（BUSCLK、
+MFCLK 4 MHz 或 LFCLK 32.768 kHz）除以它的 divideRatio，其他时钟源报错。SysConfig 不为 I2C 和
+SPI 导出时钟宏，工程 YAML 缺少电源域或 CPUCLK 时报错。UART 用 SysConfig 的 INST_FREQUENCY 宏，
+PWM 的源时钟由驱动从 INST_CLK_FREQ 求出，都不需要生成器计算。
 Clocks (M5): the BUSCLK of PD1 is CPUCLK_FREQ, that of PD0 is CPUCLK_FREQ / the ULPCLK divider
 (the DL_SYSCTL_setULPCLKDivider of the generated code, 1 by default). The I2C driver resets the
 clock configuration itself (BUSCLK, divider 1), so the BUSCLK of the power domain is the right
 argument; the SPI driver keeps the clock configuration SysConfig wrote, so its argument is the
-BUSCLK divided by the divideRatio of SysConfig (4 MHz when the source is MFCLK). A UART takes
-the INST_FREQUENCY macro of SysConfig and the source clock of a PWM is derived by the driver
-from INST_CLK_FREQ, so neither needs a generator-side computation.
+clock source SysConfig chose (BUSCLK, MFCLK at 4 MHz or LFCLK at 32.768 kHz) divided by its
+divideRatio, and any other source is an error. SysConfig exports no clock macro for an I2C or
+an SPI, so a project YAML without the power domain or CPUCLK is an error. A UART takes the
+INST_FREQUENCY macro of SysConfig and the source clock of a PWM is derived by the driver from
+INST_CLK_FREQ, so neither needs a generator-side computation.
+
+设置（libxr_config.yaml）：值为 null 时用默认值，缓冲区和队列必须是正整数，UART 的
+tx_buffer_size 还要满足驱动的对齐和 DMA 长度断言；PWM 的 frequency 为 null 时不调用
+SetConfig。terminal_source 沿用 STM32 的约定（空值或 none 不生成终端），只在文件里还没有这个键
+时选第一个 UART。设置键不分大小写，文件里的写法保持不变。
+Settings (libxr_config.yaml): a null value takes the default, the buffers and queues must be
+positive integers and the tx_buffer_size of a UART must also meet the alignment and DMA length
+assertions of the driver; a null PWM frequency calls no SetConfig. terminal_source follows the
+STM32 convention (an empty value or none generates no terminal), and the first UART is chosen
+only while the file has no such key. Settings keys match without regard to case, and the
+spelling of the file is kept.
 
 对象名：GPIO 用引脚标签（$name 去掉 PIN_ 前缀），UART/I2C/SPI 用外设名的小写（uart0），PWM 是
 pwm_<timer>_c<n>。GPIO 中断遵循 STM32 的约定（模型 O1）：生成器只创建对象，边沿来自 SysConfig；
 RegisterCallback、EnableInterrupt 和回调函数属于消费者（Module 或 User Code）。UART 没有 DMA TX
-（或 SPI 没有一对 DMA 通道）时驱动没有对应的构造路径，生成报错。
+（或 SPI 没有一对 DMA 通道）时驱动没有对应的构造路径，生成报错；UART 的 DMA RX 通道不用（不生成
+MSPM0_UART_EXTEND_INIT），给出警告。
 Object names: a GPIO takes the pin label (the $name without its PIN_ prefix), a UART/I2C/SPI
 the lower-case peripheral name (uart0), and a PWM is pwm_<timer>_c<n>. GPIO interrupts follow
 the STM32 convention (model O1): the generator creates the object only, the edge comes from
 SysConfig, and RegisterCallback, EnableInterrupt and the callback belong to the consumer (a
 Module or the User Code). The driver has no construction path for a UART without DMA TX (or an
-SPI without a pair of DMA channels), so generation reports an error then.
+SPI without a pair of DMA channels), so generation reports an error then; the DMA RX channel of
+a UART is unused (MSPM0_UART_EXTEND_INIT is not generated) and warned about.
 """
 
 from __future__ import annotations
@@ -45,6 +61,7 @@ import os
 import re
 import sys
 
+from xr_syntax.cpp import CppDocument
 from xr_syntax.i18n import tr
 
 from libxr import generator_code_stm32 as stm32
@@ -75,9 +92,19 @@ STM32_ONLY_SECTIONS = (
     "USART",
     "SYSTEM",
 )
-# MFCLK 的固定频率（M5）。
-# The fixed frequency of MFCLK (M5).
+# UART 发送缓冲的一半 N（tx_buffer_size）：驱动断言 2 x N 是 2 * alignof(size_t) 的倍数
+# （Cortex-M0+ 上 size_t 按 4 字节对齐，所以 N 是 4 的倍数），且 N 不超过单次 DMA 的
+# 0xFFFF 字节（mspm0_uart.cpp）。
+# The half N of the UART transmit buffer (tx_buffer_size): the driver asserts that 2 x N is a
+# multiple of 2 * alignof(size_t) (size_t aligns to 4 bytes on the Cortex-M0+, so N is a
+# multiple of 4) and that N is at most the 0xFFFF bytes of one DMA transfer (mspm0_uart.cpp).
+UART_TX_ALIGN = 4
+UART_TX_MAX = 0xFFFF // UART_TX_ALIGN * UART_TX_ALIGN
+# SPI 可用的固定时钟源的频率（M5）：MFCLK 4 MHz，LFCLK 32.768 kHz。
+# The frequencies of the fixed clock sources an SPI can use (M5): MFCLK 4 MHz, LFCLK
+# 32.768 kHz.
 MFCLK_FREQ = 4000000
+LFCLK_FREQ = 32768
 
 IDENTIFIER = re.compile(r"[A-Za-z_]\w*")
 DIVIDER_NUMBER = re.compile(r"(?:DIVIDE|RATIO)_(\d+)$")
@@ -108,15 +135,57 @@ def _fail(message: str):
     sys.exit(1)
 
 
-def _instance_settings(group: str, instance: str) -> dict:
-    """libxr_settings 中小写实例键下的设置段，缺少的默认值补进段里。
-    The settings section under the lower-case instance key of libxr_settings[group], with the
-    missing defaults filled in.
+def _settings_of(group: str, name: str) -> dict:
+    """libxr_settings[group] 中对象 name 的设置段：键不分大小写，文件里已有的键保留它的写法
+    （libxr pins -d 也这样找），没有时以小写的 name 新建。
+    The settings section of the object name in libxr_settings[group]: the key is matched
+    without regard to case and a key already in the file keeps its spelling (libxr pins -d
+    finds it the same way); a missing one is created as the lower-case name.
     """
-    section = stm32._settings(group, instance.lower())
+    section = stm32._settings(group)
+    key = next((key for key in section if str(key).lower() == name.lower()), name.lower())
+    return stm32._settings(group, key)
+
+
+def _setting(section: dict, key: str, default):
+    """设置段 section 中 key 的值；缺少或为 null（YAML 中只写了键）时写入并返回 default。
+    The value of key in the settings section; a missing or null value (only the key written in
+    YAML) is replaced by default, which is returned.
+    """
+    if section.get(key) is None:
+        section[key] = default
+    return section[key]
+
+
+def _instance_settings(group: str, instance: str) -> dict:
+    """实例的设置段，缺少的默认值补进段里，每个值都检查过：缓冲区和队列是正整数，DMA 阈值是非负
+    整数；UART 的发送缓冲还要满足驱动的断言（见 UART_TX_ALIGN 和 UART_TX_MAX）。返回检查后的
+    整数值。
+    The settings of an instance with the missing defaults filled in, every value checked: the
+    buffers and queues are positive integers, a DMA threshold a non-negative integer, and the
+    UART transmit buffer also meets the assertions of the driver (see UART_TX_ALIGN and
+    UART_TX_MAX). The checked integers are returned.
+    """
+    section = _settings_of(group, instance)
+    values = {}
     for key, default in MSPM0_DEFAULTS[group].items():
-        section.setdefault(key, default)
-    return section
+        minimum = 0 if key == "dma_enable_min_size" else 1
+        values[key] = stm32._integer(
+            f"{group}.{instance}.{key}", _setting(section, key, default), minimum
+        )
+    if group == "UART":
+        size = values["tx_buffer_size"]
+        if size % UART_TX_ALIGN or size > UART_TX_MAX:
+            raise stm32._invalid_setting(
+                f"UART.{instance}.tx_buffer_size",
+                size,
+                f"a multiple of {UART_TX_ALIGN} up to {UART_TX_MAX} (the driver takes 2 x N "
+                f"bytes, a multiple of 2 * alignof(size_t), and sends at most "
+                f"{UART_TX_MAX + 3} bytes per DMA transfer)",
+                f"{UART_TX_ALIGN} 的倍数且不大于 {UART_TX_MAX}（驱动使用 2 x N 字节，必须是 "
+                f"2 * alignof(size_t) 的倍数，单次 DMA 最多发送 {UART_TX_MAX + 3} 字节）",
+            )
+    return values
 
 
 def _object_name(name: str, kind: str) -> str:
@@ -156,11 +225,22 @@ def _peripherals(project_data: dict) -> dict[str, list]:
             continue
         objects = []
         for instance, record in records.items():
+            if not record.get("Peripheral"):
+                _fail(
+                    tr(
+                        f"{instance}: the project YAML names no peripheral for it; assign one "
+                        "in SysConfig and run `libxr parse` again",
+                        f"{instance}：工程 YAML 没有给出它的外设；请在 SysConfig 中分配外设后"
+                        "重新运行 `libxr parse`",
+                    )
+                )
             if kind == "PWM":
-                # PWM 的对象名 pwm_<timer>_c<n>；定时器取实例名去掉 PWM_ 前缀（或外设名）。
-                # The PWM object name pwm_<timer>_c<n>; the timer is the instance name without
-                # its PWM_ prefix (or the peripheral name).
-                timer = re.sub(r"^PWM_", "", instance).lower()
+                # PWM 的对象名 pwm_<定时器>_c<n>，定时器是外设名（TIMG0），与 libxr pins -d 给出
+                # 的设置键一致；实例名（PWM_0）不进名字。
+                # The PWM object name pwm_<timer>_c<n>, the timer being the peripheral (TIMG0),
+                # as in the settings keys libxr pins -d gives; the instance name (PWM_0) does
+                # not enter the name.
+                timer = str(record["Peripheral"]).lower()
                 for channel in record.get("Channels", []):
                     name = _object_name(f"pwm_{timer}_c{channel}", "PWM")
                     objects.append((name, instance, record, channel))
@@ -173,60 +253,117 @@ def _peripherals(project_data: dict) -> dict[str, list]:
     return result
 
 
-def _clock_constants(project_data: dict) -> list[str]:
-    """时钟常量：每个用到的电源域一个 BUSCLK，SPI 的非默认时钟再各一个；用不到时不生成。
-    The clock constants: one BUSCLK per power domain in use and one per SPI instance with a
-    non-default clock; none when no clock is needed.
+def _domain_clock(instance: str, record: dict, cpuclk) -> int:
+    """实例所在的电源域（0 或 1）；工程 YAML 没有电源域或 CPUCLK 时报错退出：SysConfig 不为
+    I2C 和 SPI 导出输入时钟的宏，生成器必须自己算出 BUSCLK。
+    The power domain (0 or 1) of an instance; a project YAML without the power domain or
+    CPUCLK is an error: SysConfig exports no input clock macro for an I2C or an SPI, so the
+    generator has to compute the BUSCLK itself.
+    """
+    domain = record.get("PowerDomain")
+    if domain not in (0, 1) or cpuclk is None:
+        missing = "CPUCLK" if cpuclk is None else f"the power domain of {record.get('Peripheral')}"
+        missing_zh = "CPUCLK" if cpuclk is None else f"{record.get('Peripheral')} 的电源域"
+        _fail(
+            tr(
+                f"{instance}: the project YAML has no {missing}, so the input clock of the "
+                "driver cannot be computed (SysConfig defines no clock macro for an I2C or "
+                "SPI); run `libxr parse` again with a SysConfig output that defines CPUCLK_FREQ",
+                f"{instance}：工程 YAML 里没有{missing_zh}，算不出驱动的输入时钟（SysConfig 不为 "
+                "I2C 和 SPI 定义时钟宏）；请用定义了 CPUCLK_FREQ 的 SysConfig 输出重新运行 "
+                "`libxr parse`",
+            )
+        )
+    return domain
+
+
+def _spi_clock(instance: str, record: dict) -> tuple[str | None, str, int]:
+    """SPI 的输入时钟：(时钟源常量名，或 BUSCLK 时为 None；时钟源说明；分频数)。驱动沿用
+    SysConfig 写下的时钟配置；不支持的时钟源报错退出。
+    The input clock of an SPI: (the constant of the clock source, or None for the BUSCLK; a
+    description of the source; the divider). The driver keeps the clock configuration SysConfig
+    wrote; an unsupported clock source is an error.
+    """
+    clock = record.get("SysConfigClock") or {}
+    match = DIVIDER_NUMBER.search(str(clock.get("divideRatio") or ""))
+    divider = int(match.group(1)) if match else 1
+    sel = str(clock.get("clockSel") or "")
+    if sel == "" or sel.endswith("_BUSCLK"):
+        return None, "BUSCLK", divider
+    if sel.endswith("_MFCLK"):
+        return "MFCLK_FREQ", "MFCLK (4 MHz)", divider
+    if sel.endswith("_LFCLK"):
+        return "LFCLK_FREQ", "LFCLK (32.768 kHz)", divider
+    _fail(
+        tr(
+            f"{instance}: the SysConfig clock source {sel} is not supported (BUSCLK, MFCLK and "
+            "LFCLK are); choose one of them in SysConfig",
+            f"{instance}：不支持 SysConfig 时钟源 {sel}（支持 BUSCLK、MFCLK 和 LFCLK）；请在 "
+            "SysConfig 中选择其中之一",
+        )
+    )
+
+
+def _clocks(project_data: dict) -> tuple[list[str], dict[str, str]]:
+    """时钟常量和每个 I2C、SPI 实例的时钟实参：用到的电源域各一个 BUSCLK 常量；SysConfig 给
+    SPI 配了非默认时钟（其他时钟源或分频）时再有 MFCLK/LFCLK 常量和该实例的 <实例>_CLK_FREQ，
+    凡被引用的常量都会生成。用不到时钟时两者都为空。
+    The clock constants and the clock argument of every I2C and SPI instance: one BUSCLK
+    constant per power domain in use; when SysConfig gave an SPI a non-default clock (another
+    source or a divider) there is also the MFCLK/LFCLK constant and the <instance>_CLK_FREQ of
+    that instance, and every constant that is referenced is generated. Both are empty when no
+    clock is needed.
     """
     divider = project_data.get("ULPCLKDivider") or 1
     cpuclk = project_data.get("CPUCLK")
-    domains = set()
-    for section in ("I2C", "SPI"):
-        for record in project_data.get("Peripherals", {}).get(section, {}).values():
-            if record.get("PowerDomain") is not None and cpuclk is not None:
-                domains.add(record["PowerDomain"])
-    if not domains:
-        return []
-    domains_text = " and ".join(
-        f"PD{domain} from {'MCLK (CPUCLK_FREQ)' if domain == 1 else _ulpclk_text(divider)}"
-        for domain in sorted(domains)
-    )
-    lines = _comment(
-        f"Input clocks: the BUSCLK of the power domain. {domains_text}. The I2C driver resets "
-        "the clock configuration of its peripherals, so the BUSCLK of the domain is the right "
-        "argument."
-    )
-    for domain in sorted(domains):
-        expression = "CPUCLK_FREQ" if domain == 1 or divider == 1 else f"(CPUCLK_FREQ / {divider})"
-        lines.append(f"static constexpr uint32_t PD{domain}_BUSCLK_FREQ = {expression};")
-    mfclk = False
-    for name, record in project_data.get("Peripherals", {}).get("SPI", {}).items():
-        clock = record.get("SysConfigClock")
-        if not clock:
-            continue
-        match = DIVIDER_NUMBER.search(str(clock.get("divideRatio") or ""))
-        div = int(match.group(1)) if match else 1
-        sel = str(clock.get("clockSel") or "")
-        if sel.endswith("_MFCLK"):
-            if not mfclk:
-                lines.append(f"static constexpr uint32_t MFCLK_FREQ = {MFCLK_FREQ};")
-                mfclk = True
-            base = "MFCLK_FREQ"
-        elif sel and not sel.endswith("_BUSCLK"):
-            logging.warning(
-                tr(
-                    f"{name}: unsupported SysConfig clock source {sel}; the SPI driver keeps "
-                    "the configuration SysConfig wrote, check the clock by hand",
-                    f"{name}：不支持的 SysConfig 时钟源 {sel}；SPI 驱动会沿用 SysConfig 写下的"
-                    "配置，请自行核对时钟",
-                )
-            )
-            continue
+    peripherals = project_data.get("Peripherals", {})
+    domains: set[int] = set()
+    arguments: dict[str, str] = {}
+    spi_lines: list[str] = []
+    sources: dict[str, int] = {}
+    for instance, record in peripherals.get("I2C", {}).items():
+        domain = _domain_clock(instance, record, cpuclk)
+        domains.add(domain)
+        arguments[instance] = f"PD{domain}_BUSCLK_FREQ"
+    for instance, record in peripherals.get("SPI", {}).items():
+        source, text, div = _spi_clock(instance, record)
+        if source is None:
+            domain = _domain_clock(instance, record, cpuclk)
+            domains.add(domain)
+            base, text = f"PD{domain}_BUSCLK_FREQ", f"the BUSCLK of PD{domain}"
         else:
-            base = f"PD{record.get('PowerDomain')}_BUSCLK_FREQ"
-        if div != 1:
-            lines.append(f"static constexpr uint32_t {name}_CLK_FREQ = {base} / {div};")
-    return lines
+            base = source
+            sources[source] = MFCLK_FREQ if source == "MFCLK_FREQ" else LFCLK_FREQ
+        if not record.get("SysConfigClock"):
+            arguments[instance] = base
+            continue
+        constant = f"{instance}_CLK_FREQ"
+        spi_lines += _comment(
+            f"{instance} runs from {text} divided by {div}, as SysConfig configured it; the SPI "
+            "driver keeps that clock configuration."
+        )
+        expression = base if div == 1 else f"{base} / {div}"
+        spi_lines.append(f"static constexpr uint32_t {constant} = {expression};")
+        arguments[instance] = constant
+    lines: list[str] = []
+    if domains:
+        domains_text = " and ".join(
+            f"PD{domain} from {'MCLK (CPUCLK_FREQ)' if domain == 1 else _ulpclk_text(divider)}"
+            for domain in sorted(domains)
+        )
+        lines = _comment(
+            f"Input clocks: the BUSCLK of the power domain. {domains_text}. The I2C driver "
+            "resets the clock configuration of its peripherals, so the BUSCLK of the domain is "
+            "the right argument."
+        )
+        for domain in sorted(domains):
+            expression = (
+                "CPUCLK_FREQ" if domain == 1 or divider == 1 else f"(CPUCLK_FREQ / {divider})"
+            )
+            lines.append(f"static constexpr uint32_t PD{domain}_BUSCLK_FREQ = {expression};")
+    for source in sorted(sources):
+        lines.append(f"static constexpr uint32_t {source} = {sources[source]};")
+    return lines + spi_lines, arguments
 
 
 def _ulpclk_text(divider: int) -> str:
@@ -355,19 +492,36 @@ def _gpio_section(gpio: dict) -> list[str]:
 
 
 def _uart_section(uarts: list) -> list[str]:
-    """UART 对象：MSPM0_UART_MAIN_INIT，发送走 DMA；没有 DMA TX 的实例报错。
-    The UART objects: MSPM0_UART_MAIN_INIT with DMA on the transmit side; an instance without
-    DMA TX reports an error.
+    """UART 对象：MSPM0_UART_MAIN_INIT，发送走 DMA，接收走字节中断；没有 DMA TX 的实例报错，
+    配了 DMA RX 的实例给出警告（不生成 MSPM0_UART_EXTEND_INIT，RX 通道不用）。
+    The UART objects: MSPM0_UART_MAIN_INIT with DMA on the transmit side and byte interrupts on
+    the receive side; an instance without DMA TX reports an error, and one with DMA RX gets a
+    warning (MSPM0_UART_EXTEND_INIT is not generated, so the RX channel is unused).
     """
     lines = [f"{INDENT}// UART: TX with DMA; the receive side runs on byte interrupts."]
     for name, instance, record, _channel in uarts:
         if not record.get("DMA_TX"):
             _fail(
                 tr(
-                    f"{instance}: the MSPM0 UART driver constructs only with DMA TX; enable "
-                    "DMA TX in SysConfig or drop the UART",
-                    f"{instance}：MSPM0 的 UART 驱动只支持带 DMA TX 的构造；请在 SysConfig 中"
-                    "启用 DMA TX，或删去这个 UART",
+                    f"{instance}: no DMA TX channel in the SysConfig project (UART > DMA "
+                    "Configuration: Enable DMA TX with the TX trigger, which also gives the "
+                    f"{instance}_INST_DMA_TRIGGER_n and <channel>_CHAN_ID macros); the MSPM0 UART "
+                    "driver constructs only with DMA TX. Enable it and run `libxr parse` again, "
+                    "or drop the UART",
+                    f"{instance}：SysConfig 工程里没有 DMA TX 通道（UART > DMA Configuration："
+                    f"启用 DMA TX 并选 TX 触发，SysConfig 随之生成 {instance}_INST_DMA_TRIGGER_n "
+                    "和 <通道>_CHAN_ID 宏）；MSPM0 的 UART 驱动只支持带 DMA TX 的构造。请启用后"
+                    "重新运行 `libxr parse`，或删去这个 UART",
+                )
+            )
+        if record.get("DMA_RX"):
+            logging.warning(
+                tr(
+                    f"{instance}: the DMA RX channel {record['DMA_RX']} is not used; the "
+                    "generated UART uses MSPM0_UART_MAIN_INIT, whose receive side runs on byte "
+                    "interrupts (MSPM0_UART_EXTEND_INIT is not generated)",
+                    f"{instance}：DMA RX 通道 {record['DMA_RX']} 不会被使用；生成的 UART 用 "
+                    "MSPM0_UART_MAIN_INIT，接收走字节中断（不生成 MSPM0_UART_EXTEND_INIT）",
                 )
             )
         settings = _instance_settings("UART", name)
@@ -386,23 +540,22 @@ def _uart_section(uarts: list) -> list[str]:
     return lines
 
 
-def _i2c_section(i2cs: list) -> list[str]:
-    """I2C 对象：轮询驱动，缓冲是 DMA 传输的暂存区；时钟是所在电源域的 BUSCLK。
+def _i2c_section(i2cs: list, clocks: dict[str, str]) -> list[str]:
+    """I2C 对象：轮询驱动，缓冲是 DMA 传输的暂存区；时钟是所在电源域的 BUSCLK（clocks 中的
+    实参，见 _clocks()）。
     The I2C objects: the polling driver whose buffer stages DMA transfers; the clock is the
-    BUSCLK of the power domain.
+    BUSCLK of the power domain (the argument in clocks, see _clocks()).
     """
     if not i2cs:
         return []
     lines = [f"{INDENT}// I2C: polling; the buffer stages DMA transfers."]
-    for name, instance, record, _channel in i2cs:
+    for name, instance, _record, _channel in i2cs:
         settings = _instance_settings("I2C", name)
-        domain = record.get("PowerDomain")
-        clock = f"PD{domain}_BUSCLK_FREQ" if domain is not None else f"{instance}_INST_FREQUENCY"
         lines += layout(
             f"static MSPM0I2C {name}",
             [
                 f"MSPM0_I2C_INIT({instance}",
-                clock,
+                clocks[instance],
                 f"{name}_buf",
                 f"sizeof({name}_buf)",
                 f"{settings['dma_enable_min_size']})",
@@ -412,11 +565,11 @@ def _i2c_section(i2cs: list) -> list[str]:
     return lines
 
 
-def _spi_section(spis: list) -> list[str]:
-    """SPI 对象：收发各一个 DMA 通道；时钟是所在电源域的 BUSCLK 按 SysConfig 的 divideRatio
-    分频后的值。
-    The SPI objects: one DMA channel for each direction; the clock is the BUSCLK of the power
-    domain divided by the divideRatio SysConfig wrote.
+def _spi_section(spis: list, clocks: dict[str, str]) -> list[str]:
+    """SPI 对象：收发各一个 DMA 通道；时钟是 SysConfig 配给它的输入时钟（clocks 中的实参，见
+    _clocks()）。
+    The SPI objects: one DMA channel for each direction; the clock is the input clock SysConfig
+    configured for it (the argument in clocks, see _clocks()).
     """
     if not spis:
         return []
@@ -426,25 +579,23 @@ def _spi_section(spis: list) -> list[str]:
         if not dma_rx or not dma_tx:
             _fail(
                 tr(
-                    f"{instance}: the MSPM0 SPI driver constructs only with a pair of DMA "
-                    "channels; enable DMA in SysConfig or drop the SPI",
-                    f"{instance}：MSPM0 的 SPI 驱动只支持带一对 DMA 通道的构造；请在 SysConfig "
-                    "中启用 DMA，或删去这个 SPI",
+                    f"{instance}: the MSPM0 SPI driver constructs only with one DMA channel for "
+                    f"RX and one for TX, and the SysConfig project has RX {dma_rx or 'none'}, "
+                    f"TX {dma_tx or 'none'}. Configure SPI > DMA Configuration (DMA Event 1/2 "
+                    "triggers: one RX or RX timeout, one TX), run `libxr parse` again, or drop "
+                    "the SPI",
+                    f"{instance}：MSPM0 的 SPI 驱动只支持收发各一个 DMA 通道的构造，而 SysConfig "
+                    f"工程里 RX 为 {dma_rx or '没有'}，TX 为 {dma_tx or '没有'}。请配置 SPI > DMA "
+                    "Configuration（DMA Event 1/2 的触发：一个 RX 或 RX timeout，一个 TX）后重新"
+                    "运行 `libxr parse`，或删去这个 SPI",
                 )
             )
         settings = _instance_settings("SPI", name)
-        domain = record.get("PowerDomain")
-        if record.get("SysConfigClock"):
-            clock = f"{instance}_CLK_FREQ"
-        elif domain is not None:
-            clock = f"PD{domain}_BUSCLK_FREQ"
-        else:
-            clock = f"{instance}_INST_FREQUENCY"
         lines += layout(
             f"static MSPM0SPI {name}",
             [
                 f"MSPM0_SPI_INIT({instance}",
-                clock,
+                clocks[instance],
                 dma_rx,
                 dma_tx,
                 f"{name}_rx_buf",
@@ -458,56 +609,55 @@ def _spi_section(spis: list) -> list[str]:
 
 
 def _pwm_section(pwms: list) -> list[str]:
-    """PWM 对象：定时器的每个通道一个 MSPM0PWM；频率设置在 libxr_config.yaml 中给出时对每个
-    通道调用 SetConfig。
-    The PWM objects: one MSPM0PWM per channel of the timer; SetConfig is called on every
-    channel when the frequency is set in libxr_config.yaml.
+    """PWM 对象：定时器的每个通道一个 MSPM0PWM；libxr_config.yaml 给出频率（正整数）时对该
+    通道调用 SetConfig，null 表示不调用。同一定时器的通道共用周期，频率不同时最后一次 SetConfig
+    生效，给出警告。
+    The PWM objects: one MSPM0PWM per channel of the timer; SetConfig is called on a channel
+    when libxr_config.yaml gives its frequency (a positive integer), and null means no call.
+    The channels of one timer share one period, so differing frequencies are warned about: the
+    last SetConfig wins.
     """
     if not pwms:
         return []
     lines = [
         f"{INDENT}// PWM: the channels of one timer share one period, which SysConfig configures.",
     ]
+    frequencies: dict[str, dict[str, int]] = {}
     for name, instance, _record, channel in pwms:
         lines += layout(f"static MSPM0PWM {name}", [f"MSPM0_PWM_CH({instance}, {channel})"])
-        settings = stm32._settings("PWM", name)
+        settings = _settings_of("PWM", name)
         frequency = settings.setdefault("frequency", None)
-        if frequency:
+        if frequency is not None:
+            frequency = stm32._integer(f"PWM.{name}.frequency", frequency)
+            frequencies.setdefault(instance, {})[name] = frequency
             lines += layout(f"{name}.SetConfig", [Braces(str(frequency))])
+    for instance, channels in frequencies.items():
+        if len(set(channels.values())) > 1:
+            listed = ", ".join(f"{name} {value}" for name, value in channels.items())
+            last = list(channels)[-1]
+            logging.warning(
+                tr(
+                    f"libxr_config.yaml: the PWM channels of {instance} share one period but "
+                    f"set different frequencies ({listed}); the last SetConfig ({last}) wins",
+                    f"libxr_config.yaml：{instance} 的 PWM 通道共用一个周期，却设了不同的频率"
+                    f"（{listed}）；以最后一次 SetConfig（{last}）为准",
+                )
+            )
     return lines
 
 
-def _setting_int(key: str, value) -> int:
-    """整数设置：不是正整数时报错退出。
-    An integer setting; a value that is not a positive integer logs an error and exits.
+def _terminal_source(uarts: list) -> str:
+    """生效的终端设备，与 STM32 的约定相同：空值表示不生成终端，none 也一样（写法保持不变）。
+    只有 libxr_config.yaml 里还没有 terminal_source 这个键时（第一次生成），才选第一个 UART 并
+    写进文件；之后用户清空或写成 none，重新生成都不会再打开终端。
+    The effective terminal device, with the STM32 convention: an empty value means no terminal,
+    and so does none (kept as written). Only when libxr_config.yaml has no terminal_source key
+    yet (the first generation) is the first UART chosen and written to the file; once the user
+    empties it or writes none, regenerating never turns the terminal back on.
     """
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or int(value) != value
-        or value < 1
-    ):
-        _fail(
-            tr(
-                f"libxr_config.yaml: {key} {value!r} is not a positive integer",
-                f"libxr_config.yaml：{key} {value!r} 不是正整数",
-            )
-        )
-    return int(value)
-
-
-def _terminal_section(peripherals: dict) -> list[str]:
-    """终端：terminal_source 指定的 UART 作为标准输入输出，RamFS 和 Terminal 由软件定时器任务
-    每 10 ms 运行一次；terminal_source 未设置时用第一个 UART，写成 none 时不生成终端。
-    The terminal: the UART named by terminal_source becomes the standard I/O, and the RamFS and
-    Terminal objects run in a software timer task every 10 ms; the first UART is used when
-    terminal_source is not set, and none skips the terminal.
-    """
-    uarts = peripherals.get("UART", [])
-    source = str(stm32.libxr_settings.get("terminal_source") or "").lower()
-    if not source:
-        if not uarts:
-            return []
+    document = stm32.libxr_config_document
+    source = stm32._text("terminal_source", stm32.libxr_settings.get("terminal_source"))
+    if source == "" and uarts and (document is None or "terminal_source" not in document):
         source = uarts[0][0]
         stm32.libxr_settings["terminal_source"] = source
         logging.info(
@@ -516,8 +666,20 @@ def _terminal_section(peripherals: dict) -> list[str]:
                 f"未设置 terminal_source；使用 {source}",
             )
         )
-    elif source == "none":
-        stm32.libxr_settings["terminal_source"] = ""
+    source = source.lower()
+    return "" if source == "none" else source
+
+
+def _terminal_section(peripherals: dict) -> list[str]:
+    """终端：terminal_source 指定的 UART 作为标准输入输出，RamFS 和 Terminal 由软件定时器任务
+    每 10 ms 运行一次（terminal_source 的取值见 _terminal_source()）。
+    The terminal: the UART named by terminal_source becomes the standard I/O, and the RamFS and
+    Terminal objects run in a software timer task every 10 ms (see _terminal_source() for the
+    values of terminal_source).
+    """
+    uarts = peripherals.get("UART", [])
+    source = _terminal_source(uarts)
+    if not source:
         return []
     names = {name for name, _instance, _record, _channel in uarts}
     if source not in names:
@@ -532,7 +694,7 @@ def _terminal_section(peripherals: dict) -> list[str]:
         return []
     term_config = stm32._settings("Terminal")
     params = [
-        _setting_int(f"Terminal.{key}", term_config.setdefault(key, default))
+        stm32._integer(f"Terminal.{key}", _setting(term_config, key, default))
         for key, default in (
             ("read_buff_size", 32),
             ("max_line_size", 32),
@@ -555,7 +717,7 @@ def _terminal_section(peripherals: dict) -> list[str]:
     ]
 
 
-def _sections(project_data: dict, peripherals: dict, gpio: dict, use_xrobot: bool) -> list[str]:
+def _sections(peripherals: dict, gpio: dict, use_xrobot: bool, clocks: dict[str, str]) -> list[str]:
     """app_main 函数体的各段：时基、GPIO、UART、I2C、SPI、PWM、终端和登记。
     The sections of the app_main body: timebase, GPIO, UART, I2C, SPI, PWM, terminal and the
     registrations.
@@ -568,8 +730,8 @@ def _sections(project_data: dict, peripherals: dict, gpio: dict, use_xrobot: boo
         ],
         _gpio_section(gpio),
         _uart_section(peripherals.get("UART", [])),
-        _i2c_section(peripherals.get("I2C", [])),
-        _spi_section(peripherals.get("SPI", [])),
+        _i2c_section(peripherals.get("I2C", []), clocks),
+        _spi_section(peripherals.get("SPI", []), clocks),
         _pwm_section(peripherals.get("PWM", [])),
         _terminal_section(peripherals),
     ]
@@ -577,6 +739,35 @@ def _sections(project_data: dict, peripherals: dict, gpio: dict, use_xrobot: boo
     if registrations:
         blocks.append([f"{INDENT}// Hardware registration"] + registrations)
     return stm32.join_blocks([block for block in blocks if block])
+
+
+def _check_gpio_name(label: str) -> None:
+    """GPIO 对象名（SysConfig 的引脚名）必须是合法、唯一、非关键字且非保留的 C++ 标识符；不满足
+    时报错退出，说明在 SysConfig 中改名。
+    A GPIO object name (the pin name of SysConfig) must be a valid, unique C++ identifier that
+    is neither a keyword nor reserved; otherwise generation exits with an error that says to
+    rename the pin in SysConfig.
+    """
+    if (
+        not IDENTIFIER.fullmatch(label)
+        or label in stm32.CPP_KEYWORDS
+        or "__" in label
+        or re.match(r"_[A-Z]", label)
+    ):
+        problem = ("is not a valid C++ identifier", "不是可用的 C++ 标识符")
+    elif label in stm32.registered_devices:
+        problem = (
+            f"is already used by the {stm32.registered_devices[label]} object",
+            f"已被 {stm32.registered_devices[label]} 对象使用",
+        )
+    else:
+        return
+    _fail(
+        tr(
+            f"GPIO name {label} {problem[0]}; rename the pin in SysConfig",
+            f"GPIO 名字 {label} {problem[1]}；请在 SysConfig 中给引脚改名",
+        )
+    )
 
 
 def generate_full_code(project_data: dict, use_xrobot: bool, existing_code: str) -> str:
@@ -587,22 +778,9 @@ def generate_full_code(project_data: dict, use_xrobot: bool, existing_code: str)
     peripherals = _peripherals(project_data)
     gpio = project_data.get("GPIO", {})
     for label in gpio:
-        if not IDENTIFIER.fullmatch(label) or label in stm32.registered_devices:
-            _fail(
-                tr(
-                    f"GPIO name {label} is not a valid unique C++ identifier",
-                    f"GPIO 名字 {label} 不是合法且唯一的 C++ 标识符",
-                )
-            )
+        _check_gpio_name(str(label))
         stm32._register_device(label, "GPIO")
     uarts = peripherals.get("UART", [])
-    if uarts and not any(record.get("DMA_TX") for _o, _i, record, _c in uarts):
-        logging.warning(
-            tr(
-                "No UART has DMA TX; the MSPM0 UART driver constructs only with DMA TX",
-                "没有任何 UART 配置 DMA TX；MSPM0 的 UART 驱动只支持带 DMA TX 的构造",
-            )
-        )
     default_3 = (
         []
         if use_xrobot
@@ -616,9 +794,9 @@ def generate_full_code(project_data: dict, use_xrobot: bool, existing_code: str)
     lines = _notice(project_data)
     lines += _includes(project_data, use_xrobot)
     lines += ["", "/* User Code Begin 1 */", "/* User Code End 1 */"]
-    clocks = _clock_constants(project_data)
-    if clocks:
-        lines += [""] + clocks
+    clock_lines, clocks = _clocks(project_data)
+    if clock_lines:
+        lines += [""] + clock_lines
     defines = _uart_dma_defines(uarts)
     if defines:
         lines += [""] + defines
@@ -627,13 +805,57 @@ def generate_full_code(project_data: dict, use_xrobot: bool, existing_code: str)
         lines += [""] + buffers
     lines += ["", 'extern "C" void app_main(void)', "{"]
     lines += [f"{INDENT}/* User Code Begin 2 */", f"{INDENT}/* User Code End 2 */", ""]
-    lines += _sections(project_data, peripherals, gpio, use_xrobot)
+    lines += _sections(peripherals, gpio, use_xrobot, clocks)
     lines += ["", f"{INDENT}/* User Code Begin 3 */"] + default_3
     lines.append(f"{INDENT}/* User Code End 3 */")
     if use_xrobot:
         lines.append(f"{INDENT}XROBOT_MAIN();")
     lines.append("}")
     return stm32._preserve_generated_regions(existing_code, "\n".join(lines) + "\n")
+
+
+# 手写文件被替换时最多列出的行数。
+# At most this many lines are listed when a hand-written file is replaced.
+HAND_WRITTEN_LINES = 20
+
+
+def _warn_hand_written(path: str, existing_code: str, generated_code: str) -> None:
+    """已有的 app_main 不是 libxr gen 生成的（前两行没有生成说明）时给出警告，列出 User Code
+    区域之外、新文件里不再有的行：这些行会被替换。与 STM32 一样照常生成，不拒绝。
+    Warn when the existing app_main was not generated by libxr gen (no generated-file notice in
+    its first two lines) and list the lines outside the User Code regions that the new file no
+    longer has: they are replaced. Generation goes on as on STM32; it is not refused.
+    """
+    if not existing_code.strip() or GENERATED_NOTICE in existing_code.splitlines()[:2]:
+        return
+    source = existing_code.encode("utf-8", errors="surrogateescape")
+    spans = [region.body_span for region in CppDocument.parse(existing_code).user_regions()]
+    outside, start = [], 0
+    for span in sorted(spans, key=lambda span: span.start):
+        outside.append(source[start : span.start])
+        start = span.end
+    outside.append(source[start:])
+    kept = {line.strip() for line in generated_code.splitlines()}
+    replaced = [
+        line.strip()
+        for part in outside
+        for line in part.decode("utf-8", errors="replace").splitlines()
+        if line.strip() and line.strip() not in kept
+    ]
+    if not replaced:
+        return
+    listed = "\n".join(f"  {line}" for line in replaced[:HAND_WRITTEN_LINES])
+    more = len(replaced) - HAND_WRITTEN_LINES
+    listed += tr(f"\n  ... and {more} more", f"\n  ……另有 {more} 行") if more > 0 else ""
+    logging.warning(
+        tr(
+            f"{path} was not generated by libxr gen; everything outside the User Code regions "
+            f"is regenerated, and these {len(replaced)} line(s) of it are replaced; code to "
+            f"keep belongs in the User Code regions:\n{listed}",
+            f"{path} 不是 libxr gen 生成的；User Code 区域之外的内容全部重新生成，以下 "
+            f"{len(replaced)} 行被替换；要保留的代码应放在 User Code 区域中：\n{listed}",
+        )
+    )
 
 
 def initialize_registry() -> None:
@@ -697,10 +919,10 @@ def generate(
             stm32.reject_user_xrobot_main(existing_code)
             existing_code = stm32._without_default_loop(existing_code)
 
+        code = generate_full_code(project_data, use_xrobot, existing_code)
+        _warn_hand_written(output_path, existing_code, code)
         files = {
-            os.path.basename(output_path): generate_full_code(
-                project_data, use_xrobot, existing_code
-            ),
+            os.path.basename(output_path): code,
             "app_main.h": stm32.APP_MAIN_HEADER,
             "libxr_config.yaml": stm32.libxr_config_text(),
         }

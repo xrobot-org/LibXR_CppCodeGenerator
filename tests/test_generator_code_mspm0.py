@@ -490,7 +490,7 @@ class Generation(MSPM0TestCase):
         return logs.output[-1]
 
     def test_the_generated_source_matches_the_reviewed_output(self):
-        for name in ("g3507", "g3519"):
+        for name in ("g3507", "g3519", "variants"):
             with self.subTest(name=name):
                 generator.initialize_registry()
                 generator.reset_settings()
@@ -543,6 +543,194 @@ class Generation(MSPM0TestCase):
         self.assertNotIn("xrobot_main.hpp", code)
         self.assertIn("Thread::Sleep(UINT32_MAX);", code)
         self.assertNotIn("XROBOT_MAIN();", code)
+
+    def test_the_spi_clock_constant_is_defined_whenever_it_is_used(self):
+        # H2：MFCLK 不分频和 LFCLK 时也定义 SPI_1_CLK_FREQ。
+        # H2: SPI_1_CLK_FREQ is defined for MFCLK without a divider and for LFCLK as well.
+        root, code = self.generate("variants")
+        self.assertIn("static constexpr uint32_t SPI_1_CLK_FREQ = MFCLK_FREQ / 4;", code)
+        for sel, div, line in (
+            ("MFCLK", 1, "SPI_1_CLK_FREQ = MFCLK_FREQ;"),
+            ("LFCLK", 2, "SPI_1_CLK_FREQ = LFCLK_FREQ / 2;"),
+            ("BUSCLK", 2, "SPI_1_CLK_FREQ = PD1_BUSCLK_FREQ / 2;"),
+        ):
+            with self.subTest(sel=sel, div=div):
+
+                def change(data, sel=sel, div=div):
+                    data["Peripherals"]["SPI"]["SPI_1"]["SysConfigClock"] = {
+                        "clockSel": f"DL_SPI_CLOCK_{sel}",
+                        "divideRatio": f"DL_SPI_CLOCK_DIVIDE_RATIO_{div}",
+                    }
+
+                self.project_yaml(root, change)
+                with self.assertLogs(level="WARNING"):
+                    code = self.regenerate(root)
+                self.assertIn(f"static constexpr uint32_t {line}", code)
+                self.assertIn("MSPM0_SPI_INIT(SPI_1, SPI_1_CLK_FREQ,", code)
+                source = line.split(" = ")[1].split(" ")[0].rstrip(";")
+                self.assertIn(f"static constexpr uint32_t {source} = ", code)
+
+    def test_an_unsupported_spi_clock_source_is_an_error(self):
+        root, _code = self.generate("variants")
+
+        def change(data):
+            data["Peripherals"]["SPI"]["SPI_1"]["SysConfigClock"]["clockSel"] = "DL_SPI_CLOCK_X"
+
+        self.project_yaml(root, change)
+        self.assertIn(
+            "SPI_1: the SysConfig clock source DL_SPI_CLOCK_X is not supported", self.failure(root)
+        )
+
+    def test_a_missing_power_domain_is_an_error_not_an_undefined_macro(self):
+        # L3：SysConfig 不为 I2C 定义 I2C_0_INST_FREQUENCY。
+        # L3: SysConfig defines no I2C_0_INST_FREQUENCY for an I2C.
+        root, _code = self.generate("variants")
+        self.project_yaml(root, lambda data: data["Peripherals"]["I2C"]["I2C_0"].pop("PowerDomain"))
+        self.assertIn("I2C_0: the project YAML has no the power domain of I2C0", self.failure(root))
+
+    def test_a_pwm_object_is_named_after_its_timer(self):
+        # H4：实例名 PWM_0、定时器 TIMG0 -> pwm_timg0_c0，与 libxr pins -d 一致。
+        # H4: instance PWM_0 on timer TIMG0 -> pwm_timg0_c0, as libxr pins -d names it.
+        root, code = self.generate("variants")
+        self.assertIn("static MSPM0PWM pwm_timg0_c0(MSPM0_PWM_CH(PWM_0, 0));", code)
+        self.assertIn("pwm_timg0_c1", self.settings(root)["PWM"])
+
+    def test_terminal_source_none_or_empty_stays_off(self):
+        # M1：与 STM32 一样，空值不生成终端；第一次生成时才选第一个 UART。
+        # M1: as on STM32 an empty value generates no terminal; only the first generation
+        # picks the first UART.
+        for value in ("none", ""):
+            with self.subTest(value=value):
+                generator.initialize_registry()
+                generator.reset_settings()
+                root, code = self.generate("variants")
+                self.assertIn("// Terminal on uart0", code)
+                self.settings(
+                    root, lambda settings, value=value: settings.update(terminal_source=value)
+                )
+                for _ in range(2):
+                    with self.assertLogs(level="WARNING"):
+                        code = self.regenerate(root)
+                    self.assertNotIn("Terminal on", code)
+                    self.assertEqual(self.settings(root)["terminal_source"], value)
+
+    def test_settings_are_validated(self):
+        # M2
+        root, _code = self.generate("variants")
+        for section, name, key, value, message in (
+            ("UART", "uart0", "tx_buffer_size", 30, "is not a multiple of 4 up to 65532"),
+            ("UART", "uart0", "tx_buffer_size", 65536, "is not a multiple of 4 up to 65532"),
+            ("UART", "uart0", "tx_queue_size", 0, "is not a positive integer"),
+            ("SPI", "spi1", "dma_enable_min_size", "abc", "is not a non-negative integer"),
+            ("I2C", "i2c0", "buffer_size", 1.5, "is not a positive integer"),
+            ("PWM", "pwm_timg0_c0", "frequency", "fast", "is not a positive integer"),
+            ("Terminal", None, "max_line_size", -1, "is not a positive integer"),
+        ):
+            with self.subTest(key=key, value=value):
+
+                def change(settings, section=section, name=name, key=key, value=value):
+                    (settings[section][name] if name else settings[section])[key] = value
+
+                previous = self.settings(root)
+                self.settings(root, change)
+                error = self.failure(root)
+                self.assertIn(f"{key} {value!r} {message}", error)
+                (root / "User" / "libxr_config.yaml").write_text(
+                    yaml.dump(previous), encoding="utf-8"
+                )
+
+    def test_a_null_setting_takes_the_default(self):
+        # M2：null 不再写成 2 * None。
+        # M2: a null no longer becomes 2 * None.
+        root, _code = self.generate("variants")
+        self.settings(root, lambda settings: settings["UART"]["uart0"].update(tx_buffer_size=None))
+        with self.assertLogs(level="WARNING"):
+            code = self.regenerate(root)
+        self.assertIn("static uint8_t uart0_tx_buf[2 * 128];", code)
+        self.assertNotIn(".SetConfig", code)
+
+    def test_a_settings_key_in_another_case_is_used_and_kept(self):
+        root, _code = self.generate("variants")
+
+        def change(settings):
+            settings["UART"] = {"UART0": settings["UART"].pop("uart0")}
+            settings["UART"]["UART0"]["tx_buffer_size"] = 64
+
+        self.settings(root, change)
+        with self.assertLogs(level="WARNING"):
+            code = self.regenerate(root)
+        self.assertIn("static uint8_t uart0_tx_buf[2 * 64];", code)
+        self.assertEqual(list(self.settings(root)["UART"]), ["UART0"])
+
+    def test_a_dma_rx_channel_of_a_uart_is_a_warning(self):
+        # L1
+        root, _code = self.generate("variants")
+        with self.assertLogs(level="WARNING") as logs:
+            self.regenerate(root)
+        self.assertIn(
+            "WARNING:root:UART_0: the DMA RX channel DMA_CH_UART0_RX is not used; the generated "
+            "UART uses MSPM0_UART_MAIN_INIT, whose receive side runs on byte interrupts "
+            "(MSPM0_UART_EXTEND_INIT is not generated)",
+            logs.output,
+        )
+
+    def test_a_uart_without_dma_tx_names_the_sysconfig_option(self):
+        # L6
+        root, _code = self.generate("variants")
+        self.project_yaml(root, lambda data: data["Peripherals"]["UART"]["UART_0"].pop("DMA_TX"))
+        self.assertIn(
+            "UART_0: no DMA TX channel in the SysConfig project (UART > DMA Configuration: "
+            "Enable DMA TX",
+            self.failure(root),
+        )
+
+    def test_different_frequencies_of_one_timer_are_a_warning(self):
+        # L7
+        root, _code = self.generate("variants")
+
+        def change(settings):
+            settings["PWM"]["pwm_timg0_c0"]["frequency"] = 1000
+            settings["PWM"]["pwm_timg0_c1"]["frequency"] = 2000
+
+        self.settings(root, change)
+        with self.assertLogs(level="WARNING") as logs:
+            self.regenerate(root)
+        self.assertIn(
+            "WARNING:root:libxr_config.yaml: the PWM channels of PWM_0 share one period but set "
+            "different frequencies (pwm_timg0_c0 1000, pwm_timg0_c1 2000); the last SetConfig "
+            "(pwm_timg0_c1) wins",
+            logs.output,
+        )
+
+    def test_a_hand_written_file_lists_the_lines_that_are_replaced(self):
+        # M6：已有文件没有生成说明时警告，照常生成。
+        # M6: an existing file without the generated-file notice is warned about and generated
+        # as usual.
+        root, _code = self.generate("g3507")
+        output = root / "User" / "app_main.cpp"
+        output.write_text(
+            '#include "app_main.h"\n'
+            "static int hand_written = 1;\n"
+            "/* User Code Begin 1 */\nstatic int kept = 2;\n/* User Code End 1 */\n"
+            'extern "C" void app_main(void)\n{\n'
+            "  /* User Code Begin 2 */\n  /* User Code End 2 */\n"
+            "  KEY1.EnableInterrupt();\n"
+            "  /* User Code Begin 3 */\n  /* User Code End 3 */\n"
+            "  XROBOT_MAIN();\n}\n",
+            encoding="utf-8",
+        )
+        with self.assertLogs(level="WARNING") as logs:
+            code = self.regenerate(root)
+        warning = next(line for line in logs.output if "was not generated by libxr gen" in line)
+        self.assertIn("these 2 line(s) of it are replaced", warning)
+        self.assertTrue(
+            warning.endswith("\n  static int hand_written = 1;\n  KEY1.EnableInterrupt();")
+        )
+        self.assertIn("static int kept = 2;", code)
+        # 生成过的文件不再警告。
+        # A generated file is not warned about any more.
+        with self.assertNoLogs(level="WARNING"):
+            self.regenerate(root)
 
 
 class Analyzer(TestCase):
