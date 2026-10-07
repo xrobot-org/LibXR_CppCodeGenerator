@@ -2,21 +2,28 @@
 libxr parse for an MSPM0 project: parse the SysConfig project and write the project YAML.
 
 工程是根目录中唯一的 .syscfg。解析读两个来源：.syscfg 本身（外设实例、参数和引脚分配），以及
-SysConfig 生成的 ti_msp_dl_config.h/.c（实际生成的宏名、CPUCLK_FREQ 和 ULPCLK 分频）。工程目录
-的 build* 里比 .syscfg 新的生成结果直接复用；否则用 SYSCONFIG_TOOL 运行一次（MSPM0_SDK_INSTALL_DIR
-和 SYSCONFIG_TOOL，与 CMake 的 MSPM0SysConfig.cmake 用的环境变量相同），生成到临时目录。
+SysConfig 生成的 ti_msp_dl_config.h/.c（实际生成的宏名、CPUCLK_FREQ、ULPCLK 分频和各实例的时钟
+配置）。设置了 SYSCONFIG_TOOL 和 MSPM0_SDK_INSTALL_DIR（与 CMake 的 MSPM0SysConfig.cmake 用的环境
+变量相同）时总是运行一次 SysConfig，生成到临时目录；没有设置时复用工程目录 build*、cmake-build*
+或 out 下比 .syscfg 新的生成结果。复用只比较修改时间：换成一个修改时间更旧的 .syscfg 时，旧输出
+仍会被复用，这时请重新构建或设置这两个变量。
 The project is the single .syscfg in the root. Parsing reads two sources: the .syscfg itself
 (peripheral instances, parameters and pin assignments) and the ti_msp_dl_config.h/.c that
-SysConfig generates (the macro names actually emitted, CPUCLK_FREQ and the ULPCLK divider). A
-generated output newer than the .syscfg under a build* directory of the project is reused;
-otherwise SysConfig runs once (MSPM0_SDK_INSTALL_DIR and SYSCONFIG_TOOL, the environment
-variables the CMake MSPM0SysConfig.cmake uses as well) into a temporary directory.
+SysConfig generates (the macro names actually emitted, CPUCLK_FREQ, the ULPCLK divider and the
+clock configuration of each instance). With SYSCONFIG_TOOL and MSPM0_SDK_INSTALL_DIR set (the
+environment variables the CMake MSPM0SysConfig.cmake uses as well) SysConfig always runs once,
+into a temporary directory; without them a generated output newer than the .syscfg under
+build*, cmake-build* or out in the project is reused. Reuse compares modification times only: a
+.syscfg replaced by one with an older modification time still reuses the old output, so build
+again or set the two variables then.
 
-外设分两类：LibXR 有驱动的（UART、I2C、SPI、PWM）进入 Peripherals，gen 为它们生成对象；其余
-（ADC12、DAC12、MCAN、QEI……）记入 Other，只作展示。GPIO 引脚进入 GPIO 段。
-Peripherals split in two: the ones LibXR has drivers for (UART, I2C, SPI, PWM) go into
-Peripherals and gen generates objects for them; the rest (ADC12, DAC12, MCAN, QEI, ...) are
-recorded under Other for display only. The GPIO pins go into the GPIO section.
+外设分两类：LibXR 有驱动的（UART、控制器模式的 I2C 和 SPI、PWM）进入 Peripherals，gen 为它们
+生成对象；其余（ADC12、DAC12、MCAN、QEI、目标模式的 I2C、外设模式的 SPI……）记入 Other，只作
+展示。GPIO 引脚进入 GPIO 段。
+Peripherals split in two: the ones LibXR has drivers for (UART, I2C and SPI in controller mode,
+PWM) go into Peripherals and gen generates objects for them; the rest (ADC12, DAC12, MCAN, QEI,
+an I2C in target mode, an SPI in peripheral mode, ...) are recorded under Other for display
+only. The GPIO pins go into the GPIO section.
 """
 
 from __future__ import annotations
@@ -34,6 +41,7 @@ import yaml
 from xr_syntax.i18n import tr
 
 from libxr import pin_layout, pin_project
+from libxr.generator_code_stm32 import CPP_KEYWORDS
 
 
 def _save_to_yaml(data: dict, output_path: str) -> bool:
@@ -78,8 +86,18 @@ def _print_summary(data: dict) -> None:
     gpio = data.get("GPIO", {})
     print(tr(f"\nGPIO ({len(gpio)} pins):", f"\nGPIO（{len(gpio)} 个引脚）："))
     for label, pin in gpio.items():
-        interrupt = f", {pin['Interrupt']} interrupt" if "Interrupt" in pin else ""
-        print(f"  {label}: {pin['Pin']}, {pin['Direction']}{interrupt}")
+        direction = pin["Direction"]
+        if "Interrupt" in pin:
+            print(
+                tr(
+                    f"  {label}: {pin['Pin']}, {direction}, {pin['Interrupt']} interrupt",
+                    f"  {label}：{pin['Pin']}，{direction}，{pin['Interrupt']} 中断",
+                )
+            )
+        else:
+            print(
+                tr(f"  {label}: {pin['Pin']}, {direction}", f"  {label}：{pin['Pin']}，{direction}")
+            )
     print(tr("\nActive Peripherals:", "\n已启用的外设："))
     for section, group in data.get("Peripherals", {}).items():
         print(tr(f"  {section}: {len(group)} instance(s)", f"  {section}：{len(group)} 个实例"))
@@ -91,19 +109,27 @@ def _print_summary(data: dict) -> None:
 # Time limit in seconds for a SysConfig run.
 SYSCONFIG_TIMEOUT = 300
 
+# 复用 SysConfig 输出时找的构建目录（工程根目录下的 glob）。
+# The build directories searched for a SysConfig output to reuse (globs in the project root).
+BUILD_DIRECTORIES = ("build*", "cmake-build*", "out")
+
 # LibXR 有驱动、gen 生成对象的模块：模块名 -> Peripherals 段的键。
 # The modules LibXR has drivers for and gen generates objects for: module -> the key of the
 # Peripherals section.
 GENERATED_MODULES = {"UART": "UART", "I2C": "I2C", "SPI": "SPI", "PWM": "PWM"}
 
-# 驱动会重设时钟配置的外设，SysConfig 写入的 clockSel 和 divideRatio 只起信息作用。
-# Peripherals whose clock configuration the driver resets; the clockSel and divideRatio
-# SysConfig wrote are informational only.
-DRIVER_RESET_CLOCKS = ("I2C",)
-
 SYSCFG_GPIO_PARAM = re.compile(r"^\.associatedPins\[(\d+)\]\.(\w+)$")
-SYSCFG_PERIPH_MEMBER = re.compile(r"^\.peripheral\.(\w+)\.\$assign$")
-SYSCFG_PWM_CHANNEL = re.compile(r"^\.peripheral\.ccp(\d+)Pin\.\$assign$")
+SYSCFG_PERIPH_MEMBER = re.compile(r"^\.peripheral\.(\w+)\.\$(assign|suggestSolution)$")
+SYSCFG_PWM_CHANNEL = re.compile(r"^ccp(\d+)Pin$")
+# 实例的时钟配置结构：gI2C_0ClockConfig，SPI 写成 gSPI_1_clockConfig；成员按列对齐，等号前的
+# 空格数不定。
+# The clock configuration struct of an instance: gI2C_0ClockConfig, written gSPI_1_clockConfig
+# for an SPI; the members are aligned in columns, so the spaces before the equals sign vary.
+CLOCK_CONFIG = re.compile(r"static const \w+ g(\w+?)_?[Cc]lockConfig\s*=\s*\{(.*?)\};", re.S)
+CLOCK_MEMBER = r"\.{}\s*=\s*(\w+)"
+HEADER_DEFINE = re.compile(r"^#define[ \t]+(\w+)(?:[ \t]+(.*?))?[ \t\r]*$", re.M)
+DMA_TRIGGER = re.compile(r"\(?\s*DMA_\w+?_(TX|RX)_TRIG\s*\)?")
+IDENTIFIER = re.compile(r"[A-Za-z_]\w*")
 
 
 def _strip_comments(text: str) -> str:
@@ -121,9 +147,11 @@ class Instances:
     """
 
     def __init__(self, text: str) -> None:
-        """解析 .syscfg 的脚本正文，按变量记下每个实例的全部赋值。
+        """解析 .syscfg 的脚本正文，按变量记下每个实例的全部赋值。外设和引脚都是 $assign 优先，
+        求解器的 $suggestSolution 兜底（与 libxr pins 的读法相同）。
         Parse the script body of a .syscfg and record every assignment of each instance by its
-        variable.
+        variable. For the peripheral and the pins $assign wins and the solver's
+        $suggestSolution is the fallback, as libxr pins reads them.
         """
         text = _strip_comments(text)
         modules = dict(pin_project.SYSCFG_MODULE.findall(text))
@@ -160,7 +188,9 @@ class Instances:
                 entry["peripheral"] = entry["peripheral"] or value
             elif tail.startswith(".peripheral."):
                 member = SYSCFG_PERIPH_MEMBER.match(tail)
-                if member:
+                # $assign 覆盖同名成员的 $suggestSolution，反过来不覆盖。
+                # $assign overrides a $suggestSolution of the same member, not the other way.
+                if member and (member.group(2) == "assign" or member.group(1) not in entry["pins"]):
                     entry["pins"][member.group(1)] = value
             elif tail.startswith(".DMA_CHANNEL_"):
                 entry["dma"][tail] = value
@@ -173,9 +203,6 @@ class Instances:
                     f".associatedPins[{index}].pin.$assign",
                     f".associatedPins[{index}].pin.$suggestSolution",
                 ):
-                    # $assign 优先于 $suggestSolution；后写的 $suggestSolution 不覆盖 $assign。
-                    # $assign wins over $suggestSolution; a later $suggestSolution does not
-                    # override an $assign.
                     if tail.endswith(".$assign") or "pin" not in pin:
                         pin["pin"] = value
                 else:
@@ -197,58 +224,128 @@ class Instances:
         return found
 
 
-def _sysconfig_output(directory: Path, syscfg: Path) -> tuple[str, str]:
-    """SysConfig 生成的 ti_msp_dl_config.h 和 .c 的内容：优先复用 build* 中比 .syscfg 新的输出，
-    否则运行 SysConfig 到临时目录（用后删除）。
-    The contents of the ti_msp_dl_config.h/.c SysConfig generates: an output under build* that
-    is newer than the .syscfg is reused; otherwise SysConfig runs into a temporary directory
-    (removed afterwards).
+def _fail(message: str):
+    """记录错误并以状态 1 退出。
+    Log an error and exit with status 1.
     """
-    syscfg_mtime = syscfg.stat().st_mtime
-    reused = sorted(
-        (
-            path
-            for path in directory.glob("build*/**/syscfg/ti_msp_dl_config.h")
-            if path.stat().st_mtime >= syscfg_mtime
-        ),
-        key=lambda path: path.stat().st_mtime,
-    )
-    if reused:
-        header = reused[-1]
-        source = header.with_name("ti_msp_dl_config.c")
-        if source.is_file():
-            build_dir = header.parent.parent
-            label = (
-                build_dir.relative_to(directory)
-                if build_dir.is_relative_to(directory)
-                else build_dir
-            )
-            logging.info(
-                tr(
-                    f"Reusing the SysConfig output in {label}",
-                    f"复用 {label} 中的 SysConfig 输出",
-                )
-            )
-            return header.read_text(encoding="utf-8", errors="replace"), source.read_text(
-                encoding="utf-8", errors="replace"
-            )
+    logging.error(message)
+    sys.exit(1)
 
-    tool = os.environ.get("SYSCONFIG_TOOL", "")
-    sdk = os.environ.get("MSPM0_SDK_INSTALL_DIR", "")
-    if not tool or not sdk or not os.path.exists(os.path.join(sdk, ".metadata", "product.json")):
-        logging.error(
-            tr(
-                f"{directory}: no SysConfig output newer than {syscfg.name} found under build*, "
-                "and SYSCONFIG_TOOL or MSPM0_SDK_INSTALL_DIR is not set (the environment "
-                "variables the CMake build uses). Build the project once, or set them and run "
-                "`libxr parse` again.",
-                f"{directory}：build* 下没有比 {syscfg.name} 新的 SysConfig 输出，且没有设置 "
-                "SYSCONFIG_TOOL 或 MSPM0_SDK_INSTALL_DIR（CMake 构建使用的环境变量）。"
-                "请先构建一次工程，或设置它们后重新运行 `libxr parse`。",
+
+def _read_output(directory: Path) -> tuple[str, str]:
+    """directory 中 ti_msp_dl_config.h 和 .c 的内容。
+    The contents of ti_msp_dl_config.h and .c in directory.
+    """
+    header = directory / "ti_msp_dl_config.h"
+    source = directory / "ti_msp_dl_config.c"
+    return header.read_text(encoding="utf-8", errors="replace"), source.read_text(
+        encoding="utf-8", errors="replace"
+    )
+
+
+def _sysconfig_problems(tool: str, sdk: str) -> list[tuple[str, str]]:
+    """SysConfig 环境的问题：没有设置的变量，或设置了但指错的路径；没有问题时为空。
+    The problems of the SysConfig environment: a variable that is not set, or one that is set
+    to a wrong path; empty when there is none.
+    """
+    problems = []
+    if not tool:
+        problems.append(("SYSCONFIG_TOOL is not set", "没有设置 SYSCONFIG_TOOL"))
+    elif not os.path.isfile(tool):
+        problems.append(
+            (
+                f"SYSCONFIG_TOOL={tool} is not a file (it names sysconfig_cli.bat or "
+                "sysconfig_cli.sh)",
+                f"SYSCONFIG_TOOL={tool} 不是文件（应指向 sysconfig_cli.bat 或 sysconfig_cli.sh）",
             )
         )
-        sys.exit(1)
+    if not sdk:
+        problems.append(("MSPM0_SDK_INSTALL_DIR is not set", "没有设置 MSPM0_SDK_INSTALL_DIR"))
+    elif not os.path.isfile(os.path.join(sdk, ".metadata", "product.json")):
+        problems.append(
+            (
+                f"MSPM0_SDK_INSTALL_DIR={sdk} has no .metadata/product.json",
+                f"MSPM0_SDK_INSTALL_DIR={sdk} 中没有 .metadata/product.json",
+            )
+        )
+    return problems
 
+
+def _reusable_output(directory: Path, syscfg: Path) -> Path | None:
+    """工程构建目录（BUILD_DIRECTORIES）中比 .syscfg 新、.h 和 .c 都在的最新一份 SysConfig 输出
+    目录；没有时为 None。
+    The newest SysConfig output directory in the build directories of the project
+    (BUILD_DIRECTORIES) that is newer than the .syscfg and holds both the .h and the .c; None
+    when there is none.
+    """
+    syscfg_mtime = syscfg.stat().st_mtime
+    headers = [
+        path
+        for pattern in BUILD_DIRECTORIES
+        for path in directory.glob(f"{pattern}/**/syscfg/ti_msp_dl_config.h")
+        if path.stat().st_mtime >= syscfg_mtime and path.with_suffix(".c").is_file()
+    ]
+    if not headers:
+        return None
+    return max(headers, key=lambda path: path.stat().st_mtime).parent
+
+
+def _sysconfig_output(directory: Path, syscfg: Path) -> tuple[str, str]:
+    """SysConfig 生成的 ti_msp_dl_config.h 和 .c 的内容：SysConfig 环境可用时运行它到临时目录
+    （用后删除），否则复用构建目录中比 .syscfg 新的输出；都不行时说明缺什么并退出。
+    The contents of the ti_msp_dl_config.h/.c SysConfig generates: with a usable SysConfig
+    environment it runs into a temporary directory (removed afterwards), otherwise an output in
+    a build directory that is newer than the .syscfg is reused; when neither works, say what is
+    missing and exit.
+    """
+    tool = os.environ.get("SYSCONFIG_TOOL", "")
+    sdk = os.environ.get("MSPM0_SDK_INSTALL_DIR", "")
+    problems = _sysconfig_problems(tool, sdk)
+    if not problems:
+        return _run_sysconfig(tool, sdk, syscfg)
+    english = "; ".join(problem[0] for problem in problems)
+    chinese = "；".join(problem[1] for problem in problems)
+
+    reused = _reusable_output(directory, syscfg)
+    if reused is not None and (tool or sdk):
+        # 设置了却指错的环境变量要说出来，否则用户不知道 SysConfig 为什么没有运行。
+        # A variable that is set but wrong is reported; otherwise nobody learns why SysConfig
+        # did not run.
+        logging.warning(
+            tr(
+                f"SysConfig cannot run: {english}; the build output is reused instead",
+                f"无法运行 SysConfig：{chinese}；改为复用构建输出",
+            )
+        )
+    if reused is not None:
+        build_dir = reused.parent
+        label = (
+            build_dir.relative_to(directory) if build_dir.is_relative_to(directory) else build_dir
+        )
+        logging.info(
+            tr(f"Reusing the SysConfig output in {label}", f"复用 {label} 中的 SysConfig 输出")
+        )
+        return _read_output(reused)
+
+    _fail(
+        tr(
+            f"{directory}: no SysConfig output newer than {syscfg.name} found under "
+            f"{', '.join(BUILD_DIRECTORIES)}, and SysConfig cannot run: {english} (the "
+            "environment variables the CMake build uses). Build the project once, or set them "
+            "and run `libxr parse` again.",
+            f"{directory}：{'、'.join(BUILD_DIRECTORIES)} 下没有比 {syscfg.name} 新的 SysConfig "
+            f"输出，且无法运行 SysConfig：{chinese}（CMake 构建使用的环境变量）。请先构建一次"
+            "工程，或设置它们后重新运行 `libxr parse`。",
+        )
+    )
+
+
+def _run_sysconfig(tool: str, sdk: str, syscfg: Path) -> tuple[str, str]:
+    """用 SysConfig 生成 syscfg 的输出到临时目录并读出 .h 和 .c；运行失败、超时或无法启动时
+    记录错误并退出。
+    Generate the output of syscfg into a temporary directory with SysConfig and read the .h and
+    the .c; a failed, timed-out or unstartable run logs an error and exits.
+    """
     output = tempfile.mkdtemp(prefix="libxr-sysconfig-")
     try:
         command = [
@@ -261,36 +358,60 @@ def _sysconfig_output(directory: Path, syscfg: Path) -> tuple[str, str]:
             output,
             str(syscfg),
         ]
-        result = subprocess.run(command, capture_output=True, text=True, timeout=SYSCONFIG_TIMEOUT)
+        logging.info(
+            tr(f"Running SysConfig on {syscfg.name}", f"正在对 {syscfg.name} 运行 SysConfig")
+        )
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True, timeout=SYSCONFIG_TIMEOUT
+            )
+        except subprocess.TimeoutExpired:
+            _fail(
+                tr(
+                    f"SysConfig did not finish on {syscfg} within {SYSCONFIG_TIMEOUT} s ({tool})",
+                    f"SysConfig 在 {SYSCONFIG_TIMEOUT} 秒内没有处理完 {syscfg}（{tool}）",
+                )
+            )
+        except OSError as error:
+            _fail(
+                tr(
+                    f"Cannot run SysConfig ({tool}): {error}",
+                    f"无法运行 SysConfig（{tool}）：{error}",
+                )
+            )
         if result.returncode != 0:
-            logging.error(
+            _fail(
                 tr(
                     f"SysConfig failed on {syscfg}:\n{result.stdout}{result.stderr}",
                     f"SysConfig 在 {syscfg} 上运行失败：\n{result.stdout}{result.stderr}",
                 )
             )
-            sys.exit(1)
-        header = Path(output) / "ti_msp_dl_config.h"
-        source = Path(output) / "ti_msp_dl_config.c"
-        return header.read_text(encoding="utf-8", errors="replace"), source.read_text(
-            encoding="utf-8", errors="replace"
-        )
+        try:
+            return _read_output(Path(output))
+        except OSError as error:
+            _fail(
+                tr(
+                    f"SysConfig wrote no ti_msp_dl_config.h/.c for {syscfg}: {error}",
+                    f"SysConfig 没有为 {syscfg} 写出 ti_msp_dl_config.h/.c：{error}",
+                )
+            )
     finally:
         shutil.rmtree(output, ignore_errors=True)
 
 
-def _defines(header: str) -> set[str]:
-    """ti_msp_dl_config.h 定义的宏名。
-    The macro names ti_msp_dl_config.h defines.
+def _header_defines(header: str) -> dict[str, str]:
+    """ti_msp_dl_config.h 定义的宏，按出现顺序：宏名 -> 值（去掉首尾空白，没有值时为空串）。
+    The macros ti_msp_dl_config.h defines, in order: name -> value (stripped, empty when the
+    macro has none).
     """
-    return set(re.findall(r"^#define\s+(\w+)", header, re.M))
+    return {name: (value or "").strip() for name, value in HEADER_DEFINE.findall(header)}
 
 
-def _cpuclk(header: str) -> int | None:
+def _cpuclk(defines: dict[str, str]) -> int | None:
     """ti_msp_dl_config.h 里的 CPUCLK_FREQ；没有时为 None。
     The CPUCLK_FREQ of ti_msp_dl_config.h; None when it does not define one.
     """
-    match = re.search(r"^#define\s+CPUCLK_FREQ\s+(\d+)", header, re.M)
+    match = re.fullmatch(r"\(?(\d+)U?\)?", defines.get("CPUCLK_FREQ", ""))
     return int(match.group(1)) if match else None
 
 
@@ -303,14 +424,15 @@ def _ulpclk_divider(source: str) -> int:
 
 
 def _clock_configs(source: str) -> dict[str, dict]:
-    """ti_msp_dl_config.c 里每个实例的时钟配置：实例名（I2C_0）-> clockSel 和 divideRatio。
-    The clock configuration of every instance in ti_msp_dl_config.c: instance name (I2C_0) ->
-    its clockSel and divideRatio.
+    """ti_msp_dl_config.c 里每个实例的时钟配置：实例名（I2C_0、SPI_1）-> clockSel 和
+    divideRatio。
+    The clock configuration of every instance in ti_msp_dl_config.c: instance name (I2C_0,
+    SPI_1) -> its clockSel and divideRatio.
     """
     found: dict[str, dict] = {}
-    for name, body in re.findall(r"static const \w+ g(\w+)ClockConfig = \{(.*?)\};", source, re.S):
-        sel = re.search(r"\.clockSel = (\w+)", body)
-        div = re.search(r"\.divideRatio = (\w+)", body)
+    for name, body in CLOCK_CONFIG.findall(source):
+        sel = re.search(CLOCK_MEMBER.format("clockSel"), body)
+        div = re.search(CLOCK_MEMBER.format("divideRatio"), body)
         found[name] = {
             "clockSel": sel.group(1) if sel else None,
             "divideRatio": div.group(1) if div else None,
@@ -319,11 +441,11 @@ def _clock_configs(source: str) -> dict[str, dict]:
 
 
 def _clock_is_default(clock: dict) -> bool:
-    """实例的 SysConfig 时钟配置是否为默认的 BUSCLK + 分频 1（驱动会重设的外设除外，那只影响
-    SysConfig 写下的初值）。
+    """实例的 SysConfig 时钟配置是否为默认的 BUSCLK + 分频 1（驱动会重设时钟的外设，例如 I2C，
+    这只描述 SysConfig 写下的初值）。
     Whether the SysConfig clock configuration of the instance is the default BUSCLK with divider
-    1; for a peripheral whose driver resets the clock this only describes the initial value
-    SysConfig wrote.
+    1; for a peripheral whose driver resets the clock, such as an I2C, this only describes the
+    initial value SysConfig wrote.
     """
     sel, div = clock.get("clockSel"), clock.get("divideRatio")
     return sel in (
@@ -341,11 +463,70 @@ def _clock_is_default(clock: dict) -> bool:
     )
 
 
-def _gpio_entries(syscfg: Path, instances: Instances, defines: set[str]) -> dict:
+def _device_names(power_domains: dict[str, int], defines: dict[str, str]) -> set[str]:
+    """GPIO 对象名不能用的器件名字：器件头文件的外设实例宏（UART0、SPI1、TIMG0、GPIOA……，取自
+    P1 数据的电源域表）和 ti_msp_dl_config.h 定义的宏。
+    The device names a GPIO object cannot take: the peripheral instance macros of the device
+    header (UART0, SPI1, TIMG0, GPIOA, ..., from the power domain table of the P1 data) and the
+    macros ti_msp_dl_config.h defines.
+    """
+    names = {name for name in power_domains if not re.fullmatch(r"P[A-Z]\d+", name)}
+    names.update({"GPIOA", "GPIOB", "GPIOC"})
+    names.update(defines)
+    return names
+
+
+def _gpio_label(syscfg: Path, group: str, name: str) -> str:
+    """GPIO 对象名：引脚 $name 去掉 PIN_ 前缀（PIN_LED1 -> LED1）；去掉后不是合法标识符时
+    （SysConfig 的默认名 PIN_0 -> 0）退回小写的组名加引脚名（gpio_btn_pin_0），并提示怎样在
+    SysConfig 中改名。
+    The GPIO object name: the pin $name without its PIN_ prefix (PIN_LED1 -> LED1); when that
+    is not a valid identifier (the SysConfig default PIN_0 -> 0) it falls back to the
+    lower-case group plus pin name (gpio_btn_pin_0), with a hint on renaming in SysConfig.
+    """
+    label = name[4:] if name.startswith("PIN_") else name
+    if IDENTIFIER.fullmatch(label):
+        return label
+    fallback = re.sub(r"\W", "_", f"{group}_{name}".lower())
+    logging.warning(
+        tr(
+            f"{syscfg.name}: the GPIO pin {name} of {group} gives no valid C++ name ({label}); "
+            f"the object is named {fallback}. Give the pin a name in SysConfig (GPIO > {group} "
+            "> the pin > Name, for example PIN_LED1 for LED1) to choose it.",
+            f"{syscfg.name}：{group} 的 GPIO 引脚 {name} 得不到合法的 C++ 名字（{label}）；对象"
+            f"命名为 {fallback}。请在 SysConfig 中给引脚命名（GPIO > {group} > 该引脚 > Name，"
+            "例如 PIN_LED1 得到 LED1）。",
+        )
+    )
+    return fallback
+
+
+def _gpio_physical(pin: dict, port_value: str, pin_value: str) -> str | None:
+    """引脚的物理位置（PB8）：.syscfg 的 pin.$assign/$suggestSolution；没有时（TI 例程里的端口
+    加引脚号写法，或求解器选的引脚）取自 SysConfig 输出的 PORT 和 PIN 宏的值（GPIOB、
+    DL_GPIO_PIN_8）。都没有时为 None。
+    The physical position of a pin (PB8): pin.$assign/$suggestSolution of the .syscfg; without
+    it (the port plus pin number form of TI's examples, or a pin the solver chose) it comes from
+    the values of the PORT and PIN macros of the SysConfig output (GPIOB, DL_GPIO_PIN_8). None
+    when neither gives it.
+    """
+    if pin.get("pin"):
+        return str(pin["pin"])
+    port = re.search(r"\bGPIO([A-Z])\b", port_value)
+    line = re.search(r"\bDL_GPIO_PIN_(\d+)\b", pin_value)
+    if port and line:
+        return f"P{port.group(1)}{int(line.group(1))}"
+    return None
+
+
+def _gpio_entries(
+    syscfg: Path, instances: Instances, defines: dict[str, str], device_names: set[str]
+) -> dict:
     """.syscfg 中 GPIO 组的引脚：标签（$name 去掉 PIN_ 前缀）-> 组、物理引脚、实际生成的宏和
-    电气设置。
+    电气设置。跳过的引脚都给出警告；与器件宏同名的标签报错退出。
     The pins of the GPIO groups in the .syscfg: label (the $name without its PIN_ prefix) ->
     group, physical pin, the macros that were actually generated and the electrical settings.
+    Every skipped pin is warned about; a label named like a device macro is an error.
     """
     entries: dict[str, dict] = {}
     for entry in instances.of_var.values():
@@ -361,8 +542,15 @@ def _gpio_entries(syscfg: Path, instances: Instances, defines: set[str]) -> dict
         group_port = f"{group_name}_PORT" in defines
         for index in sorted(entry["gpio"]):
             pin = entry["gpio"][index]
-            name, physical = pin.get("name"), pin.get("pin")
-            if not name or not physical:
+            name = pin.get("name")
+            if not name:
+                logging.warning(
+                    tr(
+                        f"{syscfg.name}: pin {index} of the GPIO group {group_name} has no "
+                        "name; it is skipped",
+                        f"{syscfg.name}：GPIO 组 {group_name} 的第 {index} 个引脚没有名字；跳过",
+                    )
+                )
                 continue
             port_macro = f"{group_name}_PORT" if group_port else f"{group_name}_{name}_PORT"
             pin_macro = f"{group_name}_{name}_PIN"
@@ -380,6 +568,17 @@ def _gpio_entries(syscfg: Path, instances: Instances, defines: set[str]) -> dict
                     )
                 )
                 continue
+            physical = _gpio_physical(pin, defines[port_macro], defines[pin_macro])
+            if physical is None:
+                logging.warning(
+                    tr(
+                        f"{syscfg.name}: cannot tell the pin of the GPIO {name} from "
+                        f"{port_macro} and {pin_macro}; it is skipped",
+                        f"{syscfg.name}：无法从 {port_macro} 和 {pin_macro} 得知 GPIO {name} "
+                        "的引脚；跳过",
+                    )
+                )
+                continue
             record = {
                 "Group": group_name,
                 "Pin": physical,
@@ -390,8 +589,20 @@ def _gpio_entries(syscfg: Path, instances: Instances, defines: set[str]) -> dict
                 "Resistor": pin.get("internalResistor", "NONE"),
             }
             if pin.get("interruptEn"):
-                record["Interrupt"] = pin.get("polarity", "RISE")
-            label = name[4:] if name.startswith("PIN_") else name
+                # SysConfig 的触发极性默认是 DISABLE（GPIOPin.syscfg.js）。
+                # The trigger polarity of SysConfig defaults to DISABLE (GPIOPin.syscfg.js).
+                record["Interrupt"] = pin.get("polarity", "DISABLE")
+            label = _gpio_label(syscfg, group_name, name)
+            if label in device_names or label in CPP_KEYWORDS:
+                _fail(
+                    tr(
+                        f"{syscfg.name}: the GPIO object name {label} (pin {name} of "
+                        f"{group_name}) is a C++ keyword or a macro of the device or of the "
+                        "SysConfig output; rename the pin in SysConfig",
+                        f"{syscfg.name}：GPIO 对象名 {label}（{group_name} 的引脚 {name}）是 "
+                        "C++ 关键字，或器件、SysConfig 输出中的宏；请在 SysConfig 中给引脚改名",
+                    )
+                )
             if label in entries:
                 logging.warning(
                     tr(
@@ -403,23 +614,132 @@ def _gpio_entries(syscfg: Path, instances: Instances, defines: set[str]) -> dict
     return entries
 
 
-def _dma_channel(entry: dict, direction: str) -> str | None:
-    """实例的 DMA 通道名：UART 是 DMA_CHANNEL_TX/RX，SPI 是事件通道，按触发方向区分。
-    The DMA channel name of an instance: DMA_CHANNEL_TX/RX for a UART, the event channels of an
-    SPI told apart by their trigger direction.
+def _header_dma_channel(name: str, direction: str, defines: dict[str, str]) -> str | None:
+    """SysConfig 输出里实例 name 在 direction（TX/RX）方向的 DMA 通道名：每个
+    <name>_INST_DMA_TRIGGER_n 前面紧挨着它的通道的 <通道>_CHAN_ID。没有时为 None。
+    The DMA channel name of the instance name in direction (TX/RX) in the SysConfig output:
+    every <name>_INST_DMA_TRIGGER_n directly follows the <channel>_CHAN_ID of its channel. None
+    when there is none.
     """
-    name = entry["dma"].get(f".DMA_CHANNEL_{direction}.$name")
-    if name:
-        return name
+    channel = None
+    for macro, value in defines.items():
+        if macro.endswith("_CHAN_ID"):
+            channel = macro[: -len("_CHAN_ID")]
+        elif re.fullmatch(rf"{re.escape(name)}_INST_DMA_TRIGGER_\d+", macro):
+            trigger = DMA_TRIGGER.fullmatch(value)
+            if trigger and trigger.group(1) == direction and channel:
+                return channel
+    return None
+
+
+def _dma_channel(name: str, entry: dict, direction: str, defines: dict[str, str]) -> str | None:
+    """实例的 DMA 通道名：UART 是 DMA_CHANNEL_TX/RX，SPI 是事件通道，按触发方向区分（RX 的触发
+    包括 RX_TIMEOUT）；.syscfg 没写通道名时取自 SysConfig 输出。
+    The DMA channel name of an instance: DMA_CHANNEL_TX/RX for a UART, the event channels of an
+    SPI told apart by their trigger direction (an RX trigger includes RX_TIMEOUT); when the
+    .syscfg does not name the channel it comes from the SysConfig output.
+    """
+    channel = entry["dma"].get(f".DMA_CHANNEL_{direction}.$name")
+    if channel:
+        return channel
     for event in (1, 2):
         channel = entry["dma"].get(f".DMA_CHANNEL_EVENT{event}.$name")
-        trigger = entry["params"].get(f"enabledDMAEvent{event}Triggers")
+        trigger = str(entry["params"].get(f"enabledDMAEvent{event}Triggers") or "")
         if channel and trigger:
-            if direction == "RX" and trigger.endswith("_RX"):
+            if direction == "RX" and re.search(r"_RX(_TIMEOUT)?$", trigger):
                 return channel
             if direction == "TX" and trigger.endswith("_TX"):
                 return channel
+    return _header_dma_channel(name, direction, defines)
+
+
+def _not_generated(syscfg: Path, module: str, name: str, entry: dict, defines: dict) -> str | None:
+    """LibXR 驱动不支持的工作模式：I2C 只有目标模式（SysConfig 输出里没有 <name>_BUS_SPEED_HZ），
+    SPI 是外设模式。返回原因的英文和中文，支持时为 None。
+    A mode the LibXR driver does not support: an I2C in target mode only (no <name>_BUS_SPEED_HZ
+    in the SysConfig output) and an SPI in peripheral mode. Returns the reason, or None when
+    the mode is supported.
+    """
+    if module == "I2C" and f"{name}_BUS_SPEED_HZ" not in defines:
+        return tr(
+            f"{syscfg.name}: {name} is not in controller mode (no {name}_BUS_SPEED_HZ in the "
+            "SysConfig output); the LibXR MSPM0 I2C driver is controller-only, so no object is "
+            "generated and the instance is listed under Other",
+            f"{syscfg.name}：{name} 不是控制器模式（SysConfig 输出里没有 {name}_BUS_SPEED_HZ）；"
+            "LibXR 的 MSPM0 I2C 驱动只支持控制器，不生成对象，实例列在 Other 中",
+        )
+    if module == "SPI" and str(entry["params"].get("mode", "CONTROLLER")) != "CONTROLLER":
+        return tr(
+            f"{syscfg.name}: {name} is in {entry['params']['mode']} mode; the LibXR MSPM0 SPI "
+            "driver is controller-only, so no object is generated and the instance is listed "
+            "under Other",
+            f"{syscfg.name}：{name} 是 {entry['params']['mode']} 模式；LibXR 的 MSPM0 SPI 驱动只"
+            "支持控制器，不生成对象，实例列在 Other 中",
+        )
     return None
+
+
+def _pwm_channels(syscfg: Path, name: str, entry: dict, defines: dict[str, str]) -> list[int]:
+    """PWM 实例的通道：SysConfig 输出里的 GPIO_<name>_C<n>_IDX；输出里没有时取 .syscfg 的
+    ccp<n>Pin（$assign 或 $suggestSolution）。都没有时给出警告。
+    The channels of a PWM instance: GPIO_<name>_C<n>_IDX in the SysConfig output; without them
+    the ccp<n>Pin members of the .syscfg ($assign or $suggestSolution). A warning when neither
+    gives any.
+    """
+    pattern = re.compile(rf"GPIO_{re.escape(name)}_C(\d+)_IDX")
+    channels = sorted({int(m.group(1)) for macro in defines if (m := pattern.fullmatch(macro))})
+    if not channels:
+        channels = sorted(
+            {int(m.group(1)) for member in entry["pins"] if (m := SYSCFG_PWM_CHANNEL.match(member))}
+        )
+    if not channels:
+        logging.warning(
+            tr(
+                f"{syscfg.name}: the PWM {name} has no channel (no GPIO_{name}_C<n>_IDX in the "
+                "SysConfig output and no ccp<n>Pin in the .syscfg); no PWM object is generated",
+                f"{syscfg.name}：PWM {name} 没有通道（SysConfig 输出里没有 GPIO_{name}_C<n>_IDX，"
+                ".syscfg 里也没有 ccp<n>Pin）；不生成 PWM 对象",
+            )
+        )
+    return channels
+
+
+def _syscfg_of(directory: str) -> Path:
+    """directory 根目录唯一的 .syscfg；不是正好一个时报错退出。
+    The single .syscfg in the root of directory; an error exits when there is not exactly one.
+    """
+    syscfgs = sorted(Path(directory).glob("*.syscfg"))
+    if len(syscfgs) != 1:
+        names = ", ".join(path.name for path in syscfgs) or tr("none found", "没有找到")
+        _fail(
+            tr(
+                f"{directory} must hold exactly one .syscfg file in its root ({names})",
+                f"{directory} 的根目录必须有且只有一个 .syscfg 文件（{names}）",
+            )
+        )
+    return syscfgs[0]
+
+
+def _device_of(syscfg: Path) -> tuple[str, dict[str, int]]:
+    """.syscfg 的器件（@v2CliArgs 的 --device，或 --board 的板子表）和器件族的外设电源域；没有
+    器件或器件未知时报错退出。
+    The device of the .syscfg (--device of @v2CliArgs, or the board table for --board) and the
+    peripheral power domains of its family; a missing or unknown device is an error.
+    """
+    meta = pin_project.read_syscfg(syscfg)
+    board = pin_project.load_boards().get(meta.board or "")
+    device = meta.device or (board or {}).get("device")
+    if device is None:
+        _fail(
+            tr(
+                f"{syscfg.name} does not name a device (@v2CliArgs --device or --board)",
+                f"{syscfg.name} 没有给出器件（@v2CliArgs 的 --device 或 --board）",
+            )
+        )
+    try:
+        return device, _power_domains(device)
+    except ValueError as error:
+        _fail(tr(f"{syscfg.name}: {error}", f"{syscfg.name}：{error}"))
 
 
 def parse_project(directory: str, output: str | None = None, summary: bool = True) -> None:
@@ -433,54 +753,37 @@ def parse_project(directory: str, output: str | None = None, summary: bool = Tru
     that the directory exists and the root holds one .syscfg file.
     """
     root = Path(directory)
-    syscfgs = sorted(root.glob("*.syscfg"))
-    if len(syscfgs) != 1:
-        names = ", ".join(path.name for path in syscfgs) or tr("none found", "没有找到")
-        logging.error(
-            tr(
-                f"{directory} must hold exactly one .syscfg file in its root ({names})",
-                f"{directory} 的根目录必须有且只有一个 .syscfg 文件（{names}）",
-            )
-        )
-        sys.exit(1)
-    syscfg = syscfgs[0]
+    syscfg = _syscfg_of(directory)
     logging.info(tr(f"Processing {syscfg.name}...", f"正在处理 {syscfg.name}……"))
-
+    device, power_domains = _device_of(syscfg)
     header, source = _sysconfig_output(root, syscfg)
-    meta = pin_project.read_syscfg(syscfg)
-    board = pin_project.load_boards().get(meta.board or "")
-    device = meta.device or (board or {}).get("device")
-    if device is None:
-        logging.error(
-            tr(
-                f"{syscfg.name} does not name a device (@v2CliArgs --device or --board)",
-                f"{syscfg.name} 没有给出器件（@v2CliArgs 的 --device 或 --board）",
-            )
-        )
-        sys.exit(1)
+    defines = _header_defines(header)
 
     instances = Instances(syscfg.read_text(encoding="utf-8", errors="replace"))
     peripherals: dict[str, dict] = {}
+    other: dict[str, dict] = {}
     for module, section in GENERATED_MODULES.items():
         for name, entry in instances.peripherals(module).items():
-            record = {"Peripheral": entry["peripheral"]}
+            # .syscfg 没写外设时（求解器选的）取 SysConfig 输出的 <name>_INST。
+            # When the .syscfg names no peripheral (the solver chose it) it comes from the
+            # <name>_INST of the SysConfig output.
+            peripheral = entry["peripheral"] or defines.get(f"{name}_INST") or None
+            reason = _not_generated(syscfg, module, name, entry, defines)
+            if reason:
+                logging.warning(reason)
+                other[name] = {"Module": module, "Peripheral": peripheral}
+                continue
+            record = {"Peripheral": peripheral}
             for direction in ("TX", "RX"):
-                channel = _dma_channel(entry, direction)
+                channel = _dma_channel(name, entry, direction, defines)
                 if channel:
                     record[f"DMA_{direction}"] = channel
-            pins = {member: pin for member, pin in entry["pins"].items()}
-            if pins:
-                record["Pins"] = pins
+            if entry["pins"]:
+                record["Pins"] = dict(entry["pins"])
             if module == "PWM":
-                channels = sorted(
-                    int(match.group(1))
-                    for member in entry["pins"]
-                    if (match := SYSCFG_PWM_CHANNEL.match(f".peripheral.{member}.$assign"))
-                )
-                record["Channels"] = channels
+                record["Channels"] = _pwm_channels(syscfg, name, entry, defines)
             peripherals.setdefault(section, {})[name] = record
 
-    other: dict[str, dict] = {}
     for entry in instances.of_var.values():
         module, name, peripheral = entry["module"], entry["name"], entry["peripheral"]
         if module in GENERATED_MODULES or module == "GPIO":
@@ -492,7 +795,6 @@ def parse_project(directory: str, output: str | None = None, summary: bool = Tru
     # 每个外设实例所在的电源域（P1 的数据），gen 的时钟计算（M5）要用。
     # The power domain of every peripheral instance (the P1 data), for the clock computation of
     # gen (M5).
-    power_domains = _power_domains(device)
     clocks = _clock_configs(source)
     for _section, records in peripherals.items():
         for name, record in records.items():
@@ -507,9 +809,9 @@ def parse_project(directory: str, output: str | None = None, summary: bool = Tru
         "Platform": "mspm0",
         "Syscfg": syscfg.name,
         "Mcu": {"Family": "MSPM0", "Type": device},
-        "CPUCLK": _cpuclk(header),
+        "CPUCLK": _cpuclk(defines),
         "ULPCLKDivider": _ulpclk_divider(source),
-        "GPIO": _gpio_entries(syscfg, instances, _defines(header)),
+        "GPIO": _gpio_entries(syscfg, instances, defines, _device_names(power_domains, defines)),
         "Peripherals": {**peripherals, "Other": other} if other else peripherals,
     }
 
@@ -528,8 +830,9 @@ def parse_project(directory: str, output: str | None = None, summary: bool = Tru
 
 
 def _power_domains(device: str) -> dict[str, int]:
-    """器件所属家族的外设电源域（P1 的 mspm0 数据：模块名 -> 0/1）。
-    The peripheral power domains of the family of the device (the P1 mspm0 data: module -> 0/1).
+    """器件所属家族的外设电源域（P1 的 mspm0 数据：模块名 -> 0/1）；器件未知时抛出 ValueError。
+    The peripheral power domains of the family of the device (the P1 mspm0 data: module ->
+    0/1); an unknown device raises ValueError.
     """
     data = pin_layout.load_data("mspm0")
     _, family, _ = pin_layout.mspm0_family(device, data)
