@@ -194,10 +194,27 @@ class ParsingVariants(MSPM0TestCase):
         )
 
     def test_an_rx_timeout_dma_trigger_is_the_rx_channel(self):
-        # L2
+        # L2：RX timeout 触发的通道也认作 RX 通道并记下触发，gen 再说明它不能用（审查 B2）。
+        # L2: a channel on the RX timeout trigger is the RX channel too and its trigger is
+        # recorded; gen then says it cannot be used (review B2).
         data, _logs = self.parse_logged()
         spi = data["Peripherals"]["SPI"]["SPI_1"]
         self.assertEqual((spi["DMA_RX"], spi["DMA_TX"]), ("DMA_CH_SPI1_RX", "DMA_CH_SPI1_TX"))
+        self.assertEqual(spi["DMA_RX_TRIGGER"], "DL_SPI_DMA_INTERRUPT_RX")
+
+        def timeout(name, text):
+            return text.replace('"DL_SPI_DMA_INTERRUPT_RX"', '"DL_SPI_DMA_INTERRUPT_RX_TIMEOUT"')
+
+        data, _logs = self.parse_logged(timeout)
+        spi = data["Peripherals"]["SPI"]["SPI_1"]
+        self.assertEqual(spi["DMA_RX"], "DMA_CH_SPI1_RX")
+        self.assertEqual(spi["DMA_RX_TRIGGER"], "DL_SPI_DMA_INTERRUPT_RX_TIMEOUT")
+
+    def test_a_uart_with_dma_rx_records_extend_and_its_channel(self):
+        data, _logs = self.parse_logged()
+        uart = data["Peripherals"]["UART"]["UART_0"]
+        self.assertEqual((uart["Extend"], uart["DMA_RX_ID"]), (True, 0))
+        self.assertEqual(data["DMAFullChannels"], 3)
 
     def test_pwm_channels_come_from_the_output_when_the_pins_are_only_suggested(self):
         # H3：引脚只有 $suggestSolution；去掉它们后通道仍来自 SysConfig 输出的 _IDX 宏。
@@ -563,8 +580,7 @@ class Generation(MSPM0TestCase):
                     }
 
                 self.project_yaml(root, change)
-                with self.assertLogs(level="WARNING"):
-                    code = self.regenerate(root)
+                code = self.regenerate(root)
                 self.assertIn(f"static constexpr uint32_t {line}", code)
                 self.assertIn("MSPM0_SPI_INIT(SPI_1, SPI_1_CLK_FREQ,", code)
                 source = line.split(" = ")[1].split(" ")[0].rstrip(";")
@@ -609,8 +625,7 @@ class Generation(MSPM0TestCase):
                     root, lambda settings, value=value: settings.update(terminal_source=value)
                 )
                 for _ in range(2):
-                    with self.assertLogs(level="WARNING"):
-                        code = self.regenerate(root)
+                    code = self.regenerate(root)
                     self.assertNotIn("Terminal on", code)
                     self.assertEqual(self.settings(root)["terminal_source"], value)
 
@@ -644,8 +659,7 @@ class Generation(MSPM0TestCase):
         # M2: a null no longer becomes 2 * None.
         root, _code = self.generate("variants")
         self.settings(root, lambda settings: settings["UART"]["uart0"].update(tx_buffer_size=None))
-        with self.assertLogs(level="WARNING"):
-            code = self.regenerate(root)
+        code = self.regenerate(root)
         self.assertIn("static uint8_t uart0_tx_buf[2 * 128];", code)
         self.assertNotIn(".SetConfig", code)
 
@@ -657,21 +671,77 @@ class Generation(MSPM0TestCase):
             settings["UART"]["UART0"]["tx_buffer_size"] = 64
 
         self.settings(root, change)
-        with self.assertLogs(level="WARNING"):
-            code = self.regenerate(root)
+        code = self.regenerate(root)
         self.assertIn("static uint8_t uart0_tx_buf[2 * 64];", code)
         self.assertEqual(list(self.settings(root)["UART"]), ["UART0"])
 
-    def test_a_dma_rx_channel_of_a_uart_is_a_warning(self):
-        # L1
+    def test_a_uart_extend_with_dma_rx_receives_by_dma(self):
+        # 用户 2026-10-07 决定：UART0（G3507 的 UART Extend）配了 FULL-DMA 通道上的 DMA RX，
+        # 用 MSPM0_UART_EXTEND_INIT。
+        # User decision 2026-10-07: UART0 (the UART Extend of a G3507) has DMA RX on a
+        # FULL-DMA channel, so it takes MSPM0_UART_EXTEND_INIT.
+        root, code = self.generate("variants")
+        self.assertIn("MSPM0_UART_EXTEND_INIT(UART_0, DMA_CH_UART0_TX, DMA_CH_UART0_RX,", code)
+        self.assertNotIn("MSPM0_UART_MAIN_INIT(", code)
+        for line in (
+            "#define DMA_CH_UART0_RX_LIBXR_UART_IRQN UART_0_INST_INT_IRQN",
+            "#define DMA_CH_UART0_RX_LIBXR_UART_RX 1",
+            "#define DMA_CH_UART0_RX_LIBXR_FULL_CHANNEL 1",
+            "#define DMA_CH_UART0_RX_LIBXR_HALF_INTERRUPT 1",
+            "#define UART_0_LIBXR_EXTEND_CAPABLE 1",
+            "alignas(4) static uint8_t uart0_rx_dma_buf[128];",
+        ):
+            self.assertIn(line, code)
+        self.assertEqual(self.settings(root)["UART"]["uart0"]["rx_dma_buffer_size"], 128)
+
+    def test_dma_rx_on_a_uart_main_is_a_warning(self):
         root, _code = self.generate("variants")
+        self.project_yaml(
+            root, lambda data: data["Peripherals"]["UART"]["UART_0"].update(Extend=False)
+        )
         with self.assertLogs(level="WARNING") as logs:
-            self.regenerate(root)
+            code = self.regenerate(root)
         self.assertIn(
-            "WARNING:root:UART_0: the DMA RX channel DMA_CH_UART0_RX is not used; the generated "
-            "UART uses MSPM0_UART_MAIN_INIT, whose receive side runs on byte interrupts "
-            "(MSPM0_UART_EXTEND_INIT is not generated)",
+            "WARNING:root:UART_0: the DMA RX channel DMA_CH_UART0_RX is not used; UART0 is a "
+            "UART Main instance, which receives on byte interrupts (MSPM0_UART_MAIN_INIT); DMA "
+            "reception needs a UART Extend instance",
             logs.output,
+        )
+        self.assertIn("MSPM0_UART_MAIN_INIT(UART_0, DMA_CH_UART0_TX,", code)
+        self.assertNotIn("rx_dma_buf", code)
+
+    def test_dma_rx_on_a_channel_that_is_not_full_is_an_error(self):
+        root, _code = self.generate("variants")
+        self.project_yaml(
+            root, lambda data: data["Peripherals"]["UART"]["UART_0"].update(DMA_RX_ID=4)
+        )
+        self.assertIn(
+            "UART_0: the DMA RX channel DMA_CH_UART0_RX is channel 4, but "
+            "MSPM0_UART_EXTEND_INIT receives on a FULL-DMA channel (0 to 2)",
+            self.failure(root),
+        )
+
+    def test_the_receive_ring_must_be_even(self):
+        root, _code = self.generate("variants")
+        self.settings(
+            root, lambda settings: settings["UART"]["uart0"].update(rx_dma_buffer_size=63)
+        )
+        self.assertIn("UART.uart0.rx_dma_buffer_size", self.failure(root))
+
+    def test_an_spi_rx_timeout_trigger_is_an_error(self):
+        # 审查 B2：驱动按 SysConfig 的触发搬运每个字节，RX timeout 触发的传输等不到结束。
+        # Review B2: the driver moves every byte on SysConfig's trigger, and a transfer on the
+        # RX timeout trigger never completes.
+        root, _code = self.generate("variants")
+        self.project_yaml(
+            root,
+            lambda data: data["Peripherals"]["SPI"]["SPI_1"].update(
+                DMA_RX_TRIGGER="DL_SPI_DMA_INTERRUPT_RX_TIMEOUT"
+            ),
+        )
+        self.assertIn(
+            "SPI_1: the DMA RX channel DMA_CH_SPI1_RX is triggered by RX timeout",
+            self.failure(root),
         )
 
     def test_a_uart_without_dma_tx_names_the_sysconfig_option(self):

@@ -373,7 +373,7 @@ SYSCONFIG_WEAK void SYSCFG_DL_SPI_1_init(void) {
     DL_SPI_enableDMATransmitEvent(SPI_1_INST);
 
     /* Enable SPI RX interrupt as a trigger for DMA */
-    DL_SPI_enableDMAReceiveEvent(SPI_1_INST, DL_SPI_DMA_INTERRUPT_RX_TIMEOUT);
+    DL_SPI_enableDMAReceiveEvent(SPI_1_INST, DL_SPI_DMA_INTERRUPT_RX);
     /* Set RX and TX FIFO threshold levels */
     DL_SPI_setFIFOThreshold(SPI_1_INST, DL_SPI_RX_FIFO_LEVEL_1_2_FULL, DL_SPI_TX_FIFO_LEVEL_1_2_EMPTY);
     DL_SPI_enableInterrupt(SPI_1_INST, (DL_SPI_INTERRUPT_DMA_DONE_RX |

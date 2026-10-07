@@ -184,6 +184,34 @@ def read_mspm0_family(path: Path) -> tuple[dict, dict[str, int]]:
     return packages, power_domains
 
 
+def read_mspm0_extras(path: Path) -> dict:
+    """器件族 JSON 里 LibXR 的 UART 驱动要用的外设属性：UART Extend 实例（SYS_UARTADV，
+    MSPM0_UART_EXTEND_INIT 的接收 DMA 需要它）和 FULL-DMA 通道数（DMA 的
+    SYS_N_DMA_FULL_CHANNEL，接收 DMA 必须用编号小于它的通道）。
+    The peripheral attributes of a family JSON that the LibXR UART driver needs: the UART
+    Extend instances (SYS_UARTADV, which the receive DMA of MSPM0_UART_EXTEND_INIT requires)
+    and the number of FULL-DMA channels (SYS_N_DMA_FULL_CHANNEL of the DMA; the receive DMA must
+    use a channel below it).
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    extend, full_channels = [], None
+    for peripheral in data["peripherals"].values():
+        attributes = peripheral.get("attributes", {})
+        if not isinstance(attributes, dict):
+            continue
+        if attributes.get("SYS_UARTADV") == "true":
+            extend.append(peripheral["name"])
+        if (
+            peripheral["name"] == "DMA"
+            and str(attributes.get("SYS_N_DMA_FULL_CHANNEL", "")).isdigit()
+        ):
+            full_channels = int(attributes["SYS_N_DMA_FULL_CHANNEL"])
+    extras: dict = {"uart_extend": sorted(extend)}
+    if full_channels is not None:
+        extras["dma_full_channels"] = full_channels
+    return extras
+
+
 def build_mspm0(sysconfig: Path) -> dict:
     """MSPM0 数据：每个器件族的型号前缀、各封装的引脚和外设实例的电源域。
     The MSPM0 data: the model prefixes of each family, the pins of its packages and the power
@@ -197,6 +225,7 @@ def build_mspm0(sysconfig: Path) -> dict:
             "prefixes": family_prefixes(directory.name),
             "packages": packages,
             "power_domains": power_domains,
+            **read_mspm0_extras(directory / f"{directory.name}.json"),
         }
     version = (sysconfig / "dist" / "version.txt").read_text(encoding="utf-8").strip()
     return {

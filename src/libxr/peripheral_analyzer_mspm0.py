@@ -782,6 +782,24 @@ def parse_project(directory: str, output: str | None = None, summary: bool = Tru
                 record["Pins"] = dict(entry["pins"])
             if module == "PWM":
                 record["Channels"] = _pwm_channels(syscfg, name, entry, defines)
+            if module == "SPI":
+                # 接收 DMA 的触发（RX 或 RX_TIMEOUT）：gen 只接受 RX。
+                # The trigger of the receive DMA (RX or RX_TIMEOUT): gen accepts RX only.
+                for event in (1, 2):
+                    trigger = str(entry["params"].get(f"enabledDMAEvent{event}Triggers") or "")
+                    if re.search(r"_RX(_TIMEOUT)?$", trigger):
+                        record["DMA_RX_TRIGGER"] = trigger
+            if module == "UART" and record.get("DMA_RX"):
+                # 接收 DMA 只有 UART Extend 实例能用（MSPM0_UART_EXTEND_INIT），还必须是 FULL-DMA
+                # 通道：gen 按这两项决定构造方式。
+                # Only a UART Extend instance can use receive DMA (MSPM0_UART_EXTEND_INIT), and
+                # only on a FULL-DMA channel: gen decides the construction by these two.
+                record["Extend"] = str(peripheral) in _family(device).get("uart_extend", [])
+                channel_id = re.fullmatch(
+                    r"\(?(\d+)U?\)?", defines.get(f"{record['DMA_RX']}_CHAN_ID", "")
+                )
+                if channel_id:
+                    record["DMA_RX_ID"] = int(channel_id.group(1))
             peripherals.setdefault(section, {})[name] = record
 
     for entry in instances.of_var.values():
@@ -811,6 +829,7 @@ def parse_project(directory: str, output: str | None = None, summary: bool = Tru
         "Mcu": {"Family": "MSPM0", "Type": device},
         "CPUCLK": _cpuclk(defines),
         "ULPCLKDivider": _ulpclk_divider(source),
+        "DMAFullChannels": _family(device).get("dma_full_channels"),
         "GPIO": _gpio_entries(syscfg, instances, defines, _device_names(power_domains, defines)),
         "Peripherals": {**peripherals, "Other": other} if other else peripherals,
     }
@@ -829,11 +848,20 @@ def parse_project(directory: str, output: str | None = None, summary: bool = Tru
         _print_summary(data)
 
 
+def _family(device: str) -> dict:
+    """器件所属家族的 mspm0 数据（电源域、UART Extend 实例、FULL-DMA 通道数……）；器件未知时
+    抛出 ValueError。
+    The mspm0 data of the family of the device (power domains, UART Extend instances, the
+    number of FULL-DMA channels, ...); an unknown device raises ValueError.
+    """
+    data = pin_layout.load_data("mspm0")
+    _, family, _ = pin_layout.mspm0_family(device, data)
+    return family
+
+
 def _power_domains(device: str) -> dict[str, int]:
     """器件所属家族的外设电源域（P1 的 mspm0 数据：模块名 -> 0/1）；器件未知时抛出 ValueError。
     The peripheral power domains of the family of the device (the P1 mspm0 data: module ->
     0/1); an unknown device raises ValueError.
     """
-    data = pin_layout.load_data("mspm0")
-    _, family, _ = pin_layout.mspm0_family(device, data)
-    return family.get("power_domains", {})
+    return _family(device).get("power_domains", {})

@@ -43,15 +43,20 @@ spelling of the file is kept.
 对象名：GPIO 用引脚标签（$name 去掉 PIN_ 前缀），UART/I2C/SPI 用外设名的小写（uart0），PWM 是
 pwm_<timer>_c<n>。GPIO 中断遵循 STM32 的约定（模型 O1）：生成器只创建对象，边沿来自 SysConfig；
 RegisterCallback、EnableInterrupt 和回调函数属于消费者（Module 或 User Code）。UART 没有 DMA TX
-（或 SPI 没有一对 DMA 通道）时驱动没有对应的构造路径，生成报错；UART 的 DMA RX 通道不用（不生成
-MSPM0_UART_EXTEND_INIT），给出警告。
+（或 SPI 没有一对 DMA 通道）时驱动没有对应的构造路径，生成报错。UART 默认用
+MSPM0_UART_MAIN_INIT（接收走字节中断）；配了 DMA RX 的 UART Extend 实例用
+MSPM0_UART_EXTEND_INIT（接收走 FULL-DMA 通道上的循环 DMA，接收环大小是 rx_dma_buffer_size），
+RX 通道不是 FULL-DMA 通道时报错；UART Main 实例上的 DMA RX 通道用不上，给出警告。
 Object names: a GPIO takes the pin label (the $name without its PIN_ prefix), a UART/I2C/SPI
 the lower-case peripheral name (uart0), and a PWM is pwm_<timer>_c<n>. GPIO interrupts follow
 the STM32 convention (model O1): the generator creates the object only, the edge comes from
 SysConfig, and RegisterCallback, EnableInterrupt and the callback belong to the consumer (a
 Module or the User Code). The driver has no construction path for a UART without DMA TX (or an
-SPI without a pair of DMA channels), so generation reports an error then; the DMA RX channel of
-a UART is unused (MSPM0_UART_EXTEND_INIT is not generated) and warned about.
+SPI without a pair of DMA channels), so generation reports an error then. A UART takes
+MSPM0_UART_MAIN_INIT by default (receive on byte interrupts); a UART Extend instance with DMA RX
+takes MSPM0_UART_EXTEND_INIT (receive by circular DMA on a FULL-DMA channel into a ring of
+rx_dma_buffer_size bytes), an RX channel that is no FULL-DMA channel being an error; the DMA RX
+channel of a UART Main instance cannot be used and is warned about.
 """
 
 from __future__ import annotations
@@ -78,6 +83,9 @@ from libxr.generator_code_stm32 import GENERATED_NOTICE, INDENT
 # apply to MSPM0 and are removed before generation.
 MSPM0_DEFAULTS = {
     "UART": {"tx_buffer_size": 128, "rx_buffer_size": 128, "tx_queue_size": 5},
+    # 只有 MSPM0_UART_EXTEND_INIT 的 UART 有：接收 DMA 环的字节数（偶数）。
+    # Only a UART of MSPM0_UART_EXTEND_INIT has it: the bytes of the receive DMA ring (even).
+    "UART_EXTEND": {"rx_dma_buffer_size": 128},
     "I2C": {"buffer_size": 32, "dma_enable_min_size": 8},
     "SPI": {"tx_buffer_size": 32, "rx_buffer_size": 32, "dma_enable_min_size": 3},
 }
@@ -157,7 +165,7 @@ def _setting(section: dict, key: str, default):
     return section[key]
 
 
-def _instance_settings(group: str, instance: str) -> dict:
+def _instance_settings(group: str, instance: str, extend: bool = False) -> dict:
     """实例的设置段，缺少的默认值补进段里，每个值都检查过：缓冲区和队列是正整数，DMA 阈值是非负
     整数；UART 的发送缓冲还要满足驱动的断言（见 UART_TX_ALIGN 和 UART_TX_MAX）。返回检查后的
     整数值。
@@ -168,7 +176,10 @@ def _instance_settings(group: str, instance: str) -> dict:
     """
     section = _settings_of(group, instance)
     values = {}
-    for key, default in MSPM0_DEFAULTS[group].items():
+    defaults = dict(MSPM0_DEFAULTS[group])
+    if extend:
+        defaults.update(MSPM0_DEFAULTS["UART_EXTEND"])
+    for key, default in defaults.items():
         minimum = 0 if key == "dma_enable_min_size" else 1
         values[key] = stm32._integer(
             f"{group}.{instance}.{key}", _setting(section, key, default), minimum
@@ -184,6 +195,16 @@ def _instance_settings(group: str, instance: str) -> dict:
                 f"{UART_TX_MAX + 3} bytes per DMA transfer)",
                 f"{UART_TX_ALIGN} 的倍数且不大于 {UART_TX_MAX}（驱动使用 2 x N 字节，必须是 "
                 f"2 * alignof(size_t) 的倍数，单次 DMA 最多发送 {UART_TX_MAX + 3} 字节）",
+            )
+    if extend:
+        size = values["rx_dma_buffer_size"]
+        if size < 2 or size % 2 or size > 0xFFFF:
+            raise stm32._invalid_setting(
+                f"UART.{instance}.rx_dma_buffer_size",
+                size,
+                "an even number from 2 to 65534 (the driver receives into a ring of two halves, "
+                "at most one DMA transfer long)",
+                "2 到 65534 之间的偶数（驱动的接收环分两半，最长一次 DMA 传输）",
             )
     return values
 
@@ -377,11 +398,15 @@ def _ulpclk_text(divider: int) -> str:
     )
 
 
-def _uart_dma_defines(uarts: list) -> list[str]:
-    """UART 发送 DMA 通道的所有权标注：MSPM0_UART_MAIN_INIT 需要知道通道属于哪个 UART、服务于
-    发送端。
-    The ownership annotations of the UART transmit DMA channels: MSPM0_UART_MAIN_INIT needs to
-    know which UART owns a channel and that the channel serves its transmitter.
+def _uart_dma_defines(uarts: list, extend: set[str]) -> list[str]:
+    """UART DMA 通道的所有权标注：MSPM0_UART_MAIN_INIT 需要知道发送通道属于哪个 UART、服务于
+    发送端；MSPM0_UART_EXTEND_INIT 还要接收通道的同样标注、它是 FULL-DMA 通道、是否用半传输
+    中断（FULL-DMA 通道都低于 8，用），以及实例是 UART Extend。
+    The ownership annotations of the UART DMA channels: MSPM0_UART_MAIN_INIT needs to know which
+    UART owns the transmit channel and that it serves the transmitter; MSPM0_UART_EXTEND_INIT
+    also needs the same for the receive channel, that it is a FULL-DMA channel, whether it uses
+    the half-transfer interrupt (every FULL-DMA channel is below 8, so it does) and that the
+    instance is a UART Extend.
     """
     lines: list[str] = []
     for _name, instance, record, _channel in uarts:
@@ -389,7 +414,19 @@ def _uart_dma_defines(uarts: list) -> list[str]:
         if channel:
             lines.append(f"#define {channel}_LIBXR_UART_IRQN {instance}_INST_INT_IRQN")
             lines.append(f"#define {channel}_LIBXR_UART_TX 1")
-    if lines:
+        if instance in extend:
+            rx = record["DMA_RX"]
+            lines.append(f"#define {rx}_LIBXR_UART_IRQN {instance}_INST_INT_IRQN")
+            lines.append(f"#define {rx}_LIBXR_UART_RX 1")
+            lines.append(f"#define {rx}_LIBXR_FULL_CHANNEL 1")
+            lines.append(f"#define {rx}_LIBXR_HALF_INTERRUPT 1")
+            lines.append(f"#define {instance}_LIBXR_EXTEND_CAPABLE 1")
+    if lines and extend:
+        lines = [
+            "// Ownership of the DMA channels that serve a UART; MSPM0_UART_MAIN_INIT and",
+            "// MSPM0_UART_EXTEND_INIT check these names against the ones SysConfig generated.",
+        ] + lines
+    elif lines:
         lines = [
             "// Ownership of the DMA channels that serve a UART transmitter;",
             "// MSPM0_UART_MAIN_INIT checks these names against the ones SysConfig generated.",
@@ -397,7 +434,54 @@ def _uart_dma_defines(uarts: list) -> list[str]:
     return lines
 
 
-def _buffers(peripherals: dict) -> list[str]:
+def _extend_uarts(project_data: dict, uarts: list) -> set[str]:
+    """用 MSPM0_UART_EXTEND_INIT 的 UART（SysConfig 实例名）：配了 DMA RX 的 UART Extend 实例。
+    RX 通道不是 FULL-DMA 通道时报错退出；UART Main 实例上的 DMA RX 给出警告（用
+    MSPM0_UART_MAIN_INIT，RX 通道不用）。
+    The UARTs (SysConfig instance names) that take MSPM0_UART_EXTEND_INIT: the UART Extend
+    instances with DMA RX. An RX channel that is no FULL-DMA channel logs an error and exits; DMA
+    RX on a UART Main instance is warned about (it takes MSPM0_UART_MAIN_INIT and the RX channel
+    stays unused).
+    """
+    full = project_data.get("DMAFullChannels")
+    extend = set()
+    for _name, instance, record, _channel in uarts:
+        rx = record.get("DMA_RX")
+        if not rx:
+            continue
+        peripheral = record.get("Peripheral")
+        if not record.get("Extend"):
+            logging.warning(
+                tr(
+                    f"{instance}: the DMA RX channel {rx} is not used; {peripheral} is a UART Main "
+                    "instance, which receives on byte interrupts (MSPM0_UART_MAIN_INIT); DMA "
+                    "reception needs a UART Extend instance",
+                    f"{instance}：DMA RX 通道 {rx} 不会被使用；{peripheral} 是 UART Main 实例，接收"
+                    "走字节中断（MSPM0_UART_MAIN_INIT）；DMA 接收需要 UART Extend 实例",
+                )
+            )
+            continue
+        channel_id = record.get("DMA_RX_ID")
+        if channel_id is None or full is None or channel_id >= full:
+            where = (
+                f"channel {channel_id}" if channel_id is not None else "a channel of unknown number"
+            )
+            _fail(
+                tr(
+                    f"{instance}: the DMA RX channel {rx} is {where}, but MSPM0_UART_EXTEND_INIT "
+                    f"receives on a FULL-DMA channel (0 to {(full or 1) - 1}); choose one in "
+                    "SysConfig (UART > DMA Configuration > DMA RX channel) and run `libxr parse` "
+                    "again",
+                    f"{instance}：DMA RX 通道 {rx} 是{where}，但 MSPM0_UART_EXTEND_INIT 只能用 "
+                    f"FULL-DMA 通道（0 到 {(full or 1) - 1}）接收；请在 SysConfig（UART > DMA "
+                    "Configuration 的 DMA RX 通道）中选择后重新运行 `libxr parse`",
+                )
+            )
+        extend.add(instance)
+    return extend
+
+
+def _buffers(peripherals: dict, extend: set[str]) -> list[str]:
     """DMA 缓冲区的定义：UART 发送缓冲是两个半区（2 x N，按 size_t 对齐），SPI 收发各一，I2C 是
     轮询与 DMA 之间的暂存区。
     The DMA buffer declarations: a UART transmit buffer holds two halves (2 x N, aligned as
@@ -405,10 +489,13 @@ def _buffers(peripherals: dict) -> list[str]:
     DMA.
     """
     lines: list[str] = []
-    for name, _instance, _record, _channel in peripherals.get("UART", []):
-        settings = _instance_settings("UART", name)
+    for name, instance, _record, _channel in peripherals.get("UART", []):
+        settings = _instance_settings("UART", name, instance in extend)
         tx = settings["tx_buffer_size"]
         lines.append(f"alignas(size_t) static uint8_t {name}_tx_buf[2 * {tx}];")
+        if instance in extend:
+            rx = settings["rx_dma_buffer_size"]
+            lines.append(f"alignas(4) static uint8_t {name}_rx_dma_buf[{rx}];")
     for name, _instance, _record, _channel in peripherals.get("SPI", []):
         settings = _instance_settings("SPI", name)
         lines.append(f"alignas(4) static uint8_t {name}_rx_buf[{settings['rx_buffer_size']}];")
@@ -418,11 +505,19 @@ def _buffers(peripherals: dict) -> list[str]:
         lines.append(f"alignas(4) static uint8_t {name}_buf[{settings['buffer_size']}];")
     if not lines:
         return []
-    return [
-        "// DMA buffers. A UART gets 2 x N bytes for its two transmit halves; the receive side",
-        "// runs on byte interrupts. The SPI DMA buffers are split in two halves as well; the",
-        "// I2C driver uses polling, its buffer is the staging area for DMA transfers.",
-    ] + lines
+    if extend:
+        heading = [
+            "// DMA buffers. A UART gets 2 x N bytes for its two transmit halves; a UART Extend with",
+            "// DMA RX also gets its receive ring. The SPI DMA buffers are split in two halves as",
+            "// well; the I2C driver uses polling, its buffer is the staging area for DMA transfers.",
+        ]
+    else:
+        heading = [
+            "// DMA buffers. A UART gets 2 x N bytes for its two transmit halves; the receive side",
+            "// runs on byte interrupts. The SPI DMA buffers are split in two halves as well; the",
+            "// I2C driver uses polling, its buffer is the staging area for DMA transfers.",
+        ]
+    return heading + lines
 
 
 def _notice(project_data: dict) -> list[str]:
@@ -491,14 +586,21 @@ def _gpio_section(gpio: dict) -> list[str]:
     return lines
 
 
-def _uart_section(uarts: list) -> list[str]:
-    """UART 对象：MSPM0_UART_MAIN_INIT，发送走 DMA，接收走字节中断；没有 DMA TX 的实例报错，
-    配了 DMA RX 的实例给出警告（不生成 MSPM0_UART_EXTEND_INIT，RX 通道不用）。
-    The UART objects: MSPM0_UART_MAIN_INIT with DMA on the transmit side and byte interrupts on
-    the receive side; an instance without DMA TX reports an error, and one with DMA RX gets a
-    warning (MSPM0_UART_EXTEND_INIT is not generated, so the RX channel is unused).
+def _uart_section(uarts: list, extend: set[str]) -> list[str]:
+    """UART 对象：发送走 DMA；MSPM0_UART_MAIN_INIT 接收走字节中断，extend 中的实例用
+    MSPM0_UART_EXTEND_INIT 走循环 DMA 接收（见 _extend_uarts()）。没有 DMA TX 的实例报错。
+    The UART objects: DMA on the transmit side; MSPM0_UART_MAIN_INIT receives on byte
+    interrupts, and the instances in extend take MSPM0_UART_EXTEND_INIT with circular DMA
+    reception (see _extend_uarts()). An instance without DMA TX reports an error.
     """
-    lines = [f"{INDENT}// UART: TX with DMA; the receive side runs on byte interrupts."]
+    if not uarts:
+        return []
+    if extend:
+        heading = "TX with DMA; a UART Extend with DMA RX receives by circular DMA, the others "
+        heading += "on byte interrupts."
+    else:
+        heading = "TX with DMA; the receive side runs on byte interrupts."
+    lines = _comment(f"UART: {heading}", INDENT)
     for name, instance, record, _channel in uarts:
         if not record.get("DMA_TX"):
             _fail(
@@ -514,18 +616,25 @@ def _uart_section(uarts: list) -> list[str]:
                     "重新运行 `libxr parse`，或删去这个 UART",
                 )
             )
-        if record.get("DMA_RX"):
-            logging.warning(
-                tr(
-                    f"{instance}: the DMA RX channel {record['DMA_RX']} is not used; the "
-                    "generated UART uses MSPM0_UART_MAIN_INIT, whose receive side runs on byte "
-                    "interrupts (MSPM0_UART_EXTEND_INIT is not generated)",
-                    f"{instance}：DMA RX 通道 {record['DMA_RX']} 不会被使用；生成的 UART 用 "
-                    "MSPM0_UART_MAIN_INIT，接收走字节中断（不生成 MSPM0_UART_EXTEND_INIT）",
-                )
-            )
-        settings = _instance_settings("UART", name)
+        settings = _instance_settings("UART", name, instance in extend)
         tx_buf = f"{name}_tx_buf"
+        if instance in extend:
+            rx_buf = f"{name}_rx_dma_buf"
+            lines += layout(
+                f"static MSPM0UART {name}",
+                [
+                    f"MSPM0_UART_EXTEND_INIT({instance}",
+                    record["DMA_TX"],
+                    record["DMA_RX"],
+                    tx_buf,
+                    f"sizeof({tx_buf})",
+                    str(settings["tx_queue_size"]),
+                    rx_buf,
+                    f"sizeof({rx_buf})",
+                    f"{settings['rx_buffer_size']})",
+                ],
+            )
+            continue
         lines += layout(
             f"static MSPM0UART {name}",
             [
@@ -582,12 +691,27 @@ def _spi_section(spis: list, clocks: dict[str, str]) -> list[str]:
                     f"{instance}: the MSPM0 SPI driver constructs only with one DMA channel for "
                     f"RX and one for TX, and the SysConfig project has RX {dma_rx or 'none'}, "
                     f"TX {dma_tx or 'none'}. Configure SPI > DMA Configuration (DMA Event 1/2 "
-                    "triggers: one RX or RX timeout, one TX), run `libxr parse` again, or drop "
-                    "the SPI",
+                    "triggers: one RX, one TX), run `libxr parse` again, or drop the SPI",
                     f"{instance}：MSPM0 的 SPI 驱动只支持收发各一个 DMA 通道的构造，而 SysConfig "
                     f"工程里 RX 为 {dma_rx or '没有'}，TX 为 {dma_tx or '没有'}。请配置 SPI > DMA "
-                    "Configuration（DMA Event 1/2 的触发：一个 RX 或 RX timeout，一个 TX）后重新"
-                    "运行 `libxr parse`，或删去这个 SPI",
+                    "Configuration（DMA Event 1/2 的触发：一个 RX，一个 TX）后重新运行 "
+                    "`libxr parse`，或删去这个 SPI",
+                )
+            )
+        if str(record.get("DMA_RX_TRIGGER", "")).endswith("_RX_TIMEOUT"):
+            # 驱动按 SysConfig 配好的触发搬运每个接收字节；RX timeout 只在接收超时时请求 DMA，
+            # 计数的传输等不到结束。
+            # The driver moves every received byte on the trigger SysConfig configured; RX
+            # timeout requests DMA only when reception times out, so a counted transfer never
+            # completes.
+            _fail(
+                tr(
+                    f"{instance}: the DMA RX channel {dma_rx} is triggered by RX timeout; the "
+                    "MSPM0 SPI driver needs the RX trigger (SPI > DMA Configuration: DMA Event "
+                    "trigger DL_SPI_DMA_INTERRUPT_RX). Change it and run `libxr parse` again",
+                    f"{instance}：DMA RX 通道 {dma_rx} 由 RX timeout 触发；MSPM0 的 SPI 驱动需要 RX "
+                    "触发（SPI > DMA Configuration 的 DMA Event 触发选 DL_SPI_DMA_INTERRUPT_RX）。"
+                    "请修改后重新运行 `libxr parse`",
                 )
             )
         settings = _instance_settings("SPI", name)
@@ -717,7 +841,9 @@ def _terminal_section(peripherals: dict) -> list[str]:
     ]
 
 
-def _sections(peripherals: dict, gpio: dict, use_xrobot: bool, clocks: dict[str, str]) -> list[str]:
+def _sections(
+    peripherals: dict, gpio: dict, use_xrobot: bool, clocks: dict[str, str], extend: set[str]
+) -> list[str]:
     """app_main 函数体的各段：时基、GPIO、UART、I2C、SPI、PWM、终端和登记。
     The sections of the app_main body: timebase, GPIO, UART, I2C, SPI, PWM, terminal and the
     registrations.
@@ -729,7 +855,7 @@ def _sections(peripherals: dict, gpio: dict, use_xrobot: bool, clocks: dict[str,
             f"{INDENT}PlatformInit();",
         ],
         _gpio_section(gpio),
-        _uart_section(peripherals.get("UART", [])),
+        _uart_section(peripherals.get("UART", []), extend),
         _i2c_section(peripherals.get("I2C", []), clocks),
         _spi_section(peripherals.get("SPI", []), clocks),
         _pwm_section(peripherals.get("PWM", [])),
@@ -781,6 +907,7 @@ def generate_full_code(project_data: dict, use_xrobot: bool, existing_code: str)
         _check_gpio_name(str(label))
         stm32._register_device(label, "GPIO")
     uarts = peripherals.get("UART", [])
+    extend = _extend_uarts(project_data, uarts)
     default_3 = (
         []
         if use_xrobot
@@ -797,15 +924,15 @@ def generate_full_code(project_data: dict, use_xrobot: bool, existing_code: str)
     clock_lines, clocks = _clocks(project_data)
     if clock_lines:
         lines += [""] + clock_lines
-    defines = _uart_dma_defines(uarts)
+    defines = _uart_dma_defines(uarts, extend)
     if defines:
         lines += [""] + defines
-    buffers = _buffers(peripherals)
+    buffers = _buffers(peripherals, extend)
     if buffers:
         lines += [""] + buffers
     lines += ["", 'extern "C" void app_main(void)', "{"]
     lines += [f"{INDENT}/* User Code Begin 2 */", f"{INDENT}/* User Code End 2 */", ""]
-    lines += _sections(peripherals, gpio, use_xrobot, clocks)
+    lines += _sections(peripherals, gpio, use_xrobot, clocks, extend)
     lines += ["", f"{INDENT}/* User Code Begin 3 */"] + default_3
     lines.append(f"{INDENT}/* User Code End 3 */")
     if use_xrobot:

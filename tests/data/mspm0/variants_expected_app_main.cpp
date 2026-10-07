@@ -28,15 +28,21 @@ static constexpr uint32_t MFCLK_FREQ = 4000000;
 // driver keeps that clock configuration.
 static constexpr uint32_t SPI_1_CLK_FREQ = MFCLK_FREQ / 4;
 
-// Ownership of the DMA channels that serve a UART transmitter;
-// MSPM0_UART_MAIN_INIT checks these names against the ones SysConfig generated.
+// Ownership of the DMA channels that serve a UART; MSPM0_UART_MAIN_INIT and
+// MSPM0_UART_EXTEND_INIT check these names against the ones SysConfig generated.
 #define DMA_CH_UART0_TX_LIBXR_UART_IRQN UART_0_INST_INT_IRQN
 #define DMA_CH_UART0_TX_LIBXR_UART_TX 1
+#define DMA_CH_UART0_RX_LIBXR_UART_IRQN UART_0_INST_INT_IRQN
+#define DMA_CH_UART0_RX_LIBXR_UART_RX 1
+#define DMA_CH_UART0_RX_LIBXR_FULL_CHANNEL 1
+#define DMA_CH_UART0_RX_LIBXR_HALF_INTERRUPT 1
+#define UART_0_LIBXR_EXTEND_CAPABLE 1
 
-// DMA buffers. A UART gets 2 x N bytes for its two transmit halves; the receive side
-// runs on byte interrupts. The SPI DMA buffers are split in two halves as well; the
-// I2C driver uses polling, its buffer is the staging area for DMA transfers.
+// DMA buffers. A UART gets 2 x N bytes for its two transmit halves; a UART Extend with
+// DMA RX also gets its receive ring. The SPI DMA buffers are split in two halves as
+// well; the I2C driver uses polling, its buffer is the staging area for DMA transfers.
 alignas(size_t) static uint8_t uart0_tx_buf[2 * 128];
+alignas(4) static uint8_t uart0_rx_dma_buf[128];
 alignas(4) static uint8_t spi1_rx_buf[32];
 alignas(4) static uint8_t spi1_tx_buf[32];
 alignas(4) static uint8_t i2c0_buf[32];
@@ -61,9 +67,11 @@ extern "C" void app_main(void)
   static MSPM0GPIO gpio_btn_pin_0(GPIO_BTN_PORT, GPIO_BTN_PIN_0_PIN,
                                   GPIO_BTN_PIN_0_IOMUX);
 
-  // UART: TX with DMA; the receive side runs on byte interrupts.
-  static MSPM0UART uart0(MSPM0_UART_MAIN_INIT(UART_0, DMA_CH_UART0_TX, uart0_tx_buf,
-                         sizeof(uart0_tx_buf), 5, 128));
+  // UART: TX with DMA; a UART Extend with DMA RX receives by circular DMA, the others on
+  // byte interrupts.
+  static MSPM0UART uart0(MSPM0_UART_EXTEND_INIT(UART_0, DMA_CH_UART0_TX, DMA_CH_UART0_RX,
+                         uart0_tx_buf, sizeof(uart0_tx_buf), 5, uart0_rx_dma_buf,
+                         sizeof(uart0_rx_dma_buf), 128));
 
   // I2C: polling; the buffer stages DMA transfers.
   static MSPM0I2C i2c0(MSPM0_I2C_INIT(I2C_0, PD0_BUSCLK_FREQ, i2c0_buf, sizeof(i2c0_buf),
