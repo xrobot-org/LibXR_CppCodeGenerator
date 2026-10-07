@@ -188,6 +188,10 @@ def _hpm_gen(args: argparse.Namespace) -> None:
     generate(args.input, args.output, use_xrobot, args.libxr_config)
 
 
+# 识别顺序与 libxr pins 和 VS Code 扩展一致：一个 HPM 工程（app.yaml 加 boards/ 下的 .hpmpc）
+# 即使根目录还有 .syscfg 也是 HPM。
+# The order of recognition matches libxr pins and the VS Code extension: an HPM project (an
+# app.yaml with a .hpmpc under boards/) is HPM even when its root also holds a .syscfg.
 PLATFORMS = (
     Platform(
         "stm32",
@@ -195,16 +199,6 @@ PLATFORMS = (
         _has_ioc,
         _stm32_parse,
         _stm32_gen,
-    ),
-    Platform(
-        "mspm0",
-        lambda: tr(
-            "a directory with a SysConfig .syscfg file in its root",
-            "根目录中含有 SysConfig .syscfg 文件的目录",
-        ),
-        _has_syscfg,
-        _mspm0_parse,
-        _mspm0_gen,
     ),
     Platform(
         "hpm",
@@ -215,6 +209,16 @@ PLATFORMS = (
         _has_hpmpc,
         _hpm_parse,
         _hpm_gen,
+    ),
+    Platform(
+        "mspm0",
+        lambda: tr(
+            "a directory with a SysConfig .syscfg file in its root",
+            "根目录中含有 SysConfig .syscfg 文件的目录",
+        ),
+        _has_syscfg,
+        _mspm0_parse,
+        _mspm0_gen,
     ),
 )
 

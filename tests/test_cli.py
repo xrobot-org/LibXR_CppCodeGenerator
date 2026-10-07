@@ -43,9 +43,9 @@ class Platforms(TestCase):
             logs.output,
             [
                 f"ERROR:root:{self.root}: no supported platform recognized "
-                "(stm32: a directory with an STM32CubeMX .ioc file; mspm0: a directory with "
-                "a SysConfig .syscfg file in its root; hpm: a directory with an app.yaml and "
-                "a .hpmpc under boards/)"
+                "(stm32: a directory with an STM32CubeMX .ioc file; hpm: a directory with an "
+                "app.yaml and a .hpmpc under boards/; mspm0: a directory with a SysConfig "
+                ".syscfg file in its root)"
             ],
         )
 
@@ -98,9 +98,9 @@ class Platforms(TestCase):
             logs.output,
             [
                 "ERROR:root:.: no supported platform recognized "
-                "(stm32: a directory with an STM32CubeMX .ioc file; mspm0: a directory with "
-                "a SysConfig .syscfg file in its root; hpm: a directory with an app.yaml and "
-                "a .hpmpc under boards/)"
+                "(stm32: a directory with an STM32CubeMX .ioc file; hpm: a directory with an "
+                "app.yaml and a .hpmpc under boards/; mspm0: a directory with a SysConfig "
+                ".syscfg file in its root)"
             ],
         )
         self.assertFalse(output.exists())
@@ -116,9 +116,9 @@ class Platforms(TestCase):
             logs.output,
             [
                 f"ERROR:root:{config}: platform 'zephyr' is not supported "
-                "(stm32: a directory with an STM32CubeMX .ioc file; mspm0: a directory with "
-                "a SysConfig .syscfg file in its root; hpm: a directory with an app.yaml and "
-                "a .hpmpc under boards/)"
+                "(stm32: a directory with an STM32CubeMX .ioc file; hpm: a directory with an "
+                "app.yaml and a .hpmpc under boards/; mspm0: a directory with a SysConfig "
+                ".syscfg file in its root)"
             ],
         )
 
@@ -131,6 +131,18 @@ class Platforms(TestCase):
         )
         (project / "app.yaml").write_text("dependency: []\n", encoding="utf-8")
         (project / "main.c").write_text("int main(void) { init_bsp_pins(); }\n", encoding="utf-8")
+        self.assertEqual(run_libxr("parse", "-d", str(project))[0], 0)
+        self.assertEqual(
+            (project / ".config.yaml").read_text(encoding="utf-8").splitlines()[1],
+            "Platform: hpm",
+        )
+
+    def test_an_hpm_project_with_a_syscfg_is_still_hpm(self):
+        # 识别顺序与 libxr pins 和扩展一致：stm32、hpm、mspm0。
+        # The order of recognition is that of libxr pins and the extension: stm32, hpm, mspm0.
+        self.test_an_hpm_project_is_detected()
+        project = self.root / "hpm"
+        (project / "board.syscfg").write_text("// a stray SysConfig file\n", encoding="utf-8")
         self.assertEqual(run_libxr("parse", "-d", str(project))[0], 0)
         self.assertEqual(
             (project / ".config.yaml").read_text(encoding="utf-8").splitlines()[1],
