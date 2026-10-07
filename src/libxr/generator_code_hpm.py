@@ -48,19 +48,25 @@ import sys
 from xr_syntax.i18n import tr
 
 from libxr import generator_code_stm32 as stm32
+from libxr import pin_layout
 from libxr.cpp_layout import Braces, layout
-from libxr.generator_code_stm32 import GENERATED_NOTICE, INDENT
+from libxr.generator_code_stm32 import CPP_KEYWORDS, GENERATED_NOTICE, INDENT
 
 # generator_code_stm32 的其余接口（登记表、设置、写入助手）经模块属性访问：测试会用
 # importlib.reload 重载它，直接导入的名字会指向重载前的旧全局对象。
 # The rest of the generator_code_stm32 interface (the registry, the settings, the writing
 # helpers) is reached through module attributes: tests reload it with importlib.reload, and
 # directly imported names would keep pointing at the pre-reload global objects.
-# HPM 各设置段的默认值；STM32 段（USART/TIM/USB……）不适用于 HPM，生成前剔除。
-# The defaults of the HPM settings sections; the STM32 sections (USART/TIM/USB, ...) do not
-# apply to HPM and are removed before generation.
+# HPM 各设置段的默认值；STM32 段（USART/TIM/USB……）以及终端设置（HPM 生成器不创建 UART，
+# 没有终端）不适用于 HPM，生成前从默认集合中剔除；文件里写了的照常读入。
+# The defaults of the HPM settings sections; the STM32 sections (USART/TIM/USB, ...) and the
+# terminal settings (the HPM generator creates no UART, so there is no terminal) do not apply
+# to HPM and are removed from the default set before generation; written in the file, they
+# are read as usual.
 HPM_DEFAULTS = {"I2C": {"speed": 100000}}
 STM32_ONLY_SECTIONS = (
+    "terminal_source",
+    "Terminal",
     "ADC",
     "TIM",
     "CAN",
@@ -80,6 +86,30 @@ I2C_SPEEDS = (100000, 400000, 1000000)
 PWM_DUTY_CMP = 0
 
 IDENTIFIER = re.compile(r"[A-Za-z_]\w*")
+# 生成的 app_main 里用到的名字：GPIO 对象不能叫这些。
+# The names the generated app_main uses: a GPIO object must not be called any of them.
+GENERATED_NAMES = frozenset(
+    {
+        "app_main",
+        "main",
+        "timebase",
+        "PlatformInit",
+        "LibXR",
+        "Thread",
+        "UINT32_MAX",
+        "HPMTimebase",
+        "HPMGPIO",
+        "HPMI2C",
+        "HPMPWM",
+        "LibXRHpmPwmType",
+        "XR_REGISTER",
+        "XROBOT_MAIN",
+    }
+)
+# HPM SDK 的宏和函数的前缀（HPM_GPIO0、GPIO_DI_GPIOA、IRQn_GPIO0_A、clock_i2c3……）。
+# The prefixes of the HPM SDK macros and functions (HPM_GPIO0, GPIO_DI_GPIOA, IRQn_GPIO0_A,
+# clock_i2c3, ...).
+SDK_NAME = re.compile(r"(HPM_|GPIO_|IRQn_|IOC_|clock_|gpio_|gpiom_|board_|init_)\w*")
 
 
 def _comment(text: str, indent: str = "") -> list[str]:
@@ -107,12 +137,29 @@ def _fail(message: str):
     sys.exit(1)
 
 
+def _key(section: dict, name: str):
+    """section 中与 name 只差大小写的键（文件的写法）；没有时为小写的 name。libxr pins 也这样找，
+    两边对同一个文件读到同一段。
+    The key of section that differs from name in case only (the file's spelling); the lower-case
+    name when there is none. libxr pins looks the same way, so both read the same entry of a
+    file.
+    """
+    return next((key for key in section if str(key).lower() == name.lower()), name.lower())
+
+
+def _keyed_settings(group: str, name: str) -> dict:
+    """libxr_settings[group] 中 name 的设置段，键的大小写以文件为准。
+    The settings section of name in libxr_settings[group], the case of the key as in the file.
+    """
+    return stm32._settings(group, _key(stm32._settings(group), name))
+
+
 def _instance_settings(group: str, instance: str) -> dict:
-    """libxr_settings 中小写实例键下的设置段，缺少的默认值补进段里。
-    The settings section under the lower-case instance key of libxr_settings[group], with the
+    """libxr_settings 中实例的设置段（键不区分大小写），缺少的默认值补进段里。
+    The settings section of an instance in libxr_settings (the key in any case), with the
     missing defaults filled in.
     """
-    section = stm32._settings(group, instance.lower())
+    section = _keyed_settings(group, instance)
     for key, default in HPM_DEFAULTS[group].items():
         section.setdefault(key, default)
     return section
@@ -155,8 +202,8 @@ def _setting_int(key: str, value) -> int:
     ):
         _fail(
             tr(
-                f"libxr_config.yaml: {key} {value!r} is not a positive integer",
-                f"libxr_config.yaml：{key} {value!r} 不是正整数",
+                f"{stm32.libxr_config_origin}: {key} {value!r} is not a positive integer",
+                f"{stm32.libxr_config_origin}：{key} {value!r} 不是正整数",
             )
         )
     return int(value)
@@ -200,38 +247,87 @@ def _gpio_names(project_data: dict) -> dict[str, dict]:
     warned about.
     """
     gpio = project_data.get("GPIO", {})
-    renames = stm32.libxr_settings.get("GPIO") or {}
-    if not isinstance(renames, dict):
+    if not isinstance(stm32.libxr_settings.get("GPIO") or {}, dict):
         _fail(
             tr(
-                f"{stm32.libxr_config_origin}: GPIO {renames!r} is not a mapping of a pin name "
-                "to an object name",
-                f"{stm32.libxr_config_origin}：GPIO {renames!r} 不是引脚名到对象名的映射",
+                f"{stm32.libxr_config_origin}: GPIO {stm32.libxr_settings['GPIO']!r} is not a "
+                "mapping of a pin name to an object name",
+                f"{stm32.libxr_config_origin}：GPIO {stm32.libxr_settings['GPIO']!r} 不是引脚名到"
+                "对象名的映射",
             )
         )
-    names: dict[str, dict] = {}
-    for label, pin in gpio.items():
-        rename = renames.get(label)
-        name = str(label if rename is None else rename)
-        if not IDENTIFIER.fullmatch(name) or name in stm32.registered_devices:
-            _fail(
-                tr(
-                    f"GPIO name {name} is not a valid unique C++ identifier",
-                    f"GPIO 名字 {name} 不是合法且唯一的 C++ 标识符",
-                )
-            )
-        stm32._register_device(name, "GPIO")
-        names[name] = pin
-    for label in renames:
-        if label not in gpio:
+    renames = stm32._settings("GPIO")
+    # 改名表写出每个引脚（null 保留默认名），设置树里就能直接改；引脚不在工程里了时，它的 null
+    # 条目随之删除，写了名字的保留并给出警告。
+    # The rename table lists every pin (null keeps the default name), so the settings tree can
+    # edit it directly; when a pin leaves the project its null entry goes, while one with a
+    # name stays and is warned about.
+    keys = {label: _key(renames, label) for label in gpio}
+    for key in [key for key in renames if key not in keys.values()]:
+        if renames[key] is None:
+            del renames[key]
+        else:
             logging.warning(
                 tr(
-                    f"{stm32.libxr_config_origin}: the GPIO rename {label} names no generated "
+                    f"{stm32.libxr_config_origin}: the GPIO rename {key} names no generated "
                     "pin; it is ignored",
-                    f"{stm32.libxr_config_origin}：GPIO 改名 {label} 没有对应的生成引脚；忽略",
+                    f"{stm32.libxr_config_origin}：GPIO 改名 {key} 没有对应的生成引脚；忽略",
                 )
             )
+    names: dict[str, dict] = {}
+    problems = []
+    for label, pin in gpio.items():
+        rename = renames.setdefault(keys[label], None)
+        if rename is not None and not isinstance(rename, str):
+            problems.append(
+                tr(
+                    f"GPIO.{keys[label]} {rename!r} is not a name",
+                    f"GPIO.{keys[label]} {rename!r} 不是名字",
+                )
+            )
+            continue
+        name = rename or label
+        problem = _gpio_name_problem(name)
+        if problem:
+            problems.append(f"GPIO.{keys[label]} {name!r}: {problem}")
+            continue
+        stm32._register_device(name, "GPIO")
+        names[name] = pin
+    if problems:
+        _fail(
+            tr(
+                f"{stm32.libxr_config_origin}: rename these GPIO objects:\n  ",
+                f"{stm32.libxr_config_origin}：请重命名以下 GPIO 对象：\n  ",
+            )
+            + "\n  ".join(problems)
+        )
     return names
+
+
+def _gpio_name_problem(name: str) -> str:
+    """GPIO 对象名不能用的原因；能用时为空串。名字必须是合法的 C++ 标识符，不是关键字或保留
+    标识符，不与 SDK 的宏和函数、生成代码用到的名字或其他对象重名。
+    Why a GPIO object name cannot be used; empty when it can. The name must be a valid C++
+    identifier that is no keyword or reserved identifier and does not collide with an SDK macro
+    or function, a name the generated code uses or another object.
+    """
+    if not IDENTIFIER.fullmatch(name):
+        return tr("not a valid C++ identifier", "不是合法的 C++ 标识符")
+    if name in CPP_KEYWORDS:
+        return tr("a C++ keyword", "是 C++ 关键字")
+    if "__" in name or re.match(r"_[A-Z]", name):
+        return tr("a reserved C++ identifier", "是 C++ 保留标识符")
+    if name in GENERATED_NAMES or SDK_NAME.fullmatch(name):
+        return tr(
+            "a name of the HPM SDK or of the generated code",
+            "是 HPM SDK 或生成代码使用的名字",
+        )
+    if name in stm32.registered_devices:
+        return tr(
+            f"already the name of a {stm32.registered_devices[name]} object",
+            f"已是一个 {stm32.registered_devices[name]} 对象的名字",
+        )
+    return ""
 
 
 def _pull_text(pad_ctls: dict) -> str:
@@ -265,12 +361,11 @@ def _gpio_section(project_data: dict, gpio: dict[str, dict]) -> list[str]:
     """
     if not gpio:
         return []
-    functions = ", ".join(
-        f"{name}()" for name in project_data.get("MainFunctions") or ["init_bsp_pins"]
-    )
+    functions = _functions_text(project_data)
     summary = ", ".join(_gpio_description(label, pin) for label, pin in gpio.items())
+    verb = "configured" if _main_calls(project_data) else "defines (main.c does not call it)"
     lines = _comment(
-        f"GPIO: {functions} configured {summary}. The interrupt edge comes from the pinmux "
+        f"GPIO: {functions} {verb} {summary}. The interrupt edge comes from the pinmux "
         "and every object carries its port IRQ; RegisterCallback and EnableInterrupt belong "
         "to the consumer (a Module or the User Code).",
         INDENT,
@@ -342,8 +437,11 @@ def _pwm_section(pwms: list) -> list[str]:
                 "HPMPWM::Polarity::NORMAL",
             ],
         )
-        frequency = stm32._settings("PWM", name).setdefault("frequency", None)
-        if frequency:
+        # null 不调用 SetConfig；给出的频率必须是正整数（赫兹）。
+        # null calls no SetConfig; a given frequency must be a positive integer (hertz).
+        frequency = _keyed_settings("PWM", name).setdefault("frequency", None)
+        if frequency is not None:
+            frequency = _setting_int(f"PWM.{name}.frequency", frequency)
             lines += layout(f"{name}.SetConfig", [Braces(str(frequency))])
     return lines
 
@@ -403,15 +501,36 @@ def _notice(project_data: dict) -> list[str]:
     The notice at the start of the file: which .hpmpc it was generated from, what the Pinmux
     Tool and the BSP own and that only the User Code regions are for editing.
     """
-    functions = ", ".join(
-        f"{name}()" for name in project_data.get("MainFunctions") or ["init_bsp_pins"]
-    )
+    functions = _functions_text(project_data)
+    if _main_calls(project_data):
+        pins = f"configures the pins via {functions} in main.c"
+    else:
+        pins = f"defines the pins in {functions}, which main.c does not call,"
     return [GENERATED_NOTICE] + _comment(
         f"Generated from {project_data.get('Hpmpc', 'the HPM Pinmux Tool project')}"
-        f" ({project_data.get('Mcu', {}).get('Type', '')}); the Pinmux Tool configures the"
-        f" pins via {functions} in main.c and main.c stays BSP-owned. Put application code"
-        ' between the "User Code Begin" and "User Code End" markers.'
+        f" ({project_data.get('Mcu', {}).get('Type', '')}); the Pinmux Tool {pins} and main.c"
+        ' stays BSP-owned. Put application code between the "User Code Begin" and "User Code'
+        ' End" markers.'
     )
+
+
+def _main_calls(project_data: dict) -> bool:
+    """main.c 是否真的调用了读到引脚的 pinmux 函数；为假时引脚取自 init_bsp_pins 兜底。旧的
+    工程 YAML 没有 MainCalls，按调用了处理。
+    Whether main.c really calls the pinmux functions the pins were read from; false when the
+    pins come from the init_bsp_pins fallback. An older project YAML has no MainCalls and counts
+    as calling them.
+    """
+    return bool(project_data.get("MainCalls", project_data.get("MainFunctions")))
+
+
+def _functions_text(project_data: dict) -> str:
+    """读到引脚的 pinmux 函数，写成 init_bsp_pins() 这样的列表；没有时为 "no pinmux function"。
+    The pinmux functions the pins were read from, listed as init_bsp_pins(); "no pinmux
+    function" when there is none.
+    """
+    names = project_data.get("MainFunctions") or []
+    return ", ".join(f"{name}()" for name in names) or "no pinmux function"
 
 
 def _includes(project_data: dict, use_xrobot: bool) -> list[str]:
@@ -470,6 +589,20 @@ def generate_full_code(project_data: dict, use_xrobot: bool, existing_code: str)
     return stm32._preserve_generated_regions(existing_code, "\n".join(lines) + "\n")
 
 
+def _check_soc(project_data: dict) -> None:
+    """工程 YAML 的 SoC 和封装必须在芯片引脚数据里（大写）；不认识的 SoC 无法判断有没有 PWM
+    外设，报错退出。
+    The SoC and the package of the project YAML must be in the chip pin data (upper case); for
+    an unknown SoC it cannot be told whether it has a PWM peripheral, so an error is logged and
+    generation exits.
+    """
+    soc = str(project_data.get("Mcu", {}).get("Type") or "")
+    try:
+        pin_layout.layout_hpm(soc, project_data.get("Package"))
+    except ValueError as error:
+        _fail(str(error))
+
+
 def initialize_registry() -> None:
     """清空生成对象的登记表，使同一次进程中的下一次生成不带上次的对象。
     Clear the registry of generated objects, so the next generation in the same process
@@ -514,6 +647,7 @@ def generate(
 
         reset_settings()
         project_data = stm32.load_configuration(input_path)
+        _check_soc(project_data)
         stm32.load_libxr_config(output_dir, libxr_config)
         # load_configuration 又写入了 SYSTEM（HPM 只有裸机），再剔除一次。
         # load_configuration has written SYSTEM again (HPM is bare metal only); remove it

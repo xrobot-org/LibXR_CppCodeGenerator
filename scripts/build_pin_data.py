@@ -276,18 +276,84 @@ def read_hpm_balls(datasheet: Path) -> tuple[dict[str, dict[str, str]], dict[str
     return balls, analog
 
 
+# 数据手册订购型号里的封装代码（产品命名规则图）：HPM5361ICB1 的 CB 是 LQFP100。
+# The package codes of the datasheet's ordering part numbers (the product naming convention
+# figure): the CB of HPM5361ICB1 is LQFP100.
+HPM_PACKAGE_CODES = {"CB": "LQFP100", "CF": "LQFP64", "EG": "QFN48"}
+HPM_PART_NUMBER = re.compile(r"\b(HPM\d{2}[0-9A-Z]{2})I(CB|CF|EG)\d\b")
+HPM_SOC_IP = re.compile(r"^#define\s+HPM_(\w+?)_BASE\b", re.M)
+# 信号的外设名与 hpm_soc_ip.h 的实例名不同的：OPA0_INN0 的外设是 OPAMP0。
+# Peripherals whose signal name differs from the instance of hpm_soc_ip.h: the peripheral of
+# OPA0_INN0 is OPAMP0.
+HPM_IP_ALIASES = {"OPA": "OPAMP"}
+
+
+def read_hpm_packages(datasheet: Path) -> dict[str, set[str]]:
+    """数据手册列出的订购型号：SoC -> 有货的封装（HPM5301 只有 HPM5301IEG1，即 QFN48）。引脚
+    表里有 LQFP80 一列，但没有哪个型号用这个封装。
+    The ordering part numbers the datasheet lists: SoC -> the packages it ships in (HPM5301 only
+    as HPM5301IEG1, QFN48). The pin table has an LQFP80 column, but no part uses that package.
+    """
+    import pdfplumber
+
+    packages: dict[str, set[str]] = {}
+    with pdfplumber.open(datasheet) as pdf:
+        for page in pdf.pages:
+            for soc, code in HPM_PART_NUMBER.findall(page.extract_text() or ""):
+                packages.setdefault(soc, set()).add(HPM_PACKAGE_CODES[code])
+    return packages
+
+
+def hpm_ip_instances(soc_dir: Path) -> set[str]:
+    """SoC 的 hpm_soc_ip.h 声明的外设实例（UART0、ADC0、ACMP……）。
+    The peripheral instances the hpm_soc_ip.h of a SoC declares (UART0, ADC0, ACMP, ...).
+    """
+    return set(HPM_SOC_IP.findall((soc_dir / "hpm_soc_ip.h").read_text(encoding="utf-8")))
+
+
+def hpm_signal_instance(name: str) -> str:
+    """信号所属的外设实例，用 hpm_soc_ip.h 的写法（OPA0_INN0 为 OPAMP0，ADC1_IN3 为 ADC1）。
+    The peripheral instance of a signal, spelled as in hpm_soc_ip.h (OPAMP0 for OPA0_INN0,
+    ADC1 for ADC1_IN3).
+    """
+    instance = name.split("_", 1)[0]
+    kind = re.sub(r"\d+$", "", instance)
+    return HPM_IP_ALIASES.get(kind, kind) + instance[len(kind) :]
+
+
 def build_hpm(sdk: Path, datasheet: Path, series: str) -> dict:
     """HPM 数据：一个系列（HPM5300）里每个 SoC 的各封装引脚；信号取自 SDK 的 hpm_iomux.h
     （BSD-3-Clause），球号取自该系列的数据手册 PINMUX 表（hpmicro.com）。
     The HPM data: the pins of each package of every SoC of one series (HPM5300); the signals
     come from the SDK's hpm_iomux.h (BSD-3-Clause), the balls from that series' datasheet PINMUX
     table (hpmicro.com).
+
+    数据手册的模拟功能是全系列共用的一张表，按各 SoC 的 hpm_soc_ip.h 只留它有的外设：HPM5301
+    没有 ADC1、DAC 和运放。封装取自数据手册的订购型号；手册没有列出的 SoC 不进数据。
+    The analog functions of the datasheet are one table for the whole series; each SoC keeps
+    only the peripherals its hpm_soc_ip.h declares: a HPM5301 has no ADC1, DAC or op-amp. The
+    packages come from the ordering part numbers of the datasheet; a SoC the datasheet does not
+    list stays out of the data.
     """
     balls, analog = read_hpm_balls(datasheet)
+    ordered = read_hpm_packages(datasheet)
+    soc_dirs = [
+        soc_dir
+        for soc_dir in sorted((sdk / "soc" / series).glob("*"))
+        if (soc_dir / "hpm_iomux.h").is_file()
+    ]
+    # 系列里任一 SoC 声明过的外设：只有这些按实例过滤，JTAG、XPI0 等不在 hpm_soc_ip.h 里的保留。
+    # The peripherals any SoC of the series declares: only these are filtered by instance;
+    # JTAG, XPI0 and others that hpm_soc_ip.h does not list stay.
+    series_ip = set().union(*(hpm_ip_instances(soc_dir) for soc_dir in soc_dirs))
     socs = {}
-    for soc_dir in sorted((sdk / "soc" / series).glob("*")):
-        if not (soc_dir / "hpm_iomux.h").is_file():
+    for soc_dir in soc_dirs:
+        if soc_dir.name not in ordered:
+            print(
+                f"{soc_dir.name}: not among the ordering part numbers of {datasheet.name}; skipped"
+            )
             continue
+        ip = hpm_ip_instances(soc_dir)
         signals = read_hpm_signals(soc_dir)
         # 模拟功能（ADC、ACMP、OPA 的输入输出）补进信号表；数字头文件里没有它们。
         # The analog functions (the inputs and outputs of ADC, ACMP and OPA) join the signal
@@ -295,8 +361,17 @@ def build_hpm(sdk: Path, datasheet: Path, series: str) -> dict:
         for pad, names in analog.items():
             known = {name for name, _ in signals.get(pad, [])}
             signals.setdefault(pad, []).extend([name, None] for name in names if name not in known)
+        for pad, entries in signals.items():
+            signals[pad] = [
+                entry
+                for entry in entries
+                if hpm_signal_instance(entry[0]) in ip
+                or hpm_signal_instance(entry[0]) not in series_ip
+            ]
         packages = {}
         for package in balls[next(iter(balls))]:
+            if package not in ordered[soc_dir.name]:
+                continue
             pins = [
                 [
                     ball,

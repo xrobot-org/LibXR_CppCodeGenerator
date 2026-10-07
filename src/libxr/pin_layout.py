@@ -314,9 +314,18 @@ def hpm_soc_has_pwm(model: str) -> bool:
     none): on a SoC with them a GPTMR is display-only, and only a SoC without them generates
     the HPMPWM fallback objects.
     """
-    soc = load_data("hpm")["socs"].get(model)
+    socs = load_data("hpm")["socs"]
+    soc = socs.get(model)
     if soc is None:
-        return False
+        # 不认识的 SoC 不能当作"没有 PWM"：那样会给有 PWM 外设的芯片生成 GPTMR 的对象。
+        # An unknown SoC must not count as "no PWM": that would generate GPTMR objects for a
+        # chip that has a PWM peripheral.
+        raise ValueError(
+            tr(
+                f"Unknown HPM SoC: {model}; this data has {', '.join(socs)}",
+                f"未知的 HPM SoC：{model}；数据里有 {'、'.join(socs)}",
+            )
+        )
     for package in soc["packages"].values():
         for _position, _name, _kind, _x, signals in package:
             for signal, _mode in signals:
@@ -346,6 +355,8 @@ PWM_CHANNELS = {
     "HRTIM": r"CH[A-F]\d",
     "TIMA": r"CCP\d+(_CMPL)?",
     "TIMG": r"CCP\d+(_CMPL)?",
+    "GPTMR": r"COMP_\d+",
+    "PWM": r"P_\d+",
 }
 
 
@@ -359,11 +370,15 @@ def gpio_port_and_line(pin_name: str) -> tuple[str, str] | None:
 
 
 def pin_has_gpio(pin: Pin) -> bool:
-    """引脚能当普通 GPIO：ST 的信号里有 GPIO；TI 的信号里有引脚自己的名字（PA0）。
+    """引脚能当普通 GPIO：ST 的信号里有 GPIO；TI 的信号里有引脚自己的名字（PA0）；HPM 的信号里
+    有它的 GPIO 复用（PA10 的 GPIO_A_10）。
     Whether the pin can be a plain GPIO: ST lists GPIO among the signals, TI lists the name of
-    the pin itself (PA0).
+    the pin itself (PA0), and HPM lists its GPIO mux (GPIO_A_10 for PA10).
     """
-    return "GPIO" in pin.signals or pin.name in pin.signals
+    if "GPIO" in pin.signals or pin.name in pin.signals:
+        return True
+    port_line = gpio_port_and_line(pin.name)
+    return port_line is not None and f"GPIO_{port_line[0]}_{port_line[1]}" in pin.signals
 
 
 def peripheral_index(layout: PinLayout) -> dict:
@@ -396,7 +411,9 @@ def peripheral_index(layout: PinLayout) -> dict:
                 add(*recognized, pin)
         port_line = gpio_port_and_line(pin.name)
         if port_line is not None and pin_has_gpio(pin):
-            port, line = port_line
+            # 线号去掉前导零：HPM 的 PA03 与 STM32 的 PA3 一样是 P3。
+            # The line drops its leading zeros: the PA03 of an HPM is P3, like the PA3 of an STM32.
+            port, line = port_line[0], int(port_line[1])
             add(f"GPIO{port}", "GPIO", f"P{line}", pin)
             if any(mode.startswith("EXTI") for mode in pin.extra.get("gpio_modes", [])):
                 add("EXTI", "EXTI", f"LINE{line}", pin)
