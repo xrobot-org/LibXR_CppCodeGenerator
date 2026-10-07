@@ -565,18 +565,78 @@ def hpm_assignments(hpmpc: Path, main_c: Path, layout: PinLayout) -> dict[str, d
     return assigned
 
 
-def config_key(platform: str, entry: dict) -> tuple[str, str] | None:
-    """一个已选外设在 libxr_config.yaml 中的段和键；libxr gen 不生成它时为 None。
-    The section and key of a selected peripheral in libxr_config.yaml; None when libxr gen does
-    not generate it.
+def config_entries(
+    platform: str,
+    instance: str,
+    kind: str,
+    functions: dict,
+    settings: dict,
+    sysconfig: dict | None,
+) -> list[dict]:
+    """一个已选外设在 libxr_config.yaml 中的设置条目；libxr gen 不生成它的设置时为空。
+    The config entries of a selected peripheral in libxr_config.yaml; empty when libxr gen does
+    not generate settings for it.
+
+    一个条目是 {section, key, present, params}。key 为 None 时条目是整段（HPM 的 GPIO 改名），
+    params 是该外设每个引脚的现名，文件里没有的为 None。PWM 一个实例有多个通道，每通道一个
+    条目；MSPM0 的定时器只有 SysConfig 模块是 PWM 的才生成，QEI 等没有。
+    An entry is {section, key, present, params}. With a None key the entry is a whole section
+    (the GPIO renames of an HPM) and params holds the current name of every pin of the
+    peripheral, None when the file has none. An instance of PWM has a channel per entry, and an
+    MSPM0 timer generates only with the SysConfig module PWM, not QEI and the like.
     """
-    if platform != "stm32":
-        return None
-    section = STM32_SECTIONS.get(entry["kind"])
-    if section is None:
-        return None
-    instance = entry["peripheral"]
-    return section, USB_KEYS.get(instance, instance.lower())
+
+    def keyed(section: str, name: str) -> dict:
+        """一个有键的条目：键的大小写以文件为准，文件里没有时 present 为 False。
+        A keyed entry: the case of the key is the file's, and present is False when the file has
+        none.
+        """
+        values = settings.get(section) if isinstance(settings.get(section), dict) else {}
+        actual = next((key for key in values if str(key).lower() == name), None)
+        entry = {"section": section, "key": actual or name, "present": actual is not None}
+        if actual is not None:
+            entry["params"] = values[actual]
+        return entry
+
+    def channels(pattern: str) -> list[int]:
+        """外设各引脚功能里的通道号，升序去重。
+        The channel numbers in the functions of the peripheral's pins, ascending and unique.
+        """
+        return sorted({int(match.group(1)) for f in functions if (match := re.match(pattern, f))})
+
+    if platform == "stm32":
+        section = STM32_SECTIONS.get(kind)
+        if section is None:
+            return []
+        return [keyed(section, USB_KEYS.get(instance, instance.lower()))]
+    if platform == "mspm0":
+        if kind in ("UART", "I2C", "SPI"):
+            return [keyed(kind, instance.lower())]
+        if kind in ("TIMA", "TIMG") and sysconfig and sysconfig.get("module") == "PWM":
+            return [keyed("PWM", f"pwm_{instance.lower()}_c{n}") for n in channels(r"CCP(\d+)")]
+        return []
+    if platform == "hpm":
+        if kind == "I2C":
+            return [keyed("I2C", instance.lower())]
+        if kind == "GPTMR":
+            return [keyed("PWM", f"pwm_{instance.lower()}_ch{n}") for n in channels(r"COMP_(\d+)")]
+        if kind == "GPIO":
+            values = settings.get("GPIO") if isinstance(settings.get("GPIO"), dict) else {}
+            params = {}
+            for pin_name in functions.values():
+                port_line = pin_layout.gpio_port_and_line(pin_name)
+                if port_line is None:
+                    continue
+                # 名字的规则与解析器的一致：p 加端口小写字母加线号（PA03 -> pa3）。
+                # The rule of the name is the parser's: p, the lower-case port letter and the
+                # line (PA03 -> pa3).
+                name = f"p{port_line[0].lower()}{int(port_line[1]):d}"
+                params[name] = values.get(name)
+            if not params:
+                return []
+            return [{"section": "GPIO", "key": None, "present": bool(values), "params": params}]
+        return []
+    return []
 
 
 def project_overlay(
@@ -603,17 +663,16 @@ def project_overlay(
         # MSPM0: the settings of a peripheral are in the SysConfig project (.syscfg), given read-only.
         if sysconfig and instance in sysconfig:
             used["sysconfig"] = sysconfig[instance]
-        key = config_key(layout.platform, {"peripheral": instance, "kind": used["kind"]})
-        if key is None:
-            continue
-        section, name = key
-        # 键的大小写以文件为准：同一个文件里有 fdcan1，也有 FDCAN1。
-        # The case of the key is the file's: one file has fdcan1, another FDCAN1.
-        entries = settings.get(section) if isinstance(settings.get(section), dict) else {}
-        actual = next((key for key in entries if str(key).lower() == name), None)
-        used["config"] = {"section": section, "key": actual or name, "present": actual is not None}
-        if actual is not None:
-            used["config"]["params"] = entries[actual]
+        entries = config_entries(
+            layout.platform,
+            instance,
+            used["kind"],
+            used["pins"],
+            settings,
+            used.get("sysconfig"),
+        )
+        if entries:
+            used["config"] = entries
     return {
         "assignments": dict(
             sorted(assigned.items(), key=lambda item: pin_layout.natural_key(item[0]))

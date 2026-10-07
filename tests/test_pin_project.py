@@ -108,17 +108,20 @@ class Stm32Projects(TestCase):
         peripherals = info["project"]["peripherals"]
         self.assertEqual(
             peripherals["USART1"]["config"],
-            {
-                "section": "USART",
-                "key": "usart1",
-                "present": True,
-                "params": {"tx_buffer_size": 128, "rx_buffer_size": 64},
-            },
+            [
+                {
+                    "section": "USART",
+                    "key": "usart1",
+                    "present": True,
+                    "params": {"tx_buffer_size": 128, "rx_buffer_size": 64},
+                }
+            ],
         )
         self.assertEqual(
-            peripherals["USART6"]["config"], {"section": "USART", "key": "usart6", "present": False}
+            peripherals["USART6"]["config"],
+            [{"section": "USART", "key": "usart6", "present": False}],
         )
-        self.assertEqual(peripherals["SPI1"]["config"]["params"], {"dma_section": ".axi_ram"})
+        self.assertEqual(peripherals["SPI1"]["config"][0]["params"], {"dma_section": ".axi_ram"})
         self.assertNotIn("config", peripherals["GPIOC"])
 
     def test_the_case_of_a_key_in_the_file_is_kept(self):
@@ -132,14 +135,14 @@ class Stm32Projects(TestCase):
             info = layout_with_project(directory, None, None, None)
         self.assertEqual(
             info["project"]["peripherals"]["FDCAN1"]["config"],
-            {"section": "FDCAN", "key": "FDCAN1", "present": True, "params": {"queue_size": 5}},
+            [{"section": "FDCAN", "key": "FDCAN1", "present": True, "params": {"queue_size": 5}}],
         )
 
     def test_a_missing_configuration_file_is_not_an_error(self):
         with tempfile.TemporaryDirectory() as directory:
             info = self.project(directory, config=None)
         self.assertIsNone(info["project"]["libxr_config"])
-        self.assertFalse(info["project"]["peripherals"]["USART1"]["config"]["present"])
+        self.assertFalse(info["project"]["peripherals"]["USART1"]["config"][0]["present"])
 
     def test_another_configuration_file_can_be_given(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -148,9 +151,10 @@ class Stm32Projects(TestCase):
             )
             info = self.project(directory, config_path=str(other))
         self.assertEqual(
-            info["project"]["peripherals"]["SPI1"]["config"]["params"], {"dma_enable_min_size": 8}
+            info["project"]["peripherals"]["SPI1"]["config"][0]["params"],
+            {"dma_enable_min_size": 8},
         )
-        self.assertFalse(info["project"]["peripherals"]["USART1"]["config"]["present"])
+        self.assertFalse(info["project"]["peripherals"]["USART1"]["config"][0]["present"])
 
     def test_a_given_model_wins_over_the_ioc(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -416,9 +420,51 @@ class SyscfgProjects(TestCase):
         info = self.project('//@cliArgs --package "LQFP-64(PM)"\n', model="MSPM0G3507")
         self.assertEqual(info["part"], "MSPM0G3507")
 
-    def test_libxr_gen_has_no_section_for_an_mspm0(self):
+    def test_an_mspm0_peripheral_is_tied_to_its_libxr_config_settings(self):
         peripherals = self.project()["project"]["peripherals"]
-        self.assertNotIn("config", peripherals["UART0"])
+        self.assertEqual(
+            peripherals["UART0"]["config"],
+            [{"section": "UART", "key": "uart0", "present": False}],
+        )
+        # MSPM0 的 GPIO 名字来自 .syscfg 的标签，DAC 也不生成设置段。
+        # The GPIO names of an MSPM0 come from the labels of the .syscfg, and a DAC has no
+        # settings section either.
+        self.assertNotIn("config", peripherals["GPIOB"])
+        self.assertNotIn("config", peripherals["DAC0"])
+
+    def test_a_pwm_instance_has_an_entry_per_channel(self):
+        # PWM 的对象名是 pwm_<定时器>_c<通道>，一个实例每个通道一个条目。
+        # The object names of a PWM are pwm_<timer>_c<channel>; one entry per channel of the
+        # instance.
+        syscfg = (
+            '//@v2CliArgs --device "MSPM0G3507" --package "LQFP-64(PM)"\n'
+            'const PWM  = scripting.addModule("/ti/driverlib/PWM", {}, false);\n'
+            "const PWM1 = PWM.addInstance();\n"
+            'PWM1.$name                      = "PWM_TIMA1";\n'
+            'PWM1.peripheral.$assign         = "TIMA1";\n'
+            'PWM1.peripheral.ccp0Pin.$assign = "PA28";\n'
+            'PWM1.peripheral.ccp1Pin.$assign = "PA31";\n'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            write(Path(directory), "a.syscfg", syscfg)
+            write(
+                Path(directory),
+                "User/libxr_config.yaml",
+                "PWM:\n  pwm_tima1_c0:\n    frequency: 1000\n",
+            )
+            info = layout_with_project(directory, None, None, None)
+        self.assertEqual(
+            info["project"]["peripherals"]["TIMA1"]["config"],
+            [
+                {
+                    "section": "PWM",
+                    "key": "pwm_tima1_c0",
+                    "present": True,
+                    "params": {"frequency": 1000},
+                },
+                {"section": "PWM", "key": "pwm_tima1_c1", "present": False},
+            ],
+        )
 
     def test_the_pins_the_solver_picked_are_a_fallback(self):
         # 求解器选的引脚（$suggestSolution）也算数；测试用的 PA0 是 UART0.TX。
@@ -616,6 +662,39 @@ class HpmProjects(TestCase):
             str(caught.exception),
         )
 
+    def test_a_peripheral_is_tied_to_its_libxr_config_settings(self):
+        # HPM 生成 I2C 的设置和 GPIO 的改名（pa10，PA03 -> pa3）；UART 没有设置段。
+        # An HPM generates the I2C settings and the GPIO renames (pa10, PA03 -> pa3); a UART has
+        # no settings section.
+        files = self.project_files()
+        files["User/libxr_config.yaml"] = "I2C:\n  i2c0:\n    speed: 100000\nGPIO:\n  pa10: LED\n"
+        peripherals = self.project(files)["project"]["peripherals"]
+        self.assertEqual(
+            peripherals["I2C0"]["config"],
+            [{"section": "I2C", "key": "i2c0", "present": True, "params": {"speed": 100000}}],
+        )
+        self.assertEqual(
+            peripherals["GPIOA"]["config"],
+            [{"section": "GPIO", "key": None, "present": True, "params": {"pa10": "LED"}}],
+        )
+        self.assertNotIn("config", peripherals["UART0"])
+
+    def test_a_gptmr_channel_is_a_pwm_entry(self):
+        # GPTMR 的对象名是 pwm_<定时器>_ch<通道>，每通道一个条目。
+        # The object names of a GPTMR are pwm_<timer>_ch<channel>; one entry per channel.
+        hpmpc = json.loads(self.HPMPC)
+        hpmpc["content"]["pinmux"]["functions"]["init_bsp_pins"]["selectPins"]["PB08"] = {
+            "signal": "GPTMR0.A.COMP_1",
+            "padCtls": {},
+        }
+        files = self.project_files()
+        files["boards/board/tool_config.hpmpc"] = json.dumps(hpmpc)
+        peripherals = self.project(files)["project"]["peripherals"]
+        self.assertEqual(
+            peripherals["GPTMR0"]["config"],
+            [{"section": "PWM", "key": "pwm_gptmr0_ch1", "present": False}],
+        )
+
 
 class SysconfigSettings(TestCase):
     """MSPM0 外设的设置取自 .syscfg，只读。
@@ -716,7 +795,7 @@ class CommandLine(TestCase):
         self.assertEqual((code, err), (0, ""))
         info = yaml.safe_load(out)
         self.assertEqual(info["part"], "STM32F407IGHx")
-        self.assertEqual(info["project"]["peripherals"]["USART1"]["config"]["present"], True)
+        self.assertEqual(info["project"]["peripherals"]["USART1"]["config"][0]["present"], True)
 
     def test_the_configuration_file_can_be_given_with_c(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -726,7 +805,7 @@ class CommandLine(TestCase):
         info = yaml.safe_load(out)
         self.assertEqual(code, 0)
         self.assertEqual(
-            info["project"]["peripherals"]["SPI1"]["config"]["params"], {"tx_buffer_size": 7}
+            info["project"]["peripherals"]["SPI1"]["config"][0]["params"], {"tx_buffer_size": 7}
         )
 
     def test_errors_are_logged(self):
