@@ -368,6 +368,29 @@ class Options(TestCase):
                     "run": "cmd_hpm_setup",
                 },
             ),
+            (
+                ["mspm0", "setup"],
+                {
+                    "directory": ".",
+                    "output": "",
+                    "xrobot": None,
+                    "libxr_config": "",
+                    **quiet,
+                    "run": "cmd_mspm0_setup",
+                },
+            ),
+            (
+                ["mspm0", "setup", "-d", "p", "-o", "o.cpp", "--no-xrobot"]
+                + ["--libxr-config", "c.yaml", "--verbose"],
+                {
+                    "directory": "p",
+                    "output": "o.cpp",
+                    "xrobot": False,
+                    "libxr_config": "c.yaml",
+                    **loud,
+                    "run": "cmd_mspm0_setup",
+                },
+            ),
         ):
             with self.subTest(argv=argv):
                 self.assertEqual(self.parsed(*argv), expected)
