@@ -906,13 +906,14 @@ def _add_pins(commands) -> None:
         commands,
         "pins",
         tr(
-            "print the package and pin layout of a chip model (STM32, MSPM0)",
-            "打印芯片型号的封装和引脚布局（STM32、MSPM0）",
+            "print the package and pin layout of a chip model (STM32, MSPM0, HPM)",
+            "打印芯片型号的封装和引脚布局（STM32、MSPM0、HPM）",
         ),
         cmd_pins,
         epilog=tr("examples:", "示例：")
         + "\n  libxr pins STM32H723VGT6\n  libxr pins MSPM0G3507SPMR"
         + "\n  libxr pins MSPM0G3507 --package LQFP-64 --format json"
+        + "\n  libxr pins HPM5301"
         + "\n  libxr pins -d path/to/project",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -928,10 +929,11 @@ def _add_pins(commands) -> None:
         "-d",
         "--directory",
         help=tr(
-            "project directory: overlay the signals it has selected (an STM32CubeMX .ioc, or a "
-            "SysConfig ti_msp_dl_config.h) and their libxr_config.yaml settings",
-            "工程目录：叠加其中已选的信号（STM32CubeMX 的 .ioc 或 SysConfig 的 "
-            "ti_msp_dl_config.h）和它们在 libxr_config.yaml 中的设置",
+            "project directory: overlay the signals it has selected (an STM32CubeMX .ioc, the "
+            "root SysConfig .syscfg of an MSPM0, or the .hpmpc under boards/ of an HPM) and "
+            "their libxr_config.yaml settings",
+            "工程目录：叠加其中已选的信号（STM32CubeMX 的 .ioc、MSPM0 根目录的 SysConfig "
+            ".syscfg，或 HPM 在 boards/ 下的 .hpmpc）和它们在 libxr_config.yaml 中的设置",
         ),
     )
     parser.add_argument(
@@ -947,10 +949,10 @@ def _add_pins(commands) -> None:
         "-p",
         "--package",
         help=tr(
-            "package, for a model that does not name it (MSPM0: LQFP-64, PM, ...); with -d an "
-            "MSPM0 takes it from the SysConfig project",
-            "封装，用于型号中没有封装的情况（MSPM0：LQFP-64、PM 等）；用 -d 时 MSPM0 取自 "
-            "SysConfig 工程",
+            "package, for a model that does not name it (MSPM0: LQFP-64, PM, ...; HPM: QFN48, "
+            "...); with -d it comes from the SysConfig or Pinmux Tool project",
+            "封装，用于型号中没有封装的情况（MSPM0：LQFP-64、PM 等；HPM：QFN48 等）；用 -d 时"
+            "取自 SysConfig 或 Pinmux Tool 工程",
         ),
     )
     parser.add_argument(
