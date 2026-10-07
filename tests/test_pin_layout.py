@@ -103,6 +103,50 @@ class HpmModels(TestCase):
             str(caught.exception).startswith("HPM5301 has no package BGA"), str(caught.exception)
         )
 
+    def test_the_packages_are_the_ordering_part_numbers(self):
+        # 数据手册的订购型号：HPM5301 只有 IEG1（QFN48），所以不用给封装；LQFP80 是引脚表里的一
+        # 列，但没有哪个型号用它。
+        # The ordering part numbers of the datasheet: HPM5301 ships as IEG1 (QFN48) only, so
+        # no package needs to be given; LQFP80 is a column of the pin table that no part uses.
+        self.assertEqual(layout_pins("HPM5301").package, "QFN48")
+        socs = pin_layout.load_data("hpm")["socs"]
+        self.assertEqual(sorted(socs["HPM5361"]["packages"]), ["LQFP100", "LQFP64", "QFN48"])
+        for soc in socs.values():
+            self.assertNotIn("LQFP80", soc["packages"])
+
+    def test_the_analog_functions_follow_the_peripherals_of_the_soc(self):
+        # HPM5301 只有 ADC0，没有 DAC 和运放（hpm_soc_ip.h）；HPM5361 都有。
+        # A HPM5301 has ADC0 only and no DAC or op-amp (hpm_soc_ip.h); a HPM5361 has them all.
+        pb08 = {
+            soc: next(p for p in layout_pins(soc, "QFN48").pins if p.name == "PB08")
+            for soc in ("HPM5301", "HPM5361")
+        }
+        for signal in ("ADC1_IN11", "DAC0_OUT", "OPA0_INP2"):
+            self.assertNotIn(signal, pb08["HPM5301"].signals)
+            self.assertIn(signal, pb08["HPM5361"].signals)
+
+    def test_an_unknown_soc_has_no_answer_about_pwm(self):
+        # 不认识的 SoC 不能当作没有 PWM 外设，否则会给 HPM5361 这样的芯片生成 GPTMR 的 PWM。
+        # An unknown SoC must not count as having no PWM peripheral; that would generate GPTMR
+        # PWM objects for a chip like the HPM5361.
+        self.assertFalse(pin_layout.hpm_soc_has_pwm("HPM5301"))
+        self.assertTrue(pin_layout.hpm_soc_has_pwm("HPM5361"))
+        with self.assertRaises(ValueError):
+            pin_layout.hpm_soc_has_pwm("hpm5361")
+
+    def test_the_index_has_the_gpio_ports_and_the_pwm_capable_timers(self):
+        index = layout_to_dict(layout_pins("HPM5301"))["peripherals"]
+        self.assertEqual(index["GPIOA"]["kind"], "GPIO")
+        self.assertEqual(index["GPIOA"]["signals"]["P10"], ["PA10"])
+        # 线号去掉前导零：PA03 是 P3。
+        # The line drops its leading zero: PA03 is P3.
+        self.assertEqual(index["GPIOA"]["signals"]["P3"], ["PA03"])
+        self.assertEqual(index["GPTMR0"]["capabilities"], ["pwm"])
+        self.assertEqual(
+            layout_to_dict(layout_pins("HPM5361", "QFN48"))["peripherals"]["PWM0"]["capabilities"],
+            ["pwm"],
+        )
+
 
 class Mspm0Models(TestCase):
     """MSPM0 型号按器件族和封装代码解析，每个引脚带 PINCM 和各信号的模式号。

@@ -629,6 +629,77 @@ class HpmProjects(TestCase):
         )
         self.assertEqual(info["project"]["assignments"]["PA00"]["signal"], "UART0_TXD")
 
+    def test_a_gptmr_on_a_soc_with_a_pwm_peripheral_has_no_pwm_entry(self):
+        # 与解析一致：HPM5361 有 PWM 外设，GPTMR 只作展示，libxr_config 里没有它的 PWM 条目。
+        # As parsed: a HPM5361 has a PWM peripheral, so a GPTMR is display-only and has no PWM
+        # entry in libxr_config.
+        hpmpc = json.loads(self.HPMPC)
+        hpmpc["content"]["info"]["socName"] = "HPM5361"
+        hpmpc["content"]["pinmux"]["functions"]["init_bsp_pins"]["selectPins"]["PB08"] = {
+            "signal": "GPTMR0.B.COMP[1]",
+            "padCtls": {},
+        }
+        files = self.project_files()
+        files["boards/board/tool_config.hpmpc"] = json.dumps(hpmpc)
+        peripherals = self.project(files)["project"]["peripherals"]
+        self.assertEqual(peripherals["GPTMR0"]["pins"], {"COMP_1": "PB08"})
+        self.assertNotIn("config", peripherals["GPTMR0"])
+
+    def test_a_lower_case_soc_and_a_byte_order_mark_are_read(self):
+        hpmpc = json.loads(self.HPMPC)
+        hpmpc["content"]["info"]["socName"] = "hpm5301"
+        files = self.project_files()
+        files["boards/board/tool_config.hpmpc"] = "﻿" + json.dumps(hpmpc)
+        self.assertEqual(self.project(files)["part"], "HPM5301")
+
+    def test_a_malformed_hpmpc_is_a_formatted_error(self):
+        cases = {
+            "no pinmux": {"content": {"info": {"socName": "HPM5301"}}},
+            "a string selection": {
+                "content": {
+                    "info": {"socName": "HPM5301"},
+                    "pinmux": {"functions": {"init_bsp_pins": {"selectPins": {"PA00": "x"}}}},
+                }
+            },
+        }
+        for name, document in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as directory:
+                path = write(Path(directory), "a.hpmpc", json.dumps(document))
+                with self.assertRaises(ValueError) as caught:
+                    pin_project.read_hpmpc(path)
+                self.assertIn(
+                    "export the project again from the HPM Pinmux Tool", str(caught.exception)
+                )
+        with tempfile.TemporaryDirectory() as directory:
+            path = write(Path(directory), "a.hpmpc", "{not json")
+            with self.assertRaises(ValueError):
+                pin_project.read_hpmpc(path)
+
+    def test_null_managers_and_selections_count_as_empty(self):
+        document = {
+            "content": {
+                "info": {"socName": "HPM5301"},
+                "pinmux": {
+                    "functions": {
+                        "init_bsp_pins": {"selectPins": None, "managers": None},
+                        "init_more_pins": {
+                            "selectPins": {"PA10": {"signal": "GPIO.A.A[10]", "padCtls": None}},
+                            "managers": {"gpiom": None},
+                        },
+                    }
+                },
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            project = pin_project.read_hpmpc(
+                write(Path(directory), "a.hpmpc", json.dumps(document))
+            )
+        self.assertEqual(project.functions["init_bsp_pins"].pins, {})
+        self.assertEqual(
+            project.functions["init_more_pins"].pins,
+            {"PA10": {"signal": "GPIO.A.A[10]", "padCtls": {}}},
+        )
+
     def test_a_call_inside_a_conditional_is_not_active(self):
         # O2：条件编译里的函数不算，PA04 不出现。
         # O2: a function inside a conditional does not count; PA04 stays out.
@@ -684,7 +755,7 @@ class HpmProjects(TestCase):
         # The object names of a GPTMR are pwm_<timer>_ch<channel>; one entry per channel.
         hpmpc = json.loads(self.HPMPC)
         hpmpc["content"]["pinmux"]["functions"]["init_bsp_pins"]["selectPins"]["PB08"] = {
-            "signal": "GPTMR0.A.COMP_1",
+            "signal": "GPTMR0.B.COMP[1]",
             "padCtls": {},
         }
         files = self.project_files()
@@ -694,6 +765,83 @@ class HpmProjects(TestCase):
             peripherals["GPTMR0"]["config"],
             [{"section": "PWM", "key": "pwm_gptmr0_ch1", "present": False}],
         )
+
+
+class HpmMainCalls(TestCase):
+    """main.c 里哪些 pinmux 函数算被调用：只看 main 的函数体，去掉注释和字符串，条件编译里的
+    单独列出（O2）。
+    Which pinmux functions main.c counts as called: only the body of main, with comments and
+    strings removed, and those inside a conditional listed apart (O2).
+    """
+
+    FUNCTIONS = ("init_bsp_pins", "init_uart_pins", "init_jtag_pins", "init_helper_pins")
+
+    def calls(self, text: str) -> tuple[list[str], list[str]]:
+        """给定 main.c 内容时 hpm_main_calls 的结果。
+        The result of hpm_main_calls for the given main.c content.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            path = write(Path(directory), "main.c", textwrap.dedent(text))
+            return pin_project.hpm_main_calls(path, self.FUNCTIONS)
+
+    def test_the_spellings_of_a_call_are_recognized(self):
+        called, _ = self.calls(
+            """\
+            int main(void)
+            {
+              init_bsp_pins(); // the console pins
+              init_uart_pins (void);
+              board_init(); init_jtag_pins ( );
+            }
+            """
+        )
+        self.assertEqual(called, ["init_bsp_pins", "init_uart_pins", "init_jtag_pins"])
+
+    def test_calls_in_comments_and_strings_do_not_count(self):
+        called, conditional = self.calls(
+            """\
+            int main(void)
+            {
+              /* init_uart_pins();
+                 #if 0 */
+              printf("init_jtag_pins();");
+              init_bsp_pins();
+            }
+            """
+        )
+        self.assertEqual((called, conditional), (["init_bsp_pins"], []))
+
+    def test_a_call_in_a_helper_does_not_count(self):
+        called, _ = self.calls(
+            """\
+            static void setup(void)
+            {
+              init_helper_pins();
+            }
+
+            int main(void)
+            {
+              setup();
+              init_bsp_pins();
+            }
+            """
+        )
+        self.assertEqual(called, ["init_bsp_pins"])
+
+    def test_a_call_inside_a_conditional_is_listed_apart(self):
+        called, conditional = self.calls(
+            """\
+            int main(void)
+            {
+              init_bsp_pins();
+            #ifdef KEEP_JTAG
+            #else
+              init_jtag_pins();
+            #endif
+            }
+            """
+        )
+        self.assertEqual((called, conditional), (["init_bsp_pins"], ["init_jtag_pins"]))
 
 
 class SysconfigSettings(TestCase):

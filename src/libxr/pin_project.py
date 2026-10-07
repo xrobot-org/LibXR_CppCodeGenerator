@@ -470,36 +470,186 @@ def hpm_canonical(signal: str) -> str:
     return "_".join(parts).replace("[", "_").replace("]", "")
 
 
-HPM_DIRECTIVE = re.compile(r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b")
-HPM_CALL = re.compile(r"^\s*(\w+)\(\);\s*$")
+HPM_DIRECTIVE = re.compile(r"^[ \t]*#[ \t]*(if|ifdef|ifndef|elif|else|endif)\b")
+HPM_CALL = re.compile(r"\b(\w+)\s*\(\s*(?:void\s*)?\)\s*;")
+HPM_MAIN = re.compile(r"\bmain\s*\([^)]*\)\s*\{")
+# C 源码里的注释和字面量：块注释、行注释、字符串和字符常量（带转义）。
+# The comments and literals of C source: block comments, line comments, string and character
+# constants (with escapes).
+C_COMMENT_OR_LITERAL = re.compile(
+    r"/\*.*?\*/|//[^\n]*|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'", re.S
+)
 
 
-def hpm_called_functions(main_c: Path, functions: dict) -> list[str]:
-    """main.c 在预处理条件外调用的 pinmux 函数，按调用顺序；main.c 不存在时为空。条件编译里的
-    调用不算（rmcs 的 JTAG 共用引脚在 #if 里，O2 的决定）。
-    The pinmux functions main.c calls outside preprocessor conditions, in call order; empty
-    when main.c does not exist. A call inside a conditional does not count (rmcs' JTAG shared
-    pins sit in an #if, the decision of O2).
+@dataclass
+class HpmFunction:
+    """.hpmpc 的一个 pinmux 函数：选中的引脚（pad -> 信号和 pad 设置）和 gpiom 写下的 GPIO 设置。
+    One pinmux function of a .hpmpc: the selected pins (pad -> signal and pad settings) and the
+    GPIO settings the gpiom manager wrote.
+    """
+
+    pins: dict[str, dict]
+    gpiom: dict[str, dict]
+
+
+@dataclass
+class HpmProject:
+    """一个 .hpmpc：SoC（大写，没有给出时为 None）、封装和各 pinmux 函数，按文件中的顺序。
+    One .hpmpc: the SoC (upper case, None when not given), the package and the pinmux functions,
+    in file order.
+    """
+
+    path: Path
+    soc: str | None
+    package: str | None
+    functions: dict[str, HpmFunction]
+
+
+def _mapping(value, what: str, path: Path) -> dict:
+    """value 本身（映射），null 为空映射；其他值抛出说明 what 的 ValueError。
+    value itself when it is a mapping, an empty mapping for null; any other value raises a
+    ValueError that names what.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(
+            tr(
+                f"{path}: {what} is not a mapping; export the project again from the HPM Pinmux "
+                "Tool",
+                f"{path}：{what} 不是映射；请从 HPM Pinmux Tool 重新导出工程",
+            )
+        )
+    return value
+
+
+def read_hpmpc(path: Path) -> HpmProject:
+    """读一个 .hpmpc（允许 UTF-8 BOM）。info 和 pinmux 缺失或类型不对时抛出 ValueError；值为
+    null 的 managers、gpiom 和 selectPins 当作空。SoC 名换成大写。
+    Read a .hpmpc (a UTF-8 BOM is allowed). A missing or mistyped info or pinmux raises
+    ValueError; a null managers, gpiom or selectPins counts as empty. The SoC name is put in
+    upper case.
+    """
+    try:
+        document = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            tr(f"{path}: not a readable .hpmpc: {error}", f"{path}：无法读取的 .hpmpc：{error}")
+        ) from error
+    content = _mapping(_mapping(document, "the file", path).get("content"), "content", path)
+    if "info" not in content or "pinmux" not in content:
+        raise ValueError(
+            tr(
+                f"{path}: no info or pinmux in content; export the project again from the HPM "
+                "Pinmux Tool",
+                f"{path}：content 中没有 info 或 pinmux；请从 HPM Pinmux Tool 重新导出工程",
+            )
+        )
+    info = _mapping(content["info"], "content.info", path)
+    soc = info.get("socName")
+    soc = soc.strip().upper() if isinstance(soc, str) and soc.strip() else None
+    package = info.get("packageName")
+    raw = _mapping(
+        _mapping(content["pinmux"], "content.pinmux", path).get("functions"),
+        "content.pinmux.functions",
+        path,
+    )
+    functions: dict[str, HpmFunction] = {}
+    for name, function in raw.items():
+        where = f"content.pinmux.functions.{name}"
+        function = _mapping(function, where, path)
+        pins = {}
+        for pad, selection in _mapping(
+            function.get("selectPins"), f"{where}.selectPins", path
+        ).items():
+            selection = _mapping(selection, f"{where}.selectPins.{pad}", path)
+            signal = selection.get("signal")
+            if not isinstance(signal, str) or not signal:
+                continue
+            pins[str(pad)] = {
+                "signal": signal,
+                "padCtls": _mapping(
+                    selection.get("padCtls"), f"{where}.selectPins.{pad}.padCtls", path
+                ),
+            }
+        managers = _mapping(function.get("managers"), f"{where}.managers", path)
+        gpiom = {
+            str(pad): _mapping(value, f"{where}.managers.gpiom.{pad}", path)
+            for pad, value in _mapping(
+                managers.get("gpiom"), f"{where}.managers.gpiom", path
+            ).items()
+        }
+        functions[str(name)] = HpmFunction(pins, gpiom)
+    return HpmProject(path, soc, package if isinstance(package, str) else None, functions)
+
+
+def _blank(match: re.Match) -> str:
+    """注释或字面量换成同样多的空白，换行保留，使行号和预处理指令的位置不变。
+    A comment or literal replaced by as much white space, the newlines kept, so the lines and
+    the places of the preprocessor directives stay.
+    """
+    return re.sub(r"[^\n]", " ", match.group(0))
+
+
+def hpm_main_calls(main_c: Path, functions) -> tuple[list[str], list[str]]:
+    """main.c 的 main 函数体里调用的 pinmux 函数（functions 中的名字），按调用顺序：预处理
+    条件外的和条件里的（O2：后者不算，例如 rmcs 的 JTAG 共用引脚）。注释和字符串里的不算，
+    辅助函数里的不算；main.c 不存在或没有 main 时都为空。
+    The pinmux functions (names in functions) that the body of main in main.c calls, in call
+    order: those outside preprocessor conditions and those inside one (O2: the latter do not
+    count, such as the rmcs JTAG shared pins). Calls in comments and strings or in a helper
+    function do not count; both are empty when main.c or its main does not exist.
     """
     if not main_c.is_file():
-        return []
+        return [], []
+    text = C_COMMENT_OR_LITERAL.sub(_blank, main_c.read_text(encoding="utf-8", errors="replace"))
+    start = HPM_MAIN.search(text)
+    if start is None:
+        return [], []
+    # main 的函数体：从它的 { 数到配对的 }。
+    # The body of main: from its { to the matching }.
+    depth, end = 0, len(text)
+    for index in range(start.end() - 1, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                end = index
+                break
     called: list[str] = []
-    depth = 0
-    for line in main_c.read_text(encoding="utf-8", errors="replace").splitlines():
+    conditional: list[str] = []
+    condition = 0
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        line_start, offset = offset, offset + len(line)
         directive = HPM_DIRECTIVE.match(line)
         if directive:
             if directive.group(1) in ("if", "ifdef", "ifndef"):
-                depth += 1
+                condition += 1
             elif directive.group(1) == "endif":
-                depth = max(0, depth - 1)
+                condition = max(0, condition - 1)
             continue
-        call = HPM_CALL.match(line)
-        if call and depth == 0 and call.group(1) in functions and call.group(1) not in called:
-            called.append(call.group(1))
-    return called
+        for call in HPM_CALL.finditer(line):
+            position = line_start + call.start()
+            name = call.group(1)
+            if not start.end() <= position < end or name not in functions:
+                continue
+            target = conditional if condition else called
+            if name not in target:
+                target.append(name)
+    return called, [name for name in conditional if name not in called]
 
 
-def hpm_active_functions(main_c: Path, functions: dict) -> list[str]:
+def hpm_called_functions(main_c: Path, functions) -> list[str]:
+    """main.c 的 main 在预处理条件外调用的 pinmux 函数，按调用顺序（见 hpm_main_calls）。
+    The pinmux functions that main in main.c calls outside preprocessor conditions, in call
+    order (see hpm_main_calls).
+    """
+    return hpm_main_calls(main_c, functions)[0]
+
+
+def hpm_active_functions(main_c: Path, functions) -> list[str]:
     """main.c 在预处理条件外调用的、.hpmpc 里存在的 pinmux 函数；main.c 不存在或没有调用
     时退回 init_bsp_pins。
     The pinmux functions of the .hpmpc that the root main.c calls outside preprocessor
@@ -509,6 +659,37 @@ def hpm_active_functions(main_c: Path, functions: dict) -> list[str]:
     if called:
         return called
     return ["init_bsp_pins"] if "init_bsp_pins" in functions else []
+
+
+def hpm_selections(
+    project: HpmProject, active: list[str]
+) -> tuple[list[dict], list[tuple[str, str, str, str, str]]]:
+    """活动函数选中的引脚，按选择顺序：[{pad, signal, padCtls, gpiom, function}]；同一 pad 被
+    后一个函数再次选中时替换前面的记录，并记进冲突 (pad, 前一个函数, 信号, 后一个函数, 信号)。
+    The pins the active functions select, in selection order: [{pad, signal, padCtls, gpiom,
+    function}]; a pad selected again by a later function replaces the earlier record and is
+    recorded as a conflict (pad, earlier function, signal, later function, signal).
+    """
+    selections: dict[str, dict] = {}
+    conflicts = []
+    for name in active:
+        function = project.functions[name]
+        for pad, selection in function.pins.items():
+            previous = selections.get(pad)
+            if previous is not None and previous["function"] != name:
+                conflicts.append(
+                    (pad, previous["function"], previous["signal"], name, selection["signal"])
+                )
+            # 后一个为准，记录留在原来的位置。
+            # The later one wins, and the record keeps its place.
+            selections[pad] = {
+                "pad": pad,
+                "signal": selection["signal"],
+                "padCtls": selection["padCtls"],
+                "gpiom": function.gpiom.get(pad, {}),
+                "function": name,
+            }
+    return list(selections.values()), conflicts
 
 
 def hpm_assignments(hpmpc: Path, main_c: Path, layout: PinLayout) -> dict[str, dict]:
@@ -522,47 +703,53 @@ def hpm_assignments(hpmpc: Path, main_c: Path, layout: PinLayout) -> dict[str, d
     as the macro name of hpm_iomux.h (UART0_TXD); a GPIO one (GPIO.A.A[10]) counts as the plain
     use like MSPM0. The .hpmpc carries no names, so there is no label.
     """
-    functions = json.loads(hpmpc.read_text(encoding="utf-8"))["content"]["pinmux"]["functions"]
+    project = read_hpmpc(hpmpc)
     by_name = {pin.name: pin for pin in layout.pins}
     assigned: dict[str, dict] = {}
-    owners: dict[str, tuple[str, str]] = {}
-    for function in hpm_active_functions(main_c, functions):
-        for pad, selection in functions[function].get("selectPins", {}).items():
-            if pad in owners and owners[pad][0] != function:
-                logging.warning(
-                    tr(
-                        f"{hpmpc}: {pad} is selected by both {owners[pad][0]} "
-                        f"({owners[pad][1]}) and {function} ({selection.get('signal')}); "
-                        "the later one wins",
-                        f"{hpmpc}：{pad} 同时被 {owners[pad][0]}（{owners[pad][1]}）和 "
-                        f"{function}（{selection.get('signal')}）选中；以后一个为准",
-                    )
-                )
-            owners[pad] = (function, selection.get("signal") or "")
-            pin = by_name.get(pad)
-            if pin is None or not selection.get("signal"):
-                continue
-            canonical = hpm_canonical(selection["signal"])
-            if canonical.startswith("GPIO_"):
-                port_line = pin_layout.gpio_port_and_line(pin.name)
-                assigned[pin.name] = {
-                    "signal": canonical,
-                    "peripheral": f"GPIO{port_line[0]}" if port_line else "GPIO",
-                    "kind": "GPIO",
-                    "function": f"P{port_line[1]}" if port_line else "GPIO",
-                    "matched": canonical in pin.signals,
-                }
-                continue
-            recognized = pin_layout.recognize_hpm(canonical)
-            instance, kind, pin_function = recognized or (canonical, "", "")
+    selections, conflicts = hpm_selections(project, hpm_active_functions(main_c, project.functions))
+    for pad, first, first_signal, second, second_signal in conflicts:
+        logging.warning(
+            hpm_conflict_message(hpmpc, pad, first, first_signal, second, second_signal)
+        )
+    for selection in selections:
+        pin = by_name.get(selection["pad"])
+        if pin is None:
+            continue
+        canonical = hpm_canonical(selection["signal"])
+        if canonical.startswith("GPIO_"):
+            port_line = pin_layout.gpio_port_and_line(pin.name)
             assigned[pin.name] = {
                 "signal": canonical,
-                "peripheral": instance,
-                "kind": kind,
-                "function": pin_function,
+                "peripheral": f"GPIO{port_line[0]}" if port_line else "GPIO",
+                "kind": "GPIO",
+                "function": f"P{int(port_line[1])}" if port_line else "GPIO",
                 "matched": canonical in pin.signals,
             }
+            continue
+        recognized = pin_layout.recognize_hpm(canonical)
+        instance, kind, pin_function = recognized or (canonical, "", "")
+        assigned[pin.name] = {
+            "signal": canonical,
+            "peripheral": instance,
+            "kind": kind,
+            "function": pin_function,
+            "matched": canonical in pin.signals,
+        }
     return assigned
+
+
+def hpm_conflict_message(
+    hpmpc: Path, pad: str, first: str, first_signal: str, second: str, second_signal: str
+) -> str:
+    """两个活动函数选中同一个 pad 的警告。
+    The warning about two active functions selecting the same pad.
+    """
+    return tr(
+        f"{hpmpc}: {pad} is selected by both {first} ({first_signal}) and {second} "
+        f"({second_signal}); the later one wins",
+        f"{hpmpc}：{pad} 同时被 {first}（{first_signal}）和 {second}（{second_signal}）选中；"
+        "以后一个为准",
+    )
 
 
 def config_entries(
@@ -572,6 +759,7 @@ def config_entries(
     functions: dict,
     settings: dict,
     sysconfig: dict | None,
+    model: str | None = None,
 ) -> list[dict]:
     """一个已选外设在 libxr_config.yaml 中的设置条目；libxr gen 不生成它的设置时为空。
     The config entries of a selected peripheral in libxr_config.yaml; empty when libxr gen does
@@ -618,7 +806,9 @@ def config_entries(
     if platform == "hpm":
         if kind == "I2C":
             return [keyed("I2C", instance.lower())]
-        if kind == "GPTMR":
+        # GPTMR 的 PWM 只在 SoC 没有 PWM 外设时生成（与解析一致）。
+        # A PWM on a GPTMR is generated only when the SoC has no PWM peripheral, as parsed.
+        if kind == "GPTMR" and not (model and pin_layout.hpm_soc_has_pwm(model)):
             return [keyed("PWM", f"pwm_{instance.lower()}_ch{n}") for n in channels(r"COMP_(\d+)")]
         if kind == "GPIO":
             values = settings.get("GPIO") if isinstance(settings.get("GPIO"), dict) else {}
@@ -670,6 +860,7 @@ def project_overlay(
             used["pins"],
             settings,
             used.get("sysconfig"),
+            layout.model,
         )
         if entries:
             used["config"] = entries
@@ -721,16 +912,15 @@ def layout_with_project(
         # An HPM project: the SoC and the package are in the info of the .hpmpc, and the selected
         # signals come from the pinmux functions main.c calls without a condition (O2: a call
         # inside a conditional does not count).
-        info = json.loads(hpmpcs[0].read_text(encoding="utf-8"))["content"]["info"]
-        soc = model or info.get("socName")
-        if soc is None:
+        project = read_hpmpc(hpmpcs[0])
+        if not (model or project.soc):
             raise ValueError(
                 tr(
                     f"{hpmpcs[0]} does not name a SoC; give the model",
                     f"{hpmpcs[0]} 没有给出 SoC；请给出型号",
                 )
             )
-        layout = pin_layout.layout_pins(soc, package or info.get("packageName"))
+        layout = pin_layout.layout_pins(model or project.soc, package or project.package)
         assigned = hpm_assignments(hpmpcs[0], root / "main.c", layout)
         source = hpmpcs[0].relative_to(root).as_posix()
         # sysconfig_file 对 HPM 是 .hpmpc 本身：外设配置就住在里面。

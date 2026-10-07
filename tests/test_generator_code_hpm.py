@@ -250,7 +250,7 @@ class Notices(TestCase):
                             "selectPins": {"PA10": {"signal": "GPIO.A.A[10]", "padCtls": {}}}
                         },
                         "init_bsp_more_pins": {
-                            "selectPins": {"PA10": {"signal": "UART0.A.TXD", "padCtls": {}}}
+                            "selectPins": {"PA10": {"signal": "SPI3.A.CS[0]", "padCtls": {}}}
                         },
                     }
                 },
@@ -291,14 +291,14 @@ class Notices(TestCase):
         self.assertTrue(
             logs.output[0].endswith(
                 ": PA10 is selected by both init_bsp_pins (GPIO.A.A[10]) and "
-                "init_bsp_more_pins (UART0.A.TXD); the later one wins"
+                "init_bsp_more_pins (SPI3.A.CS[0]); the later one wins"
             )
         )
         self.assertEqual(data["MainFunctions"], ["init_bsp_pins", "init_bsp_more_pins"])
-        # 后一个的信号生效：PA10 归 UART0，不再是 GPIO。
-        # The later signal wins: PA10 belongs to the UART0 now, not to the GPIO.
+        # 后一个的信号生效：PA10 归 SPI3，不再是 GPIO。
+        # The later signal wins: PA10 belongs to the SPI3 now, not to the GPIO.
         self.assertNotIn("pa10", data["GPIO"])
-        self.assertEqual(data["Peripherals"]["Other"]["UART0"]["Pins"]["TXD"], "PA10")
+        self.assertEqual(data["Peripherals"]["Other"]["SPI3"]["Pins"]["CS_0"], "PA10")
 
     def test_a_main_c_that_calls_no_pinmux_function_is_a_warning(self):
         main_c = textwrap.dedent(
@@ -341,6 +341,258 @@ class Notices(TestCase):
         self.assertIn("select no GPIO or peripheral pin", logs.output[1])
         self.assertEqual(data["MainFunctions"], [])
         self.assertEqual(data["GPIO"], {})
+
+
+def synthetic_project(
+    selections: dict,
+    soc: str = "HPM5301",
+    gpiom: dict | None = None,
+    main_c: str = "int main(void)\n{\n  init_bsp_pins();\n}\n",
+) -> Path:
+    """一个合成的 HPM 工程：init_bsp_pins 选中 selections（pad -> 工具的信号名），main 调用它。
+    返回工程目录。
+    A synthetic HPM project: init_bsp_pins selects selections (pad -> the tool's signal name)
+    and main calls it. The project directory is returned.
+    """
+    root = Path(tempfile.mkdtemp(prefix="libxr-hpm-review-"))
+    (root / "app.yaml").write_text("dependency: []\n", encoding="utf-8")
+    board = root / "boards" / "board"
+    board.mkdir(parents=True)
+    function = {
+        "selectPins": {
+            pad: {"signal": signal, "padCtls": {}} for pad, signal in selections.items()
+        },
+        "managers": {"gpiom": gpiom or {}},
+    }
+    hpmpc = {
+        "content": {
+            "info": {"socName": soc, "packageName": "QFN48"},
+            "pinmux": {"functions": {"init_bsp_pins": function}},
+        }
+    }
+    (board / "tool_config.hpmpc").write_text(json.dumps(hpmpc), encoding="utf-8")
+    (root / "main.c").write_text(main_c, encoding="utf-8")
+    return root
+
+
+class ParseChecks(TestCase):
+    """解析的核对：SoC、焊盘和信号按引脚数据核对，生成前的外设一致性检查。
+    The checks of the parse: the SoC, the pads and the signals against the pin data, and the
+    consistency of the peripherals before generation.
+    """
+
+    def parse(self, root: Path) -> dict:
+        """解析 root 并返回工程 YAML；测试结束时删除 root。
+        Parse root and return the project YAML; root is removed at the end of the test.
+        """
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        parse_project(str(root), summary=False)
+        return yaml.safe_load((root / ".config.yaml").read_text(encoding="utf-8"))
+
+    def test_an_unknown_soc_is_an_error(self):
+        root = synthetic_project({"PA10": "GPIO.A.A[10]"}, soc="HPM9999")
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        with self.assertLogs(level="ERROR") as logs, self.assertRaises(SystemExit):
+            parse_project(str(root), summary=False)
+        self.assertIn("Unknown HPM SoC: HPM9999", logs.output[0])
+
+    def test_a_lower_case_soc_is_the_same_soc(self):
+        data = self.parse(synthetic_project({"PA10": "GPIO.A.A[10]"}, soc="hpm5301"))
+        self.assertEqual(data["Mcu"]["Type"], "HPM5301")
+
+    def test_a_pad_off_the_package_and_a_signal_the_pad_cannot_carry_are_warned_about(self):
+        with self.assertLogs(level="WARNING") as logs:
+            data = self.parse(synthetic_project({"PA12": "GPIO.A.A[12]", "PA10": "UART0.A.TXD"}))
+        self.assertTrue(
+            any("PA12 (GPIO.A.A[12]) is not a pin of HPM5301 QFN48" in line for line in logs.output)
+        )
+        self.assertTrue(any("PA10 cannot carry UART0_TXD" in line for line in logs.output))
+        self.assertNotIn("pa12", data["GPIO"])
+
+    def test_an_i2c_without_sda_generates_nothing(self):
+        with self.assertLogs(level="WARNING") as logs:
+            data = self.parse(synthetic_project({"PB13": "I2C3.C.SCL"}))
+        self.assertNotIn("I2C", data["Peripherals"])
+        self.assertEqual(data["Peripherals"]["Other"]["I2C3"]["Pins"], {"SCL": "PB13"})
+        self.assertTrue(any("I2C3 has no SDA pin" in line for line in logs.output))
+
+    def test_a_gptmr_with_capture_only_is_no_pwm(self):
+        data = self.parse(synthetic_project({"PB09": "GPTMR0.B.CAPT[1]"}))
+        self.assertNotIn("PWM", data["Peripherals"])
+        self.assertEqual(data["Peripherals"]["Other"]["GPTMR0"]["Pins"], {"CAPT_1": "PB09"})
+
+    def test_a_gptmr_with_capture_and_compare_warns_about_the_capture(self):
+        with self.assertLogs(level="WARNING") as logs:
+            data = self.parse(
+                synthetic_project({"PB08": "GPTMR0.B.COMP[1]", "PB09": "GPTMR0.B.CAPT[1]"})
+            )
+        self.assertEqual(
+            data["Peripherals"]["PWM"]["GPTMR0"]["Channels"], [{"Index": 1, "Pad": "PB08"}]
+        )
+        self.assertTrue(any("GPTMR0 also selects CAPT_1" in line for line in logs.output))
+
+    def test_a_pin_of_another_gpio_controller_gets_no_object(self):
+        with self.assertLogs(level="WARNING") as logs:
+            data = self.parse(
+                synthetic_project(
+                    {"PA10": "GPIO.A.A[10]", "PA03": "GPIO.A.A[03]"},
+                    gpiom={"PA10": {"direction": "1", "gpioController": "2"}},
+                )
+            )
+        self.assertEqual(list(data["GPIO"]), ["pa3"])
+        self.assertTrue(
+            any("PA10 is assigned to GPIO controller 2" in line for line in logs.output)
+        )
+
+    def test_a_pinmux_function_main_does_not_call_is_warned_about(self):
+        root = synthetic_project({"PA10": "GPIO.A.A[10]"})
+        hpmpc = root / "boards" / "board" / "tool_config.hpmpc"
+        document = json.loads(hpmpc.read_text(encoding="utf-8"))
+        document["content"]["pinmux"]["functions"]["init_unused_pins"] = {
+            "selectPins": {"PA03": {"signal": "GPIO.A.A[03]", "padCtls": {}}}
+        }
+        hpmpc.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertLogs(level="WARNING") as logs:
+            data = self.parse(root)
+        self.assertEqual(list(data["GPIO"]), ["pa10"])
+        self.assertTrue(
+            any("init_unused_pins() is not called by main" in line for line in logs.output)
+        )
+
+
+class GenerationChecks(TestCase):
+    """生成的核对：设置的类型、名字和大小写，改名表和终端设置的写法。
+    The checks of generation: the type, names and case of the settings, and how the rename
+    table and the terminal settings are written.
+    """
+
+    def setUp(self):
+        super().setUp()
+        generator.initialize_registry()
+        generator.reset_settings()
+
+    def generate(self, config: str | None = None, root: Path | None = None) -> tuple[Path, str]:
+        """解析 hpm5301evklite 的临时工程（或 root），按 config（libxr_config.yaml 的内容）生成。
+        返回工程目录和生成的 app_main。
+        Parse the temporary project of hpm5301evklite (or root) and generate with config (the
+        content of libxr_config.yaml). The project directory and the generated app_main are
+        returned.
+        """
+        if root is None:
+            root = project_of("hpm5301evklite")
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        parse_project(str(root), summary=False)
+        output = root / "User" / "app_main.cpp"
+        output.parent.mkdir(exist_ok=True)
+        if config is not None:
+            (root / "User" / "libxr_config.yaml").write_text(config, encoding="utf-8")
+        generator.generate(str(root / ".config.yaml"), str(output), True, "")
+        return root, output.read_text(encoding="utf-8")
+
+    def settings(self, root: Path) -> dict:
+        """写出的 libxr_config.yaml。
+        The libxr_config.yaml that was written.
+        """
+        return yaml.safe_load((root / "User" / "libxr_config.yaml").read_text(encoding="utf-8"))
+
+    def assertGenerationFails(self, config: str, *messages: str):
+        """按 config 生成时报错退出，错误信息含 messages。
+        Generation with config logs an error that holds messages and exits.
+        """
+        with self.assertLogs(level="ERROR") as logs, self.assertRaises(SystemExit):
+            self.generate(config)
+        for message in messages:
+            self.assertIn(message, "\n".join(logs.output))
+
+    def test_the_rename_table_lists_every_pin_and_no_terminal_is_written(self):
+        root, _code = self.generate()
+        settings = self.settings(root)
+        self.assertEqual(settings["GPIO"], {"pa10": None, "pa3": None})
+        self.assertNotIn("Terminal", settings)
+        self.assertNotIn("terminal_source", settings)
+
+    def test_a_stale_null_rename_goes_and_a_stale_name_stays(self):
+        root, _code = self.generate("GPIO:\n  pa10: LED\n  pb1:\n  pb2: OLD\n")
+        self.assertEqual(self.settings(root)["GPIO"], {"pa10": "LED", "pb2": "OLD", "pa3": None})
+
+    def test_a_written_terminal_source_is_kept_and_warned_about(self):
+        with self.assertLogs(level="WARNING") as logs:
+            root, _code = self.generate("terminal_source: uart0\n")
+        self.assertEqual(self.settings(root)["terminal_source"], "uart0")
+        self.assertTrue(
+            any("terminal_source 'uart0' has no effect" in line for line in logs.output)
+        )
+
+    def test_unusable_gpio_names_are_listed_together(self):
+        self.assertGenerationFails(
+            "GPIO:\n  pa10: int\n  pa3: HPM_GPIO0\n",
+            "GPIO.pa10 'int': a C++ keyword",
+            "GPIO.pa3 'HPM_GPIO0': a name of the HPM SDK or of the generated code",
+        )
+        for name, problem in (
+            ("timebase", "a name of the HPM SDK or of the generated code"),
+            ("i2c3", "already the name of a I2C object"),
+            ("__led", "a reserved C++ identifier"),
+            ("1led", "not a valid C++ identifier"),
+        ):
+            with self.subTest(name=name):
+                generator.initialize_registry()
+                generator.reset_settings()
+                self.assertGenerationFails(f"GPIO:\n  pa10: '{name}'\n", problem)
+
+    def test_a_gpio_rename_must_be_a_name(self):
+        self.assertGenerationFails("GPIO:\n  pa10: 5\n", "GPIO.pa10 5 is not a name")
+
+    def test_a_pwm_frequency_must_be_a_positive_integer(self):
+        for value in ("0", "-5", "abc", "1.5", "true"):
+            with self.subTest(value=value):
+                generator.initialize_registry()
+                generator.reset_settings()
+                self.assertGenerationFails(
+                    f"PWM:\n  pwm_gptmr0_ch1:\n    frequency: {value}\n",
+                    "PWM.pwm_gptmr0_ch1.frequency",
+                    "is not a positive integer",
+                )
+
+    def test_the_key_of_a_setting_is_found_in_any_case(self):
+        # 文件写 I2C3、PWM_GPTMR0_CH1、PA10：生成与 libxr pins 一样读到这些段，不另写一份小写的。
+        # The file writes I2C3, PWM_GPTMR0_CH1 and PA10: generation reads these entries as libxr
+        # pins does, and writes no second, lower-case copy.
+        root, code = self.generate(
+            "I2C:\n  I2C3:\n    speed: 400000\n"
+            "PWM:\n  PWM_GPTMR0_CH1:\n    frequency: 1000\n"
+            "GPIO:\n  PA10: LED\n"
+        )
+        self.assertIn("static HPMI2C i2c3(HPM_I2C3, clock_i2c3, {400000U});", code)
+        self.assertIn("pwm_gptmr0_ch1.SetConfig({1000});", code)
+        self.assertIn("static HPMGPIO LED(", code)
+        settings = self.settings(root)
+        self.assertEqual(list(settings["I2C"]), ["I2C3"])
+        self.assertEqual(list(settings["PWM"]), ["PWM_GPTMR0_CH1"])
+        self.assertEqual(settings["GPIO"], {"PA10": "LED", "pa3": None})
+
+    def test_an_unknown_soc_in_the_project_yaml_is_an_error(self):
+        root = project_of("hpm5301evklite")
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        parse_project(str(root), summary=False)
+        config = root / ".config.yaml"
+        config.write_text(
+            config.read_text(encoding="utf-8").replace("Type: HPM5301", "Type: HPM9999"),
+            encoding="utf-8",
+        )
+        (root / "User").mkdir()
+        with self.assertLogs(level="ERROR") as logs, self.assertRaises(SystemExit):
+            generator.generate(str(config), str(root / "User" / "app_main.cpp"), True, "")
+        self.assertIn("Unknown HPM SoC: HPM9999", logs.output[0])
+
+    def test_the_notice_says_when_main_calls_no_pinmux_function(self):
+        root = synthetic_project(
+            {"PA10": "GPIO.A.A[10]"}, main_c="int main(void)\n{\n  board_init();\n}\n"
+        )
+        with self.assertLogs(level="WARNING"):
+            _root, code = self.generate(root=root)
+        notice = " ".join(line.removeprefix("//").strip() for line in code.splitlines()[:6])
+        self.assertIn("defines the pins in init_bsp_pins(), which main.c does not call", notice)
 
 
 if __name__ == "__main__":
