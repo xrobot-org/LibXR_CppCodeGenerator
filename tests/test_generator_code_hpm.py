@@ -172,6 +172,22 @@ class Generation(TestCase):
         self.assertNotIn("pa10", code)
         self.assertNotIn("pa3", code)
 
+    def test_a_null_gpio_rename_keeps_the_default_name(self):
+        # 设置树里清空改名写成 null：对象名退回引脚名，而不是 "None"。
+        # Clearing a rename in the settings tree writes null: the object name falls back to the
+        # pin name instead of "None".
+        root, _code = self.generate("hpm5301evklite")
+        config = root / "User" / "libxr_config.yaml"
+        settings = yaml.safe_load(config.read_text(encoding="utf-8"))
+        settings["GPIO"] = {"pa10": None, "pa3": "KEY"}
+        config.write_text(yaml.dump(settings), encoding="utf-8")
+        generator.generate(
+            str(root / ".config.yaml"), str(root / "User" / "app_main.cpp"), True, ""
+        )
+        code = (root / "User" / "app_main.cpp").read_text(encoding="utf-8")
+        self.assertIn("static HPMGPIO pa10(HPM_GPIO0, GPIO_DI_GPIOA, 10, IRQn_GPIO0_A);", code)
+        self.assertIn("XR_REGISTER(pa10, LibXR::GPIO);", code)
+
     def test_the_gptmr_pwm_object_is_generated_and_registered(self):
         # 5301 没有 PWM 外设：GPTMR 的比较器走 HPMPWM 的 fallback 路径。对象和登记都不能包
         # #if——xrobot 的生成器无法判断编译选项，guard 里的 XR_REGISTER 会被它拒绝。

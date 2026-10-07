@@ -192,11 +192,12 @@ def _peripherals(project_data: dict) -> dict[str, list]:
 
 
 def _gpio_names(project_data: dict) -> dict[str, dict]:
-    """GPIO 对象的名字：默认按引脚（pb11），libxr_config 的 GPIO 段把它映射到新名字；名字必须
-    合法且唯一，不满足时报错退出，改名单里没有的引脚给出警告。
+    """GPIO 对象的名字：默认按引脚（pb11），libxr_config 的 GPIO 段把它映射到新名字，值为
+    null 的改名保留默认名；名字必须合法且唯一，不满足时报错退出，改名单里没有的引脚给出警告。
     The names of the GPIO objects: the pin name (pb11) by default, which the GPIO section of
-    libxr_config maps to a new one; a name that is not a valid unique identifier logs an error
-    and generation exits, and a rename that names no pin is warned about.
+    libxr_config maps to a new one while a null rename keeps the default; a name that is not a
+    valid unique identifier logs an error and generation exits, and a rename that names no pin is
+    warned about.
     """
     gpio = project_data.get("GPIO", {})
     renames = stm32.libxr_settings.get("GPIO") or {}
@@ -210,7 +211,8 @@ def _gpio_names(project_data: dict) -> dict[str, dict]:
         )
     names: dict[str, dict] = {}
     for label, pin in gpio.items():
-        name = str(renames.get(label, label))
+        rename = renames.get(label)
+        name = str(label if rename is None else rename)
         if not IDENTIFIER.fullmatch(name) or name in stm32.registered_devices:
             _fail(
                 tr(
