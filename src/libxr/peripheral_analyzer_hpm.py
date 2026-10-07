@@ -43,12 +43,6 @@ from xr_syntax.i18n import tr
 
 from libxr import pin_layout, pin_project
 
-# .hpmpc 里 gpiom 管理器的 gpioController 值：1 是 SoC 的 GPIO0（工具为它生成
-# gpiom_soc_gpio0），HPMGPIO 只驱动这一个控制器。
-# The gpioController value of the gpiom manager of a .hpmpc: 1 is the GPIO0 of the SoC (the
-# tool generates gpiom_soc_gpio0 for it), the only controller HPMGPIO drives.
-GPIO0_CONTROLLER = "1"
-
 
 def _fail(message: str):
     """记录错误并以状态 1 退出。
@@ -143,10 +137,11 @@ def _report_calls(
     conditional: list[str],
     active: list[str],
 ) -> None:
-    """main.c 调用情况的警告：条件编译里调用的函数、没有被调用的函数，以及完全没有调用时的
-    init_bsp_pins 兜底。
+    """main.c 调用情况的警告：条件编译里调用的函数、没有被调用的函数、调用全在条件里时读不到
+    引脚，以及完全没有调用时的 init_bsp_pins 兜底。
     The warnings about the calls of main.c: the functions called inside a conditional, the
-    functions not called, and the init_bsp_pins fallback when there is no call at all.
+    functions not called, no pin read when every call sits inside a conditional, and the
+    init_bsp_pins fallback when there is no call at all.
     """
     for name in conditional:
         logging.warning(
@@ -156,6 +151,17 @@ def _report_calls(
                 f"{main_c}：{name}() 在预处理条件里调用；不读它的引脚（生成的对象不能依赖编译选项）",
             )
         )
+    if not called and conditional:
+        # 调用全在预处理条件里：不退回 init_bsp_pins（O2）。
+        # Every call sits inside a condition: no init_bsp_pins fallback (O2).
+        logging.warning(
+            tr(
+                f"{main_c}: main calls pinmux functions only inside preprocessor conditions; no "
+                "pin is read",
+                f"{main_c}：main 只在预处理条件里调用 pinmux 函数；读不到引脚",
+            )
+        )
+        return
     if not called:
         detail = (
             tr("using the init_bsp_pins fallback", "退回 init_bsp_pins")
@@ -197,7 +203,7 @@ def parse_project(directory: str, output: str | None = None, summary: bool = Tru
     hpmpc, main_c, project = _project(directory)
     layout = _layout(project)
     called, conditional = pin_project.hpm_main_calls(main_c, project.functions)
-    active = called or (["init_bsp_pins"] if "init_bsp_pins" in project.functions else [])
+    active = pin_project.hpm_active_functions(main_c, project.functions)
     _report_calls(hpmpc, main_c, project, called, conditional, active)
     selections, conflicts = pin_project.hpm_selections(project, active)
     for conflict in conflicts:
@@ -240,7 +246,7 @@ def parse_project(directory: str, output: str | None = None, summary: bool = Tru
                 )
             )
         if canonical.startswith("GPIO_"):
-            controller = str(selection["gpiom"].get("gpioController") or GPIO0_CONTROLLER)
+            controller = pin_project.hpm_gpio_controller(selection["gpiom"])
             entry = _gpio_entry(pad, pad_ctls, selection["gpiom"])
             if entry is None:
                 logging.warning(
@@ -250,7 +256,7 @@ def parse_project(directory: str, output: str | None = None, summary: bool = Tru
                     )
                 )
                 continue
-            if controller != GPIO0_CONTROLLER:
+            if controller != pin_project.HPM_GPIO0_CONTROLLER:
                 logging.warning(
                     tr(
                         f"{hpmpc}: {pad} is assigned to GPIO controller {controller}, not the "

@@ -425,6 +425,11 @@ def peripheral_index(layout: PinLayout) -> dict:
             "signals": dict(sorted(entry["signals"].items(), key=lambda s: natural_key(s[0]))),
         }
         pattern = PWM_CHANNELS.get(entry["kind"])
+        # HPM 的 GPTMR 只在 SoC 没有 PWM 外设时由 HPMPWM 驱动（fallback 路径）。
+        # An HPM GPTMR is driven by HPMPWM only when the SoC has no PWM peripheral (the
+        # fallback path).
+        if entry["kind"] == "GPTMR" and layout.platform == "hpm" and hpm_soc_has_pwm(layout.part):
+            pattern = None
         if pattern and any(re.fullmatch(pattern, function) for function in entry["signals"]):
             index[instance]["capabilities"] = ["pwm"]
     return index

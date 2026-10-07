@@ -8,9 +8,9 @@
 
 /**
  * A test project with the SysConfig setups the two BSPs do not use: an SPI clocked from MFCLK
- * with a divider and an RX timeout DMA trigger, an SPI in peripheral mode, an I2C in target
- * mode only, a PWM with the default instance name whose pins are only suggested, GPIO pins
- * given as port + pin number, a pin with the default name, and a UART with DMA on both sides.
+ * with a divider, an SPI in peripheral mode, an I2C in target mode only, a PWM with the default
+ * instance name whose pins are only suggested, GPIO pins given as port + pin number, a pin with
+ * the default name, and a UART Extend with DMA on both sides (MSPM0_UART_EXTEND_INIT).
  */
 const GPIO   = scripting.addModule("/ti/driverlib/GPIO", {}, false);
 const GPIO1  = GPIO.addInstance();

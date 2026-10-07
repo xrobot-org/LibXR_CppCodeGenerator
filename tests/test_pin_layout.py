@@ -142,10 +142,11 @@ class HpmModels(TestCase):
         # The line drops its leading zero: PA03 is P3.
         self.assertEqual(index["GPIOA"]["signals"]["P3"], ["PA03"])
         self.assertEqual(index["GPTMR0"]["capabilities"], ["pwm"])
-        self.assertEqual(
-            layout_to_dict(layout_pins("HPM5361", "QFN48"))["peripherals"]["PWM0"]["capabilities"],
-            ["pwm"],
-        )
+        index_5361 = layout_to_dict(layout_pins("HPM5361", "QFN48"))["peripherals"]
+        self.assertEqual(index_5361["PWM0"]["capabilities"], ["pwm"])
+        # 审查 C4：有 PWM 外设的 SoC 上 HPMPWM 不驱动 GPTMR。
+        # Review C4: on a SoC with a PWM peripheral HPMPWM does not drive a GPTMR.
+        self.assertNotIn("capabilities", index_5361["GPTMR0"])
 
 
 class Mspm0Models(TestCase):

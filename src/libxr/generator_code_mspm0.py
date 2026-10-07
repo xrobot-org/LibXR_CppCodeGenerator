@@ -938,7 +938,21 @@ def generate_full_code(project_data: dict, use_xrobot: bool, existing_code: str)
     if use_xrobot:
         lines.append(f"{INDENT}XROBOT_MAIN();")
     lines.append("}")
-    return stm32._preserve_generated_regions(existing_code, "\n".join(lines) + "\n")
+    generated = "\n".join(lines) + "\n"
+    # 与生成代码里其他名字（timebase、ramfs、terminal、时钟常量……）相同的 GPIO 名字。
+    # GPIO names equal to another name of the generated code (timebase, ramfs, terminal, the
+    # clock constants, ...).
+    clashes = stm32.overused_names(gpio, generated, use_xrobot)
+    if clashes:
+        _fail(
+            tr(
+                f"The generated code uses these GPIO names for something else: "
+                f"{', '.join(clashes)}; rename the pins in SysConfig",
+                f"生成代码把这些 GPIO 名字用于别处：{'、'.join(clashes)}；请在 SysConfig 中给"
+                "引脚改名",
+            )
+        )
+    return stm32._preserve_generated_regions(existing_code, generated)
 
 
 # 手写文件被替换时最多列出的行数。

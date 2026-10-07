@@ -444,6 +444,16 @@ class ParseChecks(TestCase):
             any("PA10 is assigned to GPIO controller 2" in line for line in logs.output)
         )
 
+    def test_no_fallback_when_every_call_is_conditional(self):
+        # 审查 C2：与 libxr pins 一样，调用全在 #if 里时不退回 init_bsp_pins。
+        # Review C2: as in libxr pins, no init_bsp_pins fallback when every call is in #if.
+        main_c = "int main(void)\n{\n#if USE_PINS\n  init_bsp_pins();\n#endif\n}\n"
+        with self.assertLogs(level="WARNING") as logs:
+            data = self.parse(synthetic_project({"PA10": "GPIO.A.A[10]"}, main_c=main_c))
+        self.assertEqual((data["MainFunctions"], data["GPIO"]), ([], {}))
+        self.assertTrue(any("only inside preprocessor conditions" in line for line in logs.output))
+        self.assertFalse(any("fallback" in line for line in logs.output))
+
     def test_a_pinmux_function_main_does_not_call_is_warned_about(self):
         root = synthetic_project({"PA10": "GPIO.A.A[10]"})
         hpmpc = root / "boards" / "board" / "tool_config.hpmpc"
@@ -539,6 +549,32 @@ class GenerationChecks(TestCase):
                 generator.initialize_registry()
                 generator.reset_settings()
                 self.assertGenerationFails(f"GPIO:\n  pa10: '{name}'\n", problem)
+
+    def test_sdk_macros_and_generated_names_are_refused_and_plain_names_pass(self):
+        # 审查 C1：类函数宏和生成代码用到的名字（NORMAL 是 PWM 的极性）不能用；gpio_led 可以。
+        # Review C1: function-like macros and names the generated code uses (NORMAL is the
+        # polarity of the PWM) are refused; gpio_led is fine.
+        self.assertGenerationFails("GPIO:\n  pa10: MAX\n", "GPIO.pa10 'MAX'")
+        generator.initialize_registry()
+        generator.reset_settings()
+        self.assertGenerationFails(
+            "GPIO:\n  pa10: NORMAL\n",
+            "the generated code uses the names for something else: NORMAL",
+        )
+        generator.initialize_registry()
+        generator.reset_settings()
+        _root, code = self.generate("GPIO:\n  pa10: gpio_led\n  pa3: board_key\n")
+        self.assertIn("static HPMGPIO gpio_led(", code)
+
+    def test_a_null_or_literal_speed_is_read_as_on_the_other_platforms(self):
+        # 审查 C3：null 用默认值，字符串按整数字面量读。
+        # Review C3: null takes the default, a string is read as an integer literal.
+        _root, code = self.generate("I2C:\n  i2c3:\n    speed:\n")
+        self.assertIn("{100000U}", code)
+        generator.initialize_registry()
+        generator.reset_settings()
+        _root, code = self.generate("I2C:\n  i2c3:\n    speed: '0x61A80'\n")
+        self.assertIn("{400000U}", code)
 
     def test_a_gpio_rename_must_be_a_name(self):
         self.assertGenerationFails("GPIO:\n  pa10: 5\n", "GPIO.pa10 5 is not a name")

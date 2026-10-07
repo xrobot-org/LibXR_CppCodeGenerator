@@ -484,10 +484,10 @@ def _gpio_label(syscfg: Path, group: str, name: str) -> str:
     is not a valid identifier (the SysConfig default PIN_0 -> 0) it falls back to the
     lower-case group plus pin name (gpio_btn_pin_0), with a hint on renaming in SysConfig.
     """
+    fallback, used = pin_project.mspm0_gpio_name(group, name)
+    if not used:
+        return fallback
     label = name[4:] if name.startswith("PIN_") else name
-    if IDENTIFIER.fullmatch(label):
-        return label
-    fallback = re.sub(r"\W", "_", f"{group}_{name}".lower())
     logging.warning(
         tr(
             f"{syscfg.name}: the GPIO pin {name} of {group} gives no valid C++ name ({label}); "

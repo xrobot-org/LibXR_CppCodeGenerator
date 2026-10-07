@@ -694,6 +694,18 @@ class Generation(MSPM0TestCase):
             self.assertIn(line, code)
         self.assertEqual(self.settings(root)["UART"]["uart0"]["rx_dma_buffer_size"], 128)
 
+    def test_a_gpio_named_like_a_generated_object_is_an_error(self):
+        # 审查 C1：timebase 是生成代码里的对象，GPIO 不能再叫它。
+        # Review C1: timebase is an object of the generated code, so a GPIO cannot take it.
+        root, _code = self.generate("variants")
+        self.project_yaml(
+            root, lambda data: data["GPIO"].update(timebase=data["GPIO"].pop("USER_LED_1"))
+        )
+        self.assertIn(
+            "The generated code uses these GPIO names for something else: timebase",
+            self.failure(root),
+        )
+
     def test_dma_rx_on_a_uart_main_is_a_warning(self):
         root, _code = self.generate("variants")
         self.project_yaml(

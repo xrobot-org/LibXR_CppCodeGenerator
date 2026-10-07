@@ -720,6 +720,20 @@ def _gpio_object_name(port: str, gpio_data: dict) -> str:
     return _sanitize_cpp_identifier(gpio_data.get("Label", "") or port)
 
 
+def overused_names(names, generated_code: str, use_xrobot: bool) -> list[str]:
+    """names 中在生成代码里出现次数超过声明（加 --xrobot 时的 XR_REGISTER 行）的名字：它们与
+    生成代码用到的其他名字相同。注释和字符串里的不算；各平台的 GPIO 名字检查共用。
+    The names among names that occur in the generated code more often than their declaration
+    (plus the XR_REGISTER line with --xrobot): they equal another name the generated code uses.
+    Comments and strings do not count; the GPIO name checks of every platform share this.
+    """
+    counts: dict[str, int] = {}
+    for occurrence in identifier_occurrences(generated_code):
+        counts[occurrence.text] = counts.get(occurrence.text, 0) + 1
+    expected_uses = 2 if use_xrobot else 1
+    return [name for name in names if counts.get(name, 0) > expected_uses]
+
+
 def check_gpio_names(project_data: dict, generated_code: str, use_xrobot: bool) -> None:
     """拒绝生成的 app_main 无法声明的 GPIO 对象名。
     Reject GPIO object names that the generated app_main cannot declare.

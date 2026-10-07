@@ -106,10 +106,52 @@ GENERATED_NAMES = frozenset(
         "XROBOT_MAIN",
     }
 )
-# HPM SDK 的宏和函数的前缀（HPM_GPIO0、GPIO_DI_GPIOA、IRQn_GPIO0_A、clock_i2c3……）。
-# The prefixes of the HPM SDK macros and functions (HPM_GPIO0, GPIO_DI_GPIOA, IRQn_GPIO0_A,
-# clock_i2c3, ...).
-SDK_NAME = re.compile(r"(HPM_|GPIO_|IRQn_|IOC_|clock_|gpio_|gpiom_|board_|init_)\w*")
+# HPM SDK 的宏和枚举值的前缀（HPM_GPIO0、GPIO_DI_GPIOA、IRQn_GPIO0_A、clock_i2c3、
+# ATTR_ALIGN……）。gpio_led、board_led 这样的普通名字不在其中。
+# The prefixes of the HPM SDK macros and enumerators (HPM_GPIO0, GPIO_DI_GPIOA, IRQn_GPIO0_A,
+# clock_i2c3, ATTR_ALIGN, ...). Ordinary names such as gpio_led or board_led are not.
+SDK_NAME = re.compile(
+    r"(HPM_|IS_HPM_|IRQn_|IOC_|clock_|GPIO_(DI|DO|OE|IE|IF|PL|TP|AS)_|GPIOM_|ATTR_|SDK_DECLARE_"
+    r"|TRACE_|SAVE_|RESTORE_|ISR_NAME_|intc_[ms]_)\w*"
+)
+# hpm_common.h 和 RISC-V 头文件里的类函数宏（HPM SDK v1.13.0），前缀规则管不到的：对象叫这个
+# 名字时 static HPMGPIO MAX(...) 会被当成宏展开。
+# The function-like macros of hpm_common.h and the RISC-V headers (HPM SDK v1.13.0) that the
+# prefix rule does not cover: an object of that name, static HPMGPIO MAX(...), would expand as
+# the macro.
+SDK_MACROS = frozenset(
+    {
+        "ARRAY_SIZE",
+        "MAX",
+        "MIN",
+        "NOP",
+        "WFI",
+        "MAKE_STATUS",
+        "NESTED_IRQ_ENTER",
+        "NESTED_IRQ_EXIT",
+        "MODE_SWITCH_FROM_M",
+        "COMPLETE_IRQ_HANDLING_S",
+        "ENTER_NESTED_IRQ_HANDLING_M",
+        "ENTER_NESTED_IRQ_HANDLING_S",
+        "EXIT_NESTED_IRQ_HANDLING_M",
+        "EXIT_NESTED_IRQ_HANDLING_S",
+        "FREERTOS_VECTOR_ISR_WRAPPER_NAME",
+        "fencei",
+        "fenceiorw",
+        "fencerw",
+        "read_csr",
+        "write_csr",
+        "set_csr",
+        "clear_csr",
+        "read_set_csr",
+        "read_clear_csr",
+        "read_fcsr",
+        "write_fcsr",
+        "clear_fcsr",
+        "enable_fpu",
+        "disable_fpu",
+    }
+)
 
 
 def _comment(text: str, indent: str = "") -> list[str]:
@@ -155,13 +197,15 @@ def _keyed_settings(group: str, name: str) -> dict:
 
 
 def _instance_settings(group: str, instance: str) -> dict:
-    """libxr_settings 中实例的设置段（键不区分大小写），缺少的默认值补进段里。
-    The settings section of an instance in libxr_settings (the key in any case), with the
-    missing defaults filled in.
+    """libxr_settings 中实例的设置段（键不区分大小写），缺少的和为 null 的值补成默认值（与
+    MSPM0 一样）。
+    The settings section of an instance in libxr_settings (the key in any case), with missing
+    and null values set to their defaults (as on MSPM0).
     """
     section = _keyed_settings(group, instance)
     for key, default in HPM_DEFAULTS[group].items():
-        section.setdefault(key, default)
+        if section.get(key) is None:
+            section[key] = default
     return section
 
 
@@ -191,22 +235,16 @@ def _object_name(name: str, kind: str) -> str:
 
 
 def _setting_int(key: str, value) -> int:
-    """整数设置：不是正整数时报错退出。
-    An integer setting; a value that is not a positive integer logs an error and exits.
+    """正整数设置，读法与 STM32、MSPM0 相同（stm32._integer：字符串按 Python 整数字面量读，
+    如 0x3E8）；不是正整数时报错退出。
+    A positive integer setting, read as on STM32 and MSPM0 (stm32._integer: a string is a
+    Python integer literal, such as 0x3E8); a value that is not a positive integer logs an
+    error and exits.
     """
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or int(value) != value
-        or value < 1
-    ):
-        _fail(
-            tr(
-                f"{stm32.libxr_config_origin}: {key} {value!r} is not a positive integer",
-                f"{stm32.libxr_config_origin}：{key} {value!r} 不是正整数",
-            )
-        )
-    return int(value)
+    try:
+        return stm32._integer(key, value, 1)
+    except stm32.LibXRConfigError as error:
+        _fail(str(error))
 
 
 def _peripherals(project_data: dict) -> dict[str, list]:
@@ -317,7 +355,7 @@ def _gpio_name_problem(name: str) -> str:
         return tr("a C++ keyword", "是 C++ 关键字")
     if "__" in name or re.match(r"_[A-Z]", name):
         return tr("a reserved C++ identifier", "是 C++ 保留标识符")
-    if name in GENERATED_NAMES or SDK_NAME.fullmatch(name):
+    if name in GENERATED_NAMES or name in SDK_MACROS or SDK_NAME.fullmatch(name):
         return tr(
             "a name of the HPM SDK or of the generated code",
             "是 HPM SDK 或生成代码使用的名字",
@@ -586,7 +624,21 @@ def generate_full_code(project_data: dict, use_xrobot: bool, existing_code: str)
     if use_xrobot:
         lines.append(f"{INDENT}XROBOT_MAIN();")
     lines.append("}")
-    return stm32._preserve_generated_regions(existing_code, "\n".join(lines) + "\n")
+    generated = "\n".join(lines) + "\n"
+    # 与生成代码里其他名字相同的 GPIO 名字（固定名单之外的）：数一数出现次数。
+    # GPIO names equal to another name of the generated code (beyond the fixed list): count
+    # the occurrences.
+    clashes = stm32.overused_names(gpio, generated, use_xrobot)
+    if clashes:
+        _fail(
+            tr(
+                f"{stm32.libxr_config_origin}: rename these GPIO objects; the generated code "
+                f"uses the names for something else: {', '.join(clashes)}",
+                f"{stm32.libxr_config_origin}：请重命名以下 GPIO 对象，生成代码把这些名字用于"
+                f"别处：{'、'.join(clashes)}",
+            )
+        )
+    return stm32._preserve_generated_regions(existing_code, generated)
 
 
 def _check_soc(project_data: dict) -> None:

@@ -343,8 +343,60 @@ class SyscfgProjects(TestCase):
         gpio = assignments["PB22"]
         self.assertEqual(
             (gpio["peripheral"], gpio["function"], gpio["label"]),
-            ("GPIOB", "P22", "PIN_KEY1"),
+            ("GPIOB", "P22", "KEY1"),
         )
+
+    def test_settings_follow_what_gen_generates(self):
+        # 审查 A1：目标模式的 I2C 和外设模式的 SPI 不生成对象，也就没有 libxr_config 条目。
+        # Review A1: an I2C in target mode and an SPI in peripheral mode generate no object, so
+        # they have no libxr_config entry.
+        syscfg = self.PROJECT + textwrap.dedent("""\
+            const I2C  = scripting.addModule("/ti/driverlib/I2C", {}, false);
+            const I2C1 = I2C.addInstance();
+            const I2C2 = I2C.addInstance();
+            I2C1.$name                     = "I2C_TARGET";
+            I2C1.basicEnableTarget         = true;
+            I2C1.peripheral.$assign        = "I2C1";
+            I2C1.peripheral.sdaPin.$assign = "PB3";
+            I2C1.peripheral.sclPin.$assign = "PB2";
+            I2C2.$name                     = "I2C_0";
+            I2C2.basicEnableController     = true;
+            I2C2.peripheral.$assign        = "I2C0";
+            I2C2.peripheral.sdaPin.$assign = "PA10";
+            I2C2.peripheral.sclPin.$assign = "PA11";
+            const SPI  = scripting.addModule("/ti/driverlib/SPI", {}, false);
+            const SPI1 = SPI.addInstance();
+            SPI1.$name                      = "SPI_PERIPH";
+            SPI1.mode                       = "PERIPHERAL";
+            SPI1.peripheral.$assign         = "SPI0";
+            SPI1.peripheral.sclkPin.$assign = "PA6";
+            """)
+        peripherals = self.project(syscfg)["project"]["peripherals"]
+        self.assertNotIn("config", peripherals["I2C1"])
+        self.assertNotIn("config", peripherals["SPI0"])
+        self.assertEqual(peripherals["I2C0"]["config"][0]["key"], "i2c0")
+
+    def test_gpio_pins_by_port_and_number_and_their_object_names(self):
+        # 审查 A3：TI 例程的端口加引脚号写法也读得到；标签是 gen 生成的对象名（PIN_0 得到
+        # gpio_btn_pin_0）。
+        # Review A3: the port plus pin number form of TI's examples is read as well; the label
+        # is the object name gen generates (PIN_0 gives gpio_btn_pin_0).
+        syscfg = self.PROJECT + textwrap.dedent("""\
+            const GPIO2 = GPIO.addInstance();
+            const GPIO3 = GPIO.addInstance();
+            GPIO2.$name                         = "GPIO_LEDS";
+            GPIO2.port                          = "PORTA";
+            GPIO2.associatedPins.create(1);
+            GPIO2.associatedPins[0].$name       = "USER_LED_1";
+            GPIO2.associatedPins[0].assignedPin = "26";
+            GPIO3.$name                         = "GPIO_BTN";
+            GPIO3.associatedPins.create(1);
+            GPIO3.associatedPins[0].$name       = "PIN_0";
+            GPIO3.associatedPins[0].pin.$assign = "PA7";
+            """)
+        assignments = self.project(syscfg)["project"]["assignments"]
+        self.assertEqual(assignments["PA26"]["label"], "USER_LED_1")
+        self.assertEqual(assignments["PA7"]["label"], "gpio_btn_pin_0")
 
     def test_a_singleton_module_is_its_own_instance(self):
         # DAC12 没有 addInstance，直接配在模块变量上。
@@ -629,6 +681,33 @@ class HpmProjects(TestCase):
         )
         self.assertEqual(info["project"]["assignments"]["PA00"]["signal"], "UART0_TXD")
 
+    def test_the_settings_follow_what_gen_generates(self):
+        # 审查 A1、A2：缺 SDA 的 I2C 没有条目；GPIO 改名的键不分大小写，保留文件的写法；分给
+        # GPIO0 以外控制器的引脚没有改名项（gen 不为它生成对象）。
+        # Review A1, A2: an I2C without SDA has no entry; the GPIO rename key matches in any
+        # case and keeps the file's spelling; a pin on a controller other than GPIO0 has no
+        # rename (gen makes no object for it).
+        hpmpc = json.loads(self.HPMPC)
+        function = hpmpc["content"]["pinmux"]["functions"]["init_bsp_pins"]
+        function["selectPins"]["PA09"] = {"signal": "GPIO.A.A[09]", "padCtls": {}}
+        function["managers"] = {"gpiom": {"PA09": {"gpioController": "2"}}}
+        files = self.project_files()
+        files["boards/board/tool_config.hpmpc"] = json.dumps(hpmpc)
+        files["User/libxr_config.yaml"] = "GPIO:\n  PA10: led\n"
+        peripherals = self.project(files)["project"]["peripherals"]
+        self.assertNotIn("config", peripherals["I2C0"])
+        self.assertEqual(
+            peripherals["GPIOA"]["config"],
+            [{"section": "GPIO", "key": None, "present": True, "params": {"PA10": "led"}}],
+        )
+
+    def test_no_fallback_when_every_call_is_conditional(self):
+        # 审查 C2：init_bsp_pins 只在 #if 里调用时不读它（O2），也不退回它。
+        # Review C2: init_bsp_pins called only inside #if is not read (O2), not even as the
+        # fallback.
+        main = "int main(void)\n{\n#if USE_PINS\n  init_bsp_pins();\n#endif\n}\n"
+        self.assertEqual(self.project(self.project_files(main))["project"]["assignments"], {})
+
     def test_a_gptmr_on_a_soc_with_a_pwm_peripheral_has_no_pwm_entry(self):
         # 与解析一致：HPM5361 有 PWM 外设，GPTMR 只作展示，libxr_config 里没有它的 PWM 条目。
         # As parsed: a HPM5361 has a PWM peripheral, so a GPTMR is display-only and has no PWM
@@ -734,10 +813,18 @@ class HpmProjects(TestCase):
         )
 
     def test_a_peripheral_is_tied_to_its_libxr_config_settings(self):
-        # HPM 生成 I2C 的设置和 GPIO 的改名（pa10，PA03 -> pa3）；UART 没有设置段。
+        # HPM 生成 I2C 的设置和 GPIO 的改名（pa10，PA03 -> pa3）；UART 没有设置段。I2C 要有
+        # SCL 和 SDA 才生成（与解析一致），这里补上 SDA。
         # An HPM generates the I2C settings and the GPIO renames (pa10, PA03 -> pa3); a UART has
-        # no settings section.
+        # no settings section. An I2C generates only with SCL and SDA (as parsed), so SDA is
+        # added here.
+        hpmpc = json.loads(self.HPMPC)
+        hpmpc["content"]["pinmux"]["functions"]["init_bsp_pins"]["selectPins"]["PA02"] = {
+            "signal": "I2C0.A.SDA",
+            "padCtls": {},
+        }
         files = self.project_files()
+        files["boards/board/tool_config.hpmpc"] = json.dumps(hpmpc)
         files["User/libxr_config.yaml"] = "I2C:\n  i2c0:\n    speed: 100000\nGPIO:\n  pa10: LED\n"
         peripherals = self.project(files)["project"]["peripherals"]
         self.assertEqual(
