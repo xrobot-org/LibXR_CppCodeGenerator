@@ -513,12 +513,16 @@ $ libxr stm32 cmake
 [INFO] LibXR.CMake already included in CMakeLists.txt.
 ```
 
-BSP 根目录还没有 `Modules/modules.yaml` 时，`libxr stm32 setup --xrobot` 在最后依次列出 XRobot 的设置
-命令：`xrobot init`、`xrobot module add`、`xrobot setup` 和 `xrobot instance add`。
+使用 XRobot 的工程，`libxr stm32 setup`、`libxr mspm0 setup` 和 `libxr hpm setup` 在最后给出 XRobot 的
+下一步：BSP 根目录还没有 `Modules/modules.yaml` 时，依次列出 XRobot 的设置命令 `xrobot init`、
+`xrobot module add`、`xrobot setup` 和 `xrobot instance add`；已经有了时，提醒运行 `xrobot gen`，
+因为 `User/xrobot_main.hpp` 由 XRobot 生成，libxr 的 setup 不更新它。
 
-While the BSP root has no `Modules/modules.yaml` yet, `libxr stm32 setup --xrobot` ends by listing
-the XRobot setup commands in order: `xrobot init`, `xrobot module add`, `xrobot setup` and
-`xrobot instance add`.
+For a project that uses XRobot, `libxr stm32 setup`, `libxr mspm0 setup` and `libxr hpm setup` end
+with the next XRobot step: while the BSP root has no `Modules/modules.yaml` yet, they list the
+XRobot setup commands in order, `xrobot init`, `xrobot module add`, `xrobot setup` and
+`xrobot instance add`; once it exists, they remind to run `xrobot gen`, since XRobot generates
+`User/xrobot_main.hpp` and the libxr setup does not update it.
 
 详见 [与 XRobot 集成](https://xrobot.work/docs/code_gen/code-gen-xrobot-inter)。
 
@@ -670,6 +674,7 @@ $ libxr mspm0 setup
 [INFO] .\User\libxr_config.yaml does not exist; creating it with the default settings
 [INFO] terminal_source is not set; using uart0
 [INFO] Generated User: wrote app_main.cpp, app_main.h, libxr_config.yaml
+[INFO] Next: run `xrobot gen` to bring User/xrobot_main.hpp up to date; libxr setup does not update it
 
 ===== [Configuration Summary] =====
 
@@ -735,6 +740,7 @@ $ libxr hpm setup
 [INFO] System: bare metal
 [INFO] .\User\libxr_config.yaml does not exist; creating it with the default settings
 [INFO] Generated User: wrote app_main.cpp, app_main.h, libxr_config.yaml
+[INFO] Next: run `xrobot gen` to bring User/xrobot_main.hpp up to date; libxr setup does not update it
 
 ===== [Configuration Summary] =====
 
