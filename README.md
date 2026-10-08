@@ -408,6 +408,22 @@ USB:
     - {tx_fifo_size: 128, rx_fifo_size: 128, queue_size: 3}
 ```
 
+每一项可以加上 `interface`，作为这路 CDC 控制接口和数据接口的名字。几路 CDC 的 VID:PID 相同，主机按接口名
+区分它们；没有 `interface` 的一路使用 LibXR 的默认名 `XRUSB CDC Control` 和 `XRUSB CDC Data`：
+
+Each item can add `interface`, the name of the control and data interfaces of that CDC. The CDCs
+share VID:PID, and the host tells them apart by the interface name; a CDC without `interface`
+keeps the LibXR default names `XRUSB CDC Control` and `XRUSB CDC Data`:
+
+```yaml
+USB:
+  usb_otg_hs:
+    enable: true
+    cdc:
+    - {tx_fifo_size: 128, rx_fifo_size: 128, queue_size: 3, interface: Console}
+    - {tx_fifo_size: 128, rx_fifo_size: 128, queue_size: 3, interface: Telemetry}
+```
+
 `database.enable` 为 true 时，`app_main()` 生成 `STM32Flash flash(FLASH_REGIONS, FLASH_REGION_NUMBER)`
 和 `DatabaseRaw<N> database(flash)`，数据库以 `database` 注册；`FLASH_REGIONS` 来自
 `User/flash_map.hpp`，数据库使用 Flash 末尾的两个扇区。模板参数 `N` 是 Flash 的最小写入单元，单位为
