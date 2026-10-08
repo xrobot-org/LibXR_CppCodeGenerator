@@ -541,7 +541,7 @@ def _includes(project_data: dict, use_xrobot: bool) -> list[str]:
     XRobot, xrobot_main.hpp; all in alphabetical order.
     """
     peripherals = project_data.get("Peripherals", {})
-    drivers = ["mspm0_timebase.hpp"]
+    drivers = ["mspm0_timebase.hpp", "mspm0_power.hpp"]
     if project_data.get("GPIO"):
         drivers.append("mspm0_gpio.hpp")
     for kind in ("I2C", "PWM", "SPI", "UART"):
@@ -853,6 +853,7 @@ def _sections(
             f"{INDENT}// Timebase and platform",
             f"{INDENT}static MSPM0Timebase timebase;",
             f"{INDENT}PlatformInit();",
+            f"{INDENT}static MSPM0PowerManager power_manager;",
         ],
         _gpio_section(gpio),
         _uart_section(peripherals.get("UART", []), extend),
@@ -999,14 +1000,18 @@ def _warn_hand_written(path: str, existing_code: str, generated_code: str) -> No
     )
 
 
-def initialize_registry() -> None:
-    """清空生成对象的登记表和本次生成用到的头文件，使同一次进程中的下一次生成不带上次的对象。
+def initialize_registry(use_xrobot: bool) -> None:
+    """清空生成对象的登记表和本次生成用到的头文件，使同一次进程中的下一次生成不带上次的对象；
+    use_xrobot 为真时先登记 power_manager（PowerManager）。
     Clear the registry of generated objects and the headers of this generation, so the next
-    generation in the same process carries no objects over.
+    generation in the same process carries no objects over; with use_xrobot, power_manager
+    (PowerManager) is registered first.
     """
     stm32.registered_devices.clear()
     stm32.registered_origins.clear()
     stm32.used_headers.clear()
+    if use_xrobot:
+        stm32._register_device("power_manager", "PowerManager", tr("power manager", "电源管理器"))
 
 
 def reset_settings() -> None:
@@ -1049,7 +1054,7 @@ def generate(
         stm32.libxr_settings.pop("SYSTEM", None)
         stm32._settings("UART")
         stm32._settings("PWM")
-        initialize_registry()
+        initialize_registry(use_xrobot)
 
         existing_code = ""
         if os.path.exists(output_path):

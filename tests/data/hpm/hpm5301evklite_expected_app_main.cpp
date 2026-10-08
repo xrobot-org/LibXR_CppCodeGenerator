@@ -7,6 +7,7 @@
 #include "libxr.hpp"
 #include "hpm_gpio.hpp"
 #include "hpm_i2c.hpp"
+#include "hpm_power.hpp"
 #include "hpm_pwm.hpp"
 #include "hpm_soc.h"
 #include "hpm_timebase.hpp"
@@ -25,6 +26,7 @@ extern "C" void app_main(void)
   // Timebase and platform
   static HPMTimebase timebase;
   PlatformInit();
+  static HPMPowerManager power_manager;
 
   // GPIO: init_bsp_pins() configured pa10 (PA10) as an output pin, pa3 (PA03) as an input
   // pin with a pull-down. The interrupt edge comes from the pinmux and every object
@@ -43,6 +45,8 @@ extern "C" void app_main(void)
                                clock_gptmr0, 1, 0, HPMPWM::Polarity::NORMAL);
 
   // Hardware registration
+  XR_REGISTER(power_manager, LibXR::PowerManager);
+
   XR_REGISTER(pa10, LibXR::GPIO);
   XR_REGISTER(pa3, LibXR::GPIO);
 

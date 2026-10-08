@@ -6,6 +6,7 @@
 
 #include "libxr.hpp"
 #include "hpm_gpio.hpp"
+#include "hpm_power.hpp"
 #include "hpm_soc.h"
 #include "hpm_timebase.hpp"
 #include "xrobot_main.hpp"
@@ -23,6 +24,7 @@ extern "C" void app_main(void)
   // Timebase and platform
   static HPMTimebase timebase;
   PlatformInit();
+  static HPMPowerManager power_manager;
 
   // GPIO: init_bsp_pins() configured pb11 (PB11) as an output pin, pb13 (PB13) as an
   // output pin, pb12 (PB12) as an input pin, pb10 (PB10) as an input pin, pa31 (PA31) as
@@ -36,6 +38,8 @@ extern "C" void app_main(void)
   static HPMGPIO pa31(HPM_GPIO0, GPIO_DI_GPIOA, 31, IRQn_GPIO0_A);
 
   // Hardware registration
+  XR_REGISTER(power_manager, LibXR::PowerManager);
+
   XR_REGISTER(pb11, LibXR::GPIO);
   XR_REGISTER(pb13, LibXR::GPIO);
   XR_REGISTER(pb12, LibXR::GPIO);
