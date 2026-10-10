@@ -7,6 +7,7 @@
 #include "libxr.hpp"
 #include "mspm0_gpio.hpp"
 #include "mspm0_i2c.hpp"
+#include "mspm0_power.hpp"
 #include "mspm0_pwm.hpp"
 #include "mspm0_spi.hpp"
 #include "mspm0_timebase.hpp"
@@ -66,6 +67,7 @@ extern "C" void app_main(void)
   // Timebase and platform
   static MSPM0Timebase timebase;
   PlatformInit();
+  static MSPM0PowerManager power_manager;
 
   // GPIO: SysConfig configured LED1 (PA25), LED2 (PA16) as output pins and KEY1 (PB24),
   // KEY2 (PB20) as input pins. The interrupt edge comes from SysConfig; RegisterCallback
@@ -108,6 +110,8 @@ extern "C" void app_main(void)
   Timer::Start(terminal_task);
 
   // Hardware registration
+  XR_REGISTER(power_manager, LibXR::PowerManager);
+
   XR_REGISTER(LED1, LibXR::GPIO);
   XR_REGISTER(LED2, LibXR::GPIO);
   XR_REGISTER(KEY1, LibXR::GPIO);

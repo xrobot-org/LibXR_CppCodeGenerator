@@ -114,7 +114,7 @@ class Generation(TestCase):
 
     def setUp(self):
         super().setUp()
-        generator.initialize_registry()
+        generator.initialize_registry(False)
         generator.reset_settings()
 
     def generate(self, name: str, use_xrobot: bool = True) -> tuple[Path, str]:
@@ -232,6 +232,27 @@ class Generation(TestCase):
         # 对象照旧生成。
         # The objects are still generated.
         self.assertIn("static HPMPWM pwm_gptmr0_ch1(", code)
+
+    def test_power_manager_is_generated_always_and_registered_only_with_xrobot(self):
+        # power_manager 对象总是生成，登记只在使用 XRobot 时；GPIO 不能改叫 power_manager。
+        # The power_manager object is always generated; it is registered only with XRobot, and
+        # a GPIO cannot be renamed to power_manager.
+        root, code = self.generate("hpm5301evklite", use_xrobot=False)
+        self.assertIn('#include "hpm_power.hpp"', code)
+        self.assertIn("static HPMPowerManager power_manager;", code)
+        self.assertNotIn("XR_REGISTER", code)
+        output = root / "User" / "app_main.cpp"
+        generator.generate(str(root / ".config.yaml"), str(output), True, "")
+        self.assertIn(
+            "XR_REGISTER(power_manager, LibXR::PowerManager);",
+            output.read_text(encoding="utf-8"),
+        )
+        (root / "User" / "libxr_config.yaml").write_text(
+            "GPIO:\n  pa10: power_manager\n", encoding="utf-8"
+        )
+        with self.assertLogs(level="ERROR") as logs, self.assertRaises(SystemExit):
+            generator.generate(str(root / ".config.yaml"), str(output), True, "")
+        self.assertIn("a name of the HPM SDK or of the generated code", "\n".join(logs.output))
 
 
 class Notices(TestCase):
@@ -478,7 +499,7 @@ class GenerationChecks(TestCase):
 
     def setUp(self):
         super().setUp()
-        generator.initialize_registry()
+        generator.initialize_registry(False)
         generator.reset_settings()
 
     def generate(self, config: str | None = None, root: Path | None = None) -> tuple[Path, str]:
@@ -546,7 +567,7 @@ class GenerationChecks(TestCase):
             ("1led", "not a valid C++ identifier"),
         ):
             with self.subTest(name=name):
-                generator.initialize_registry()
+                generator.initialize_registry(False)
                 generator.reset_settings()
                 self.assertGenerationFails(f"GPIO:\n  pa10: '{name}'\n", problem)
 
@@ -555,13 +576,13 @@ class GenerationChecks(TestCase):
         # Review C1: function-like macros and names the generated code uses (NORMAL is the
         # polarity of the PWM) are refused; gpio_led is fine.
         self.assertGenerationFails("GPIO:\n  pa10: MAX\n", "GPIO.pa10 'MAX'")
-        generator.initialize_registry()
+        generator.initialize_registry(False)
         generator.reset_settings()
         self.assertGenerationFails(
             "GPIO:\n  pa10: NORMAL\n",
             "the generated code uses the names for something else: NORMAL",
         )
-        generator.initialize_registry()
+        generator.initialize_registry(False)
         generator.reset_settings()
         _root, code = self.generate("GPIO:\n  pa10: gpio_led\n  pa3: board_key\n")
         self.assertIn("static HPMGPIO gpio_led(", code)
@@ -571,7 +592,7 @@ class GenerationChecks(TestCase):
         # Review C3: null takes the default, a string is read as an integer literal.
         _root, code = self.generate("I2C:\n  i2c3:\n    speed:\n")
         self.assertIn("{100000U}", code)
-        generator.initialize_registry()
+        generator.initialize_registry(False)
         generator.reset_settings()
         _root, code = self.generate("I2C:\n  i2c3:\n    speed: '0x61A80'\n")
         self.assertIn("{400000U}", code)
@@ -582,7 +603,7 @@ class GenerationChecks(TestCase):
     def test_a_pwm_frequency_must_be_a_positive_integer(self):
         for value in ("0", "-5", "abc", "1.5", "true"):
             with self.subTest(value=value):
-                generator.initialize_registry()
+                generator.initialize_registry(False)
                 generator.reset_settings()
                 self.assertGenerationFails(
                     f"PWM:\n  pwm_gptmr0_ch1:\n    frequency: {value}\n",

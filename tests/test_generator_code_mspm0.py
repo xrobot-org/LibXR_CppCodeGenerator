@@ -445,7 +445,7 @@ class Generation(MSPM0TestCase):
 
     def setUp(self):
         super().setUp()
-        generator.initialize_registry()
+        generator.initialize_registry(False)
         generator.reset_settings()
 
     def generate(self, name: str, use_xrobot: bool = True, edit=None) -> tuple[Path, str]:
@@ -509,7 +509,7 @@ class Generation(MSPM0TestCase):
     def test_the_generated_source_matches_the_reviewed_output(self):
         for name in ("g3507", "g3519", "variants"):
             with self.subTest(name=name):
-                generator.initialize_registry()
+                generator.initialize_registry(False)
                 generator.reset_settings()
                 _root, code = self.generate(name)
                 expected = (DATA / "mspm0" / f"{name}_expected_app_main.cpp").read_text(
@@ -617,7 +617,7 @@ class Generation(MSPM0TestCase):
         # picks the first UART.
         for value in ("none", ""):
             with self.subTest(value=value):
-                generator.initialize_registry()
+                generator.initialize_registry(False)
                 generator.reset_settings()
                 root, code = self.generate("variants")
                 self.assertIn("// Terminal on uart0", code)
@@ -703,6 +703,24 @@ class Generation(MSPM0TestCase):
         )
         self.assertIn(
             "The generated code uses these GPIO names for something else: timebase",
+            self.failure(root),
+        )
+
+    def test_power_manager_is_generated_always_and_registered_only_with_xrobot(self):
+        # power_manager 对象总是生成，登记只在使用 XRobot 时；GPIO 不能再叫 power_manager。
+        # The power_manager object is always generated; it is registered only with XRobot, and
+        # a GPIO cannot take the name power_manager.
+        root, code = self.generate("g3507", use_xrobot=False)
+        self.assertIn('#include "mspm0_power.hpp"', code)
+        self.assertIn("static MSPM0PowerManager power_manager;", code)
+        self.assertNotIn("XR_REGISTER", code)
+        code = self.regenerate(root)
+        self.assertIn("XR_REGISTER(power_manager, LibXR::PowerManager);", code)
+        self.project_yaml(
+            root, lambda data: data["GPIO"].update(power_manager=data["GPIO"].pop("LED1"))
+        )
+        self.assertIn(
+            "GPIO name power_manager is already used by the PowerManager object",
             self.failure(root),
         )
 
@@ -823,7 +841,7 @@ class Setup(MSPM0TestCase):
 
     def setUp(self):
         super().setUp()
-        generator.initialize_registry()
+        generator.initialize_registry(False)
         generator.reset_settings()
 
     def setup(self, root: Path, *options) -> tuple[int, str]:

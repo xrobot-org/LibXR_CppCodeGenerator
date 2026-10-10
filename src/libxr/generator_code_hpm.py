@@ -93,11 +93,13 @@ GENERATED_NAMES = frozenset(
         "app_main",
         "main",
         "timebase",
+        "power_manager",
         "PlatformInit",
         "LibXR",
         "Thread",
         "UINT32_MAX",
         "HPMTimebase",
+        "HPMPowerManager",
         "HPMGPIO",
         "HPMI2C",
         "HPMPWM",
@@ -522,6 +524,7 @@ def _sections(
             f"{INDENT}// Timebase and platform",
             f"{INDENT}static HPMTimebase timebase;",
             f"{INDENT}PlatformInit();",
+            f"{INDENT}static HPMPowerManager power_manager;",
         ],
         _gpio_section(project_data, gpio),
         _i2c_section(peripherals.get("I2C", [])),
@@ -578,7 +581,7 @@ def _includes(project_data: dict, use_xrobot: bool) -> list[str]:
     and, with XRobot, xrobot_main.hpp; all in alphabetical order.
     """
     peripherals = project_data.get("Peripherals", {})
-    drivers = ["hpm_soc.h", "hpm_timebase.hpp"]
+    drivers = ["hpm_soc.h", "hpm_timebase.hpp", "hpm_power.hpp"]
     if project_data.get("GPIO"):
         drivers.append("hpm_gpio.hpp")
     for kind in ("I2C", "PWM"):
@@ -655,14 +658,18 @@ def _check_soc(project_data: dict) -> None:
         _fail(str(error))
 
 
-def initialize_registry() -> None:
-    """清空生成对象的登记表，使同一次进程中的下一次生成不带上次的对象。
+def initialize_registry(use_xrobot: bool) -> None:
+    """清空生成对象的登记表，使同一次进程中的下一次生成不带上次的对象；use_xrobot 为真时先
+    登记 power_manager（PowerManager）。
     Clear the registry of generated objects, so the next generation in the same process
-    carries no objects over.
+    carries no objects over; with use_xrobot, power_manager (PowerManager) is registered
+    first.
     """
     stm32.registered_devices.clear()
     stm32.registered_origins.clear()
     stm32.used_headers.clear()
+    if use_xrobot:
+        stm32._register_device("power_manager", "PowerManager", tr("power manager", "电源管理器"))
 
 
 def reset_settings() -> None:
@@ -708,7 +715,7 @@ def generate(
         stm32._settings("I2C")
         stm32._settings("PWM")
         stm32._settings("GPIO")
-        initialize_registry()
+        initialize_registry(use_xrobot)
 
         existing_code = ""
         if os.path.exists(output_path):

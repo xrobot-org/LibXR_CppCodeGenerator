@@ -723,12 +723,14 @@ Active Peripherals:
 
 缓冲区大小等设置在 `libxr_config.yaml` 中。GPIO 以引脚标签命名（`LED1`），UART、I2C、SPI 以小写的外设名
 命名（`uart0`、`i2c0`），PWM 为 `pwm_tima1_c0`；`terminal_source` 指定终端使用的串口，未设置时用第一个 UART。
+生成总是包含 `static MSPM0PowerManager power_manager;`，使用 XRobot 时把它登记为 `PowerManager`。
 流程、设置与约束的完整说明见 [MSPM0 代码生成](https://xrobot.work/docs/code_gen/mspm0)。
 
 The settings such as the buffer sizes live in `libxr_config.yaml`. GPIO objects are named after
 the pin labels (`LED1`), UART, I2C and SPI after their lowercase peripheral names (`uart0`, `i2c0`),
 and a PWM is `pwm_tima1_c0`; `terminal_source` names the UART the terminal uses, the first one when it is not
-set. The flow, the settings and their constraints are described in
+set. The generation always emits `static MSPM0PowerManager power_manager;`, registered as a
+`PowerManager` with XRobot. The flow, the settings and their constraints are described in
 [MSPM0 code generation](https://xrobot.work/en/docs/code_gen/mspm0).
 
 ---
@@ -782,11 +784,13 @@ Active Peripherals:
 ```
 
 支持 HPM5301（QFN48）和 HPM5361（LQFP100、LQFP64、QFN48）。UART、SPI 等外设目前只识别，生成时列入
-Other。流程、命名与设置的完整说明见 [HPM 代码生成](https://xrobot.work/docs/code_gen/hpm)。
+Other。生成总是包含 `static HPMPowerManager power_manager;`，使用 XRobot 时把它登记为
+`PowerManager`。流程、命名与设置的完整说明见 [HPM 代码生成](https://xrobot.work/docs/code_gen/hpm)。
 
 HPM5301 (QFN48) and HPM5361 (LQFP100, LQFP64, QFN48) are supported. Peripherals such as UART and
-SPI are recognized for now and listed under Other in the generation. The flow, the naming and the
-settings are described in [HPM code generation](https://xrobot.work/en/docs/code_gen/hpm).
+SPI are recognized for now and listed under Other in the generation. The generation always emits
+`static HPMPowerManager power_manager;`, registered as a `PowerManager` with XRobot. The flow, the
+naming and the settings are described in [HPM code generation](https://xrobot.work/en/docs/code_gen/hpm).
 
 ---
 
