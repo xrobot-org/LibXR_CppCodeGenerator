@@ -8,16 +8,19 @@ code kept on regeneration.
 没有 SysConfig，输出随工程一起提交），以及一个覆盖 BSP 没用到的 SysConfig 写法的 variants 工程
 （SPI 用 MFCLK 分频和 RX timeout DMA 触发、外设模式的 SPI、只有目标模式的 I2C、默认实例名且
 引脚只有建议值的 PWM、端口加引脚号的 GPIO、默认名 PIN_0 的引脚、收发都有 DMA 的 UART），它的
-输出同样由 SysConfig 1.28.1 生成。测试把固件复制进临时工程，使生成输出的修改时间比 .syscfg 新，
-解析直接复用它；测试期间不设置 SYSCONFIG_TOOL 和 MSPM0_SDK_INSTALL_DIR。
+输出同样由 SysConfig 1.28.1 生成，以及 TI SDK 的 uart_tx_multibyte_fifo_dma_interrupts 例程
+（一个实例只有一个 DMA 触发，输出的触发宏不带编号）。测试把固件复制进临时工程，使生成输出的
+修改时间比 .syscfg 新，解析直接复用它；测试期间不设置 SYSCONFIG_TOOL 和 MSPM0_SDK_INSTALL_DIR。
 The fixtures are the real project files of the two BSPs: the .syscfg plus the
 ti_msp_dl_config.h/.c that SysConfig generated (CI has no SysConfig, so the output is committed
-with the project), and a variants project with the SysConfig setups the BSPs do not use (an SPI
+with the project), a variants project with the SysConfig setups the BSPs do not use (an SPI
 on MFCLK with a divider and an RX timeout DMA trigger, an SPI in peripheral mode, an I2C in
 target mode only, a PWM with the default instance name and only suggested pins, GPIO pins given
 as port plus pin number, a pin with the default name PIN_0, a UART with DMA on both sides),
-whose output SysConfig 1.28.1 generated as well. A test copies the fixtures into a temporary
-project, so the generated output is newer than the .syscfg and parsing reuses it;
+whose output SysConfig 1.28.1 generated as well, and the uart_tx_multibyte_fifo_dma_interrupts
+example of the TI SDK (an instance with a single DMA trigger, so its trigger macro carries no
+number). A test copies the fixtures into a temporary project, so the generated output is newer
+than the .syscfg and parsing reuses it;
 SYSCONFIG_TOOL and MSPM0_SDK_INSTALL_DIR are unset during the tests.
 """
 
@@ -51,6 +54,7 @@ def bsp(name: str) -> str:
         "g3507": "mspm0g3507_minidb48.syscfg",
         "g3519": "mspm0g3519_minidb48.syscfg",
         "variants": "mspm0_variants.syscfg",
+        "uart_tx_dma": "uart_tx_multibyte_fifo_dma_interrupts.syscfg",
     }[name]
 
 
@@ -167,6 +171,17 @@ class Parsing(MSPM0TestCase):
         peripherals = self.parse("g3519")["Peripherals"]
         self.assertEqual(peripherals["UART"]["UART_7"]["DMA_TX"], "DMA_CH_UART7_TX")
         self.assertEqual(peripherals["UART"]["UART_7"]["PowerDomain"], 0)
+
+    def test_a_single_dma_trigger_of_the_output_names_the_channel(self):
+        # TI 的 uart_tx_multibyte_fifo_dma_interrupts 例程：.syscfg 只写了
+        # DMA_CHANNEL_TX.peripheral.$assign，输出里的触发宏只有一个，因而不带编号
+        # （UART_0_INST_DMA_TRIGGER）。
+        # TI's uart_tx_multibyte_fifo_dma_interrupts example: the .syscfg names only
+        # DMA_CHANNEL_TX.peripheral.$assign, and the output holds a single trigger macro,
+        # which therefore carries no number (UART_0_INST_DMA_TRIGGER).
+        uart = self.parse("uart_tx_dma")["Peripherals"]["UART"]["UART_0"]
+        self.assertEqual(uart["DMA_TX"], "DMA_CH0")
+        self.assertEqual(uart["Peripheral"], "UART0")
 
 
 class ParsingVariants(MSPM0TestCase):
@@ -780,9 +795,23 @@ class Generation(MSPM0TestCase):
         self.project_yaml(root, lambda data: data["Peripherals"]["UART"]["UART_0"].pop("DMA_TX"))
         self.assertIn(
             "UART_0: no DMA TX channel in the SysConfig project (UART > DMA Configuration: "
-            "Enable DMA TX",
+            "Enable DMA TX with the TX trigger, which also gives the <channel>_CHAN_ID and "
+            "UART_0_INST_DMA_TRIGGER macros, the latter numbered _0, _1 when the instance has "
+            "more than one trigger)",
             self.failure(root),
         )
+
+    def test_the_ti_example_with_one_dma_trigger_generates(self):
+        # TI 例程端到端：.syscfg 加 SysConfig 输出解析出 DMA_CH0（触发宏不带编号），生成出来的
+        # UART 用它构造。
+        # The TI example end to end: its .syscfg and SysConfig output parse to DMA_CH0 (the
+        # trigger macro carries no number), and the generated UART is constructed with it.
+        root = self.project("uart_tx_dma")
+        parse_project(str(root), summary=False)
+        (root / "User").mkdir()
+        code = self.regenerate(root)
+        self.assertIn("MSPM0_UART_MAIN_INIT(UART_0, DMA_CH0,", code)
+        self.assertIn("#define DMA_CH0_LIBXR_UART_IRQN UART_0_INST_INT_IRQN", code)
 
     def test_different_frequencies_of_one_timer_are_a_warning(self):
         # L7
@@ -926,3 +955,39 @@ class Analyzer(TestCase):
             sorted(clocks), ["I2C_0", "I2C_TARGET", "PWM_0", "SPI_1", "SPI_PERIPH", "UART_0"]
         )
         self.assertEqual(clocks["UART_0"]["clockSel"], "DL_UART_MAIN_CLOCK_BUSCLK")
+
+    def test_a_dma_trigger_without_a_number_names_the_channel_too(self):
+        # SysConfig 在一个实例只有一个 DMA 触发时不写编号；通道名是触发宏前面紧挨着的
+        # <通道>_CHAN_ID。
+        # SysConfig writes no number while an instance has one DMA trigger; the channel is the
+        # <channel>_CHAN_ID directly before the trigger macro.
+        defines = {
+            "DMA_CH0_CHAN_ID": "(0)",
+            "UART_0_INST_DMA_TRIGGER": "(DMA_UART0_TX_TRIG)",
+        }
+        self.assertEqual(analyzer._header_dma_channel("UART_0", "TX", defines), "DMA_CH0")
+        self.assertIsNone(analyzer._header_dma_channel("UART_0", "RX", defines))
+
+    def test_an_spi_with_one_dma_event_uses_the_same_lookup(self):
+        # SPI 和 UART 走同一个查找：只开一个 DMA 事件时它的触发宏也不带编号。
+        # An SPI uses the same lookup as a UART: with a single DMA event its trigger macro
+        # carries no number either.
+        defines = {
+            "DMA_CH_SPI1_RX_CHAN_ID": "(3)",
+            "SPI_1_INST_DMA_TRIGGER": "(DMA_SPI1_RX_TRIG)",
+        }
+        self.assertEqual(analyzer._header_dma_channel("SPI_1", "RX", defines), "DMA_CH_SPI1_RX")
+        self.assertIsNone(analyzer._header_dma_channel("SPI_1", "TX", defines))
+
+    def test_a_numbered_dma_trigger_names_the_channel_as_before(self):
+        # 两个及以上触发时宏带编号，两个方向各取自己前面的通道。
+        # From two triggers on the macros carry numbers, and each direction takes the channel
+        # before its own trigger.
+        defines = {
+            "DMA_CH_UART0_TX_CHAN_ID": "(1)",
+            "UART_0_INST_DMA_TRIGGER_0": "(DMA_UART0_TX_TRIG)",
+            "DMA_CH_UART0_RX_CHAN_ID": "(0)",
+            "UART_0_INST_DMA_TRIGGER_1": "(DMA_UART0_RX_TRIG)",
+        }
+        self.assertEqual(analyzer._header_dma_channel("UART_0", "TX", defines), "DMA_CH_UART0_TX")
+        self.assertEqual(analyzer._header_dma_channel("UART_0", "RX", defines), "DMA_CH_UART0_RX")

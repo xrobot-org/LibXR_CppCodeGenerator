@@ -607,13 +607,15 @@ def _uart_section(uarts: list, extend: set[str]) -> list[str]:
                 tr(
                     f"{instance}: no DMA TX channel in the SysConfig project (UART > DMA "
                     "Configuration: Enable DMA TX with the TX trigger, which also gives the "
-                    f"{instance}_INST_DMA_TRIGGER_n and <channel>_CHAN_ID macros); the MSPM0 UART "
+                    f"<channel>_CHAN_ID and {instance}_INST_DMA_TRIGGER macros, the latter "
+                    "numbered _0, _1 when the instance has more than one trigger); the MSPM0 UART "
                     "driver constructs only with DMA TX. Enable it and run `libxr parse` again, "
                     "or drop the UART",
                     f"{instance}：SysConfig 工程里没有 DMA TX 通道（UART > DMA Configuration："
-                    f"启用 DMA TX 并选 TX 触发，SysConfig 随之生成 {instance}_INST_DMA_TRIGGER_n "
-                    "和 <通道>_CHAN_ID 宏）；MSPM0 的 UART 驱动只支持带 DMA TX 的构造。请启用后"
-                    "重新运行 `libxr parse`，或删去这个 UART",
+                    f"启用 DMA TX 并选 TX 触发，SysConfig 随之生成 <通道>_CHAN_ID 和 "
+                    f"{instance}_INST_DMA_TRIGGER 宏，实例有多个触发时带编号 _0、_1）；MSPM0 的 "
+                    "UART 驱动只支持带 DMA TX 的构造。请启用后重新运行 `libxr parse`，或删去"
+                    "这个 UART",
                 )
             )
         settings = _instance_settings("UART", name, instance in extend)
