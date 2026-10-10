@@ -616,16 +616,18 @@ def _gpio_entries(
 
 def _header_dma_channel(name: str, direction: str, defines: dict[str, str]) -> str | None:
     """SysConfig 输出里实例 name 在 direction（TX/RX）方向的 DMA 通道名：每个
-    <name>_INST_DMA_TRIGGER_n 前面紧挨着它的通道的 <通道>_CHAN_ID。没有时为 None。
+    <name>_INST_DMA_TRIGGER 或 <name>_INST_DMA_TRIGGER_n 前面紧挨着它的通道的 <通道>_CHAN_ID
+    （一个实例只有一个触发时 SysConfig 不写编号，两个及以上才写 _0、_1）。没有时为 None。
     The DMA channel name of the instance name in direction (TX/RX) in the SysConfig output:
-    every <name>_INST_DMA_TRIGGER_n directly follows the <channel>_CHAN_ID of its channel. None
-    when there is none.
+    every <name>_INST_DMA_TRIGGER or <name>_INST_DMA_TRIGGER_n directly follows the
+    <channel>_CHAN_ID of its channel (SysConfig writes no number while the instance has one
+    trigger, and _0, _1 from two on). None when there is none.
     """
     channel = None
     for macro, value in defines.items():
         if macro.endswith("_CHAN_ID"):
             channel = macro[: -len("_CHAN_ID")]
-        elif re.fullmatch(rf"{re.escape(name)}_INST_DMA_TRIGGER_\d+", macro):
+        elif re.fullmatch(rf"{re.escape(name)}_INST_DMA_TRIGGER(?:_\d+)?", macro):
             trigger = DMA_TRIGGER.fullmatch(value)
             if trigger and trigger.group(1) == direction and channel:
                 return channel
