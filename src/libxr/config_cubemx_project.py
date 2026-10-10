@@ -835,11 +835,12 @@ def _report_next_steps(project_dir: str, xrobot: bool = False) -> None:
     CubeMX sources do not call it yet, the XRobot setup commands in order when an XRobot project
     has no Modules/modules.yaml yet, and the build commands when the project has CMake presets.
 
-    FreeRTOS 工程在定义 StartDefaultTask 的源文件中调用，其他工程在 Core/Src/main.c 的 main()
-    中调用。xrobot 为真表示入口源文件按 --xrobot 生成。构建命令使用第一个同时有 configure 和
-    build preset 的名字。
-    A FreeRTOS project calls it in the source file defining StartDefaultTask, any other
-    project in main() of Core/Src/main.c. xrobot true means the entry source was generated with
+    ThreadX 工程在 App_ThreadX_Init() 中创建一个调用它的线程，FreeRTOS 工程在定义
+    StartDefaultTask 的源文件中调用，其他工程在 Core/Src/main.c 的 main() 中调用。xrobot 为真
+    表示入口源文件按 --xrobot 生成。构建命令使用第一个同时有 configure 和 build preset 的名字。
+    A ThreadX project creates a thread calling it in App_ThreadX_Init(), a FreeRTOS project
+    calls it in the source file defining StartDefaultTask, any other project in main() of
+    Core/Src/main.c. xrobot true means the entry source was generated with
     --xrobot. The build commands use the first name that has both a configure and a build
     preset.
     """
@@ -851,33 +852,73 @@ def _report_next_steps(project_dir: str, xrobot: bool = False) -> None:
                 with open(os.path.join(sources, name), encoding="utf-8", errors="replace") as f:
                     texts[name] = f.read()
     if not any(re.search(r"\bapp_main\s*\(\s*\)\s*;", text) for text in texts.values()):
+        threadx = next((name for name, text in texts.items() if "App_ThreadX_Init(" in text), None)
         task = next((name for name, text in texts.items() if "StartDefaultTask(" in text), None)
-        if task:
-            where_en = f"in the default task StartDefaultTask (Core/Src/{task})"
-            where_zh = f"在默认任务 StartDefaultTask（Core/Src/{task}）中"
+        keep_en = "inside USER CODE sections, which CubeMX keeps when it regenerates the code."
+        keep_zh = "写在 USER CODE 区域中，CubeMX 重新生成代码时保留。"
+        if threadx:
+            # App_ThreadX_Init() 在调度器启动前执行，app_main() 要在线程中运行。
+            # App_ThreadX_Init() runs before the scheduler starts; app_main() runs in a thread.
+            english = (
+                f"Next: in App_ThreadX_Init() (Core/Src/{threadx}), create a thread whose entry "
+                f'function includes "app_main.h" and calls app_main(), {keep_en} '
+                "App_ThreadX_Init() runs before the scheduler starts, so it cannot call "
+                "app_main() directly."
+            )
+            chinese = (
+                f"下一步：在 App_ThreadX_Init()（Core/Src/{threadx}）中创建一个线程，线程入口函数 "
+                f'#include "app_main.h" 并调用 app_main()，{keep_zh}App_ThreadX_Init() 在调度器'
+                "启动前执行，不能在其中直接调用 app_main()。"
+            )
         else:
-            where_en, where_zh = "in main() of Core/Src/main.c", "在 Core/Src/main.c 的 main() 中"
-        logging.info(
-            tr(
-                f'Next: #include "app_main.h" and call app_main() {where_en}, inside USER CODE '
-                "sections, which CubeMX keeps when it regenerates the code.",
-                f'下一步：{where_zh} #include "app_main.h" 并调用 app_main()，写在 USER CODE 区域中，'
-                "CubeMX 重新生成代码时保留。",
-            )
-        )
-    if xrobot and not os.path.isfile(os.path.join(project_dir, "Modules", "modules.yaml")):
-        logging.info(
-            tr(
-                "Next: Modules/modules.yaml does not exist yet; set up XRobot in this order:",
-                "下一步：还没有 Modules/modules.yaml，按以下顺序完成 XRobot 的设置：",
-            )
-        )
-        for command, english, chinese in XROBOT_STEPS:
-            logging.info(f"  {command:<36}  " + tr(english, chinese))
+            if task:
+                where_en = f"in the default task StartDefaultTask (Core/Src/{task})"
+                where_zh = f"在默认任务 StartDefaultTask（Core/Src/{task}）中"
+            else:
+                where_en, where_zh = (
+                    "in main() of Core/Src/main.c",
+                    "在 Core/Src/main.c 的 main() 中",
+                )
+            english = f'Next: #include "app_main.h" and call app_main() {where_en}, {keep_en}'
+            chinese = f'下一步：{where_zh} #include "app_main.h" 并调用 app_main()，{keep_zh}'
+        logging.info(tr(english, chinese))
+    report_xrobot_steps(project_dir, xrobot)
     preset = _build_preset(os.path.join(project_dir, "CMakePresets.json"))
     if preset:
         command = f"cmake --preset {preset} && cmake --build --preset {preset}"
         logging.info(tr(f"Build: {command}", f"构建：{command}"))
+
+
+def report_xrobot_steps(project_dir: str, xrobot: bool) -> None:
+    """XRobot 工程（xrobot 为真）的后续步骤，各平台的 setup 共用：还没有 Modules/modules.yaml
+    时依次给出 XRobot 的设置命令（XROBOT_STEPS，其中 xrobot setup 生成 User/xrobot_main.hpp）；
+    已经有了时提醒运行 xrobot gen，因为 libxr 的 setup 不更新 User/xrobot_main.hpp（用户
+    2026-10-07 决定统一提醒）。
+    The next steps of an XRobot project (xrobot true), shared by the setup of every platform:
+    without Modules/modules.yaml the XRobot setup commands in order (XROBOT_STEPS, where xrobot
+    setup generates User/xrobot_main.hpp); with it a reminder to run xrobot gen, because the
+    libxr setup does not update User/xrobot_main.hpp (the user decided on 2026-10-07 to remind
+    on every platform).
+    """
+    if not xrobot:
+        return
+    if os.path.isfile(os.path.join(project_dir, "Modules", "modules.yaml")):
+        logging.info(
+            tr(
+                "Next: run `xrobot gen` to bring User/xrobot_main.hpp up to date; libxr setup "
+                "does not update it",
+                "下一步：运行 `xrobot gen` 更新 User/xrobot_main.hpp；libxr 的 setup 不更新它",
+            )
+        )
+        return
+    logging.info(
+        tr(
+            "Next: Modules/modules.yaml does not exist yet; set up XRobot in this order:",
+            "下一步：还没有 Modules/modules.yaml，按以下顺序完成 XRobot 的设置：",
+        )
+    )
+    for command, english, chinese in XROBOT_STEPS:
+        logging.info(f"  {command:<36}  " + tr(english, chinese))
 
 
 def _build_preset(path: str) -> str:

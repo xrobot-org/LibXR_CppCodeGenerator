@@ -14,14 +14,16 @@ LibXR 代码生成工具 / Code generator for LibXR
 [![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FJiu-xiao%2FLibXR_CppCodeGenerator.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2FJiu-xiao%2FLibXR_CppCodeGenerator?ref=badge_shield)
 
 LibXR_CppCodeGenerator 由各平台开发工具的工程生成使用 [LibXR](https://github.com/xrobot-org/libxr)
-的 C++ 代码，以 pip 包 `libxr` 发布，命令为 `libxr`。目前支持 STM32：它读取 STM32CubeMX 工程的
-`.ioc` 文件，生成外设对象和入口函数 `app_main`，并把 LibXR 接入工程的 CMake 构建。
+的 C++ 代码，以 pip 包 `libxr` 发布，命令为 `libxr`。目前支持三个平台：STM32 读取 STM32CubeMX 工程的
+`.ioc` 文件，MSPM0 读取 SysConfig 工程的 `.syscfg`，HPM 读取 HPM Pinmux Tool 工程的 `.hpmpc`；三者都
+生成外设对象和入口函数 `app_main`，STM32 的命令另外把 LibXR 接入工程的 CMake 构建。
 
 LibXR_CppCodeGenerator generates C++ code that uses [LibXR](https://github.com/xrobot-org/libxr)
 from the projects of each platform's development tool. It is published as the pip package
-`libxr`, with the command `libxr`. STM32 is supported so far: it reads the `.ioc` file of an
-STM32CubeMX project, generates the peripheral objects and the entry function `app_main`, and
-adds LibXR to the project's CMake build.
+`libxr`, with the command `libxr`. Three platforms are supported: STM32 reads the `.ioc` file of
+an STM32CubeMX project, MSPM0 reads the `.syscfg` of a SysConfig project, and HPM reads the
+`.hpmpc` of an HPM Pinmux Tool project; all three generate the peripheral objects and the entry
+function `app_main`, and the STM32 commands also add LibXR to the project's CMake build.
 
 ---
 
@@ -95,15 +97,15 @@ pip install .
 
 以上三种方式只选其一，不要混用。系统中有多份安装时，命令行实际调用的版本可能与预期不同，而不同版本
 生成的代码并不一致。当前使用的版本可通过 `libxr --version` 查看。BSP 所用的版本由
-`User/libxr_config.yaml` 顶层的 `generator: 6.0.0` 固定：生成器新建这个文件时写入当前的版本，重新
-生成时保留这个键；安装的版本应与之一致，例如 `pipx install libxr==6.0.0`。
+`User/libxr_config.yaml` 顶层的 `generator: 6.0.1` 固定：生成器新建这个文件时写入当前的版本，重新
+生成时保留这个键；安装的版本应与之一致，例如 `pipx install libxr==6.0.1`。
 
 Use only one of these methods. With several installations present, the command line may run a
 different version than expected, and different versions generate different code.
 `libxr --version` shows the version in use. The version a BSP uses is pinned by
-`generator: 6.0.0` at the top level of `User/libxr_config.yaml`: the generator writes the
+`generator: 6.0.1` at the top level of `User/libxr_config.yaml`: the generator writes the
 current version when it creates this file, and regeneration keeps the key; install the same
-version, e.g. `pipx install libxr==6.0.0`.
+version, e.g. `pipx install libxr==6.0.1`.
 
 ---
 
@@ -335,7 +337,7 @@ with the new value; the changes and comments in the file are kept on regeneratio
 
 ```yaml
 # User/libxr_config.yaml（节选 / excerpt）
-generator: 6.0.0
+generator: 6.0.1
 terminal_source: usart1
 software_timer:
   priority: 2
@@ -406,6 +408,22 @@ USB:
     cdc:
     - {tx_fifo_size: 128, rx_fifo_size: 128, queue_size: 3}
     - {tx_fifo_size: 128, rx_fifo_size: 128, queue_size: 3}
+```
+
+每一项可以加上 `interface`，作为这路 CDC 控制接口和数据接口的名字。几路 CDC 的 VID:PID 相同，主机按接口名
+区分它们；没有 `interface` 的一路使用 LibXR 的默认名 `XRUSB CDC Control` 和 `XRUSB CDC Data`：
+
+Each item can add `interface`, the name of the control and data interfaces of that CDC. The CDCs
+share VID:PID, and the host tells them apart by the interface name; a CDC without `interface`
+keeps the LibXR default names `XRUSB CDC Control` and `XRUSB CDC Data`:
+
+```yaml
+USB:
+  usb_otg_hs:
+    enable: true
+    cdc:
+    - {tx_fifo_size: 128, rx_fifo_size: 128, queue_size: 3, interface: Console}
+    - {tx_fifo_size: 128, rx_fifo_size: 128, queue_size: 3, interface: Telemetry}
 ```
 
 `database.enable` 为 true 时，`app_main()` 生成 `STM32Flash flash(FLASH_REGIONS, FLASH_REGION_NUMBER)`
@@ -511,12 +529,16 @@ $ libxr stm32 cmake
 [INFO] LibXR.CMake already included in CMakeLists.txt.
 ```
 
-BSP 根目录还没有 `Modules/modules.yaml` 时，`libxr stm32 setup --xrobot` 在最后依次列出 XRobot 的设置
-命令：`xrobot init`、`xrobot module add`、`xrobot setup` 和 `xrobot instance add`。
+使用 XRobot 的工程，`libxr stm32 setup`、`libxr mspm0 setup` 和 `libxr hpm setup` 在最后给出 XRobot 的
+下一步：BSP 根目录还没有 `Modules/modules.yaml` 时，依次列出 XRobot 的设置命令 `xrobot init`、
+`xrobot module add`、`xrobot setup` 和 `xrobot instance add`；已经有了时，提醒运行 `xrobot gen`，
+因为 `User/xrobot_main.hpp` 由 XRobot 生成，libxr 的 setup 不更新它。
 
-While the BSP root has no `Modules/modules.yaml` yet, `libxr stm32 setup --xrobot` ends by listing
-the XRobot setup commands in order: `xrobot init`, `xrobot module add`, `xrobot setup` and
-`xrobot instance add`.
+For a project that uses XRobot, `libxr stm32 setup`, `libxr mspm0 setup` and `libxr hpm setup` end
+with the next XRobot step: while the BSP root has no `Modules/modules.yaml` yet, they list the
+XRobot setup commands in order, `xrobot init`, `xrobot module add`, `xrobot setup` and
+`xrobot instance add`; once it exists, they remind to run `xrobot gen`, since XRobot generates
+`User/xrobot_main.hpp` and the libxr setup does not update it.
 
 详见 [与 XRobot 集成](https://xrobot.work/docs/code_gen/code-gen-xrobot-inter)。
 
@@ -644,6 +666,182 @@ sectors:
 
 ---
 
+## 🧩 从 .syscfg 到代码 / From .syscfg to Code
+
+`libxr mspm0 setup` 面向 SysConfig 工程：根目录有一份 `.syscfg` 文件，`main.c` 调用 SysConfig 生成的
+`SYSCFG_DL_init()` 后进入 `app_main()`。命令写 `.gitignore`（已有的不动），解析工程到 `.config.yaml`，
+生成 `User/app_main.cpp`、`app_main.h` 和 `libxr_config.yaml`。设置了环境变量 `SYSCONFIG_TOOL` 和
+`MSPM0_SDK_INSTALL_DIR` 时，解析运行一次 SysConfig；没有设置时复用构建目录中比 `.syscfg` 新的 SysConfig
+输出。下例设置了这两个变量：
+
+`libxr mspm0 setup` works on a SysConfig project: one `.syscfg` file at the root, and a `main.c`
+that calls the SysConfig-generated `SYSCFG_DL_init()` before entering `app_main()`. The command
+writes `.gitignore` (an existing one stays), parses the project into `.config.yaml`, and generates
+`User/app_main.cpp`, `app_main.h` and `libxr_config.yaml`. With the environment variables `SYSCONFIG_TOOL`
+and `MSPM0_SDK_INSTALL_DIR` set, parsing runs SysConfig once; without them it reuses a SysConfig output
+newer than the `.syscfg` in the build directories. The example has both variables set:
+
+```bash
+$ libxr mspm0 setup
+[INFO] Processing mspm0g3507_minidb48.syscfg...
+[INFO] Running SysConfig on mspm0g3507_minidb48.syscfg
+[INFO] Configuration exported to: .\.config.yaml
+[INFO] System: bare metal
+[INFO] .\User\libxr_config.yaml does not exist; creating it with the default settings
+[INFO] terminal_source is not set; using uart0
+[INFO] Generated User: wrote app_main.cpp, app_main.h, libxr_config.yaml
+[INFO] Next: run `xrobot gen` to bring User/xrobot_main.hpp up to date; libxr setup does not update it
+
+===== [Configuration Summary] =====
+
+MCU: MSPM0 MSPM0G3507
+
+GPIO (4 pins):
+  LED1: PB8, OUTPUT
+  LED2: PA16, OUTPUT
+  KEY1: PB24, INPUT, FALL interrupt
+  KEY2: PB20, INPUT, FALL interrupt
+
+Active Peripherals:
+  UART: 2 instance(s)
+    UART_0
+    UART_1
+  I2C: 2 instance(s)
+    I2C_0
+    I2C_1
+  SPI: 1 instance(s)
+    SPI_1
+  PWM: 1 instance(s)
+    PWM_TIMA1
+  Other: 5 instance(s)
+    ADC12_0
+    ADC12_1
+    DAC0
+    MCAN_0
+    QEI_TIMG8
+```
+
+缓冲区大小等设置在 `libxr_config.yaml` 中。GPIO 以引脚标签命名（`LED1`），UART、I2C、SPI 以小写的外设名
+命名（`uart0`、`i2c0`），PWM 为 `pwm_tima1_c0`；`terminal_source` 指定终端使用的串口，未设置时用第一个 UART。
+生成总是包含 `static MSPM0PowerManager power_manager;`，使用 XRobot 时把它登记为 `PowerManager`。
+流程、设置与约束的完整说明见 [MSPM0 代码生成](https://xrobot.work/docs/code_gen/mspm0)。
+
+The settings such as the buffer sizes live in `libxr_config.yaml`. GPIO objects are named after
+the pin labels (`LED1`), UART, I2C and SPI after their lowercase peripheral names (`uart0`, `i2c0`),
+and a PWM is `pwm_tima1_c0`; `terminal_source` names the UART the terminal uses, the first one when it is not
+set. The generation always emits `static MSPM0PowerManager power_manager;`, registered as a
+`PowerManager` with XRobot. The flow, the settings and their constraints are described in
+[MSPM0 code generation](https://xrobot.work/en/docs/code_gen/mspm0).
+
+---
+
+## 🧩 从 .hpmpc 到代码 / From .hpmpc to Code
+
+`libxr hpm setup` 面向 HPM SDK 工程：根目录有 `app.yaml`，`boards/<board>/` 下有唯一的 `.hpmpc` 文件。
+步骤与 MSPM0 相同，输出也是同样的三个文件；引脚从 `.hpmpc` 中 `selectPins` 的信号和 `main.c` 在预处理
+条件之外调用的引脚函数读出，`main` 完全没有调用引脚函数时用 `boards/<board>/pinmux.c` 的 `init_bsp_pins()`。
+生成的对象按平台命名：GPIO 为 `pa10` 这样的引脚名，其余为小写的实例（`i2c3`）；GPTMR 输出为
+`pwm_gptmr0_ch1`，在 SoC 没有 PWM 外设时生成（HPM5301 生成，HPM5361 归入 Other）：
+
+`libxr hpm setup` works on an HPM SDK project: `app.yaml` at the root and the single `.hpmpc` file
+of `boards/<board>/`. The steps are the ones of MSPM0, and the output is the same three files; the
+pins are read from the signals `selectPins` selects in the `.hpmpc` and from the pinmux functions
+`main.c` calls outside preprocessor conditions, falling back to the `init_bsp_pins()` of
+`boards/<board>/pinmux.c` when `main` calls no pinmux function at all. The generated objects are named after
+the platform: GPIO takes the pin name (`pa10`) and the others the lowercase instance (`i2c3`), and
+a GPTMR output becomes `pwm_gptmr0_ch1`, generated when the SoC has no PWM peripheral (HPM5301
+generates it, on HPM5361 it is listed under Other):
+
+```bash
+$ libxr hpm setup
+[INFO] Configuration exported to: .\.config.yaml
+[INFO] System: bare metal
+[INFO] .\User\libxr_config.yaml does not exist; creating it with the default settings
+[INFO] Generated User: wrote app_main.cpp, app_main.h, libxr_config.yaml
+[INFO] Next: run `xrobot gen` to bring User/xrobot_main.hpp up to date; libxr setup does not update it
+
+===== [Configuration Summary] =====
+
+SoC: HPM5301 (QFN48)
+
+GPIO (2 pins):
+  pa10: PA10
+  pa3: PA03
+
+Active Peripherals:
+  I2C: 1 instance(s)
+    I2C3
+  PWM: 1 instance(s)
+    GPTMR0
+  Other: 7 instance(s)
+    UART0
+    UART3
+    SPI1
+    ADC0
+    ACMP
+    USBPHY
+    USB0
+```
+
+支持 HPM5301（QFN48）和 HPM5361（LQFP100、LQFP64、QFN48）。UART、SPI 等外设目前只识别，生成时列入
+Other。生成总是包含 `static HPMPowerManager power_manager;`，使用 XRobot 时把它登记为
+`PowerManager`。流程、命名与设置的完整说明见 [HPM 代码生成](https://xrobot.work/docs/code_gen/hpm)。
+
+HPM5301 (QFN48) and HPM5361 (LQFP100, LQFP64, QFN48) are supported. Peripherals such as UART and
+SPI are recognized for now and listed under Other in the generation. The generation always emits
+`static HPMPowerManager power_manager;`, registered as a `PowerManager` with XRobot. The flow, the
+naming and the settings are described in [HPM code generation](https://xrobot.work/en/docs/code_gen/hpm).
+
+---
+
+## 📌 引脚布局 / Pin Layout
+
+`libxr pins` 按型号给出芯片的封装和引脚布局：每个引脚的封装位置、名称、类型和全部可选信号。型号的前缀决定平台，目前支持 STM32、MSPM0 和 HPM；HPM 的型号就是 SoC 名（`HPM5301`），有多个封装的 SoC（HPM5361）用 `--package` 选择（`LQFP100`、`LQFP64`、`QFN48`）。输出为 YAML，`--format json` 输出 JSON。
+
+`libxr pins` prints the package and pin layout of a chip model: for each pin its position on the package, name, type and all selectable signals. The prefix of the model chooses the platform; STM32, MSPM0 and HPM are supported. The model of an HPM is the SoC name (`HPM5301`), and a SoC with several packages (HPM5361) selects one with `--package` (`LQFP100`, `LQFP64`, `QFN48`). The output is YAML, or JSON with `--format json`.
+
+```bash
+$ libxr pins MSPM0G3507SPMR
+model: MSPM0G3507SPMR
+platform: mspm0
+part: MSPM0G3507
+package: LQFP-64(PM)
+pin_count: 64
+# ...
+- position: '33'
+  name: PA0
+  type: Default
+  signals:
+  - PA0
+  - UART0.TX
+  - I2C0.SDA
+  # ...
+  iomux_pincm: 1
+  modes:
+    PA0: 1
+    UART0.TX: 2
+    I2C0.SDA: 3
+    # ...
+```
+
+- `libxr pins -d <工程目录>` 叠加工程已选的信号：STM32 读 CubeMX 的 `.ioc`，MSPM0 读根目录的 `.syscfg`（型号取自工程，封装取自 SysConfig 的 `--package` 或 `--board` 对应的 LaunchPad），HPM 读 `boards/` 下的 `.hpmpc` 和 `main.c` 在预处理条件之外调用的引脚函数（封装由工程解析得到，也可用 `--package` 指定）。输出多一个 `project` 段：`assignments` 是每个引脚选了什么（信号、外设、功能、GPIO 标签和是否在器件数据中匹配），`peripherals` 是每个外设用到的引脚和它在 `libxr_config.yaml` 中的设置条目（`config` 是列表，每项有段、键、文件中是否已存在和当前参数）；文件默认为 `User/libxr_config.yaml`，可用 `-c` 指定。HPM 的 GPIO 是整段改名：`config` 一项的键为 `null`，`params` 是段内引脚名到新名的映射。
+- STM32 的封装由型号决定（`STM32H723VGT6` 为 LQFP100）；MSPM0 的封装取自型号后缀中的代码（`MSPM0G3507SPMR` 的 `PM`），型号中没有时用 `--package` 给出（`LQFP-64`、`PM` 或 `LQFP-64(PM)`）；HPM 的型号是 SoC 名，只有一种封装的 SoC（HPM5301）不必给出封装，`-d` 时封装取自 `.hpmpc`。
+- `pin_count` 是封装上的位置数。一个位置可以有多个条目：STM32G0 的 PA9 和 PA11 可以互换，共用一个位置。
+- `peripherals` 列出从信号名识别出的全部外设和每个功能可选的引脚（`USART1` 的 `TX` 可以接 `PA9`、`PB6`、`PB14`）。识别只看信号名，ETH、FMC、OctoSPI 这些 LibXR 没有对应抽象的外设也会列出。普通 GPIO 按端口列出（`GPIOA` 的 `P9` 是 `PA9`）；STM32 的外部中断列为 `EXTI`，`LINE9` 可以来自任一端口的第 9 脚，STM32 的引脚另有 `gpio_modes`（Input、Output、Analog、EXTI 等）；有输出通道的定时器带 `capabilities: [pwm]`。TI 的器件数据没有中断信息，所以 MSPM0 不列 `EXTI`。
+- MSPM0 的引脚还有 `iomux_pincm` 和每个信号的模式号 `modes`。
+- MSPM0 外设的设置取自 `.syscfg`（SysConfig 的配置脚本）：每个已选外设的 `sysconfig` 有它的模块、名字（`UART_0`）和参数（`targetBaudRate`、`enabledInterrupts` 等），`project.sysconfig_file` 是读取的文件。只读，修改在 SysConfig 里进行；表达式原样保留为字符串，引脚的指定和求解器内部的项不收。
+- 数据来自厂商：STM32 来自 ST 的 [STM32_open_pin_data](https://github.com/STMicroelectronics/STM32_open_pin_data)（BSD-3-Clause），MSPM0 来自 TI SysConfig 的器件数据（TI 有限许可，只可用于 TI 器件），HPM 来自 HPM SDK 的 `hpm_iomux.h`、`hpm_soc_ip.h`（BSD-3-Clause）和 HPM5300 数据手册的引脚表。数据文件和各份许可证文本在 `src/libxr/pin_data/`，随包分发；用 `scripts/build_pin_data.py` 重新生成。 MSPM0 的 `.syscfg` 里可能只写了 `--board`（LaunchPad），封装由 MSPM0 SDK 的板子定义得到（`mspm0_boards.json`，BSD-3-Clause，许可证文本为 `LICENSE-TI-BOARDS.txt`）。
+
+- `libxr pins -d <project directory>` overlays the signals a project has selected: the CubeMX `.ioc` for an STM32, the `.syscfg` at the root for an MSPM0 (the model comes from the project, and the package from SysConfig's `--package` or the LaunchPad its `--board` names), and the `.hpmpc` under `boards/` plus the pinmux functions `main.c` calls outside preprocessor conditions for an HPM (the package comes from the project, or from `--package`). The output gets a `project` section: `assignments` is what each pin selected (signal, peripheral, function, GPIO label and whether it matched the device data), and `peripherals` the pins each peripheral uses and its entries in `libxr_config.yaml` (`config` is a list whose items carry the section, the key, whether the file already has it and the current parameters); the file is `User/libxr_config.yaml` by default or the one given with `-c`. The GPIO rename of an HPM is one whole section: the `config` item has the key `null`, and `params` maps the pin names of the section to their new names.
+- The package of an STM32 is part of the model (`STM32H723VGT6` is LQFP100); that of an MSPM0 comes from the code in the model suffix (`PM` of `MSPM0G3507SPMR`), or from `--package` when the model has none (`LQFP-64`, `PM` or `LQFP-64(PM)`); the model of an HPM is the SoC name, a SoC with one package (HPM5301) needs no package, and with `-d` the package comes from the `.hpmpc`.
+- `pin_count` is the number of positions on the package. A position can have several entries: PA9 and PA11 of an STM32G0 can be swapped and share one position.
+- `peripherals` lists every peripheral recognized from the signal names, with the pins that can carry each function (`TX` of `USART1` can use `PA9`, `PB6` or `PB14`). Recognition looks at the signal names only, so peripherals LibXR has no abstraction for, such as ETH, FMC and OctoSPI, are listed too. Plain GPIO is listed by port (`P9` of `GPIOA` is `PA9`); the external interrupts of an STM32 are listed as `EXTI`, where `LINE9` can come from pin 9 of any port, and an STM32 pin also has `gpio_modes` (Input, Output, Analog, EXTI, ...); a timer with output channels carries `capabilities: [pwm]`. TI's device data has no interrupt information, so an MSPM0 lists no `EXTI`.
+- An MSPM0 pin also has `iomux_pincm` and `modes`, the mode of each signal.
+- The settings of an MSPM0 peripheral come from the `.syscfg`, the configuration script of SysConfig: each selected peripheral has a `sysconfig` with its module, its name (`UART_0`) and its parameters (`targetBaudRate`, `enabledInterrupts`, ...), and `project.sysconfig_file` is the file read. They are read-only, edited in SysConfig; an expression is kept as written, as a string, and pin assignments and the solver's own items are left out.
+- The data comes from the vendors: STM32 from ST's [STM32_open_pin_data](https://github.com/STMicroelectronics/STM32_open_pin_data) (BSD-3-Clause), MSPM0 from the device data of TI SysConfig (TI limited license, for TI devices only), and HPM from the `hpm_iomux.h` and `hpm_soc_ip.h` of the HPM SDK (BSD-3-Clause) and the pin tables of the HPM5300 datasheet. The data files and the license texts are in `src/libxr/pin_data/` and are distributed with the package; `scripts/build_pin_data.py` rebuilds them. A `.syscfg` of an MSPM0 may name only a `--board` (a LaunchPad); the package then comes from the board definitions of the MSPM0 SDK (`mspm0_boards.json`, BSD-3-Clause, license text in `LICENSE-TI-BOARDS.txt`).
+
+---
+
 ## 🚀 命令一览 / Commands
 
 `parse` 和 `gen` 按工程所属的平台选择解析器和生成器，只属于某个平台的命令放在平台名之下。
@@ -655,7 +853,10 @@ belong to one platform sit under its name.
 | --- | --- | --- |
 | `libxr parse` | 解析工程，写出工程 YAML | Parse a project into the project YAML |
 | `libxr gen` | 由工程 YAML 生成入口源文件 | Generate the entry source from the project YAML |
+| `libxr pins` | 打印某个型号的封装和引脚布局 | Print the package and pin layout of a model |
 | `libxr stm32 setup` | 为 CubeMX 工程加入 LibXR，生成代码并接入 CMake | Add LibXR to a CubeMX project, generate the code and integrate CMake |
+| `libxr mspm0 setup` | 为 SysConfig 工程生成 LibXR 代码 | Generate LibXR code for a SysConfig project |
+| `libxr hpm setup` | 为 HPM 工程生成 LibXR 代码 | Generate LibXR code for an HPM project |
 | `libxr stm32 cubemx-gen` | 以脚本模式运行 STM32CubeMX，由 `.ioc` 重新生成 CubeMX 工程 | Run STM32CubeMX in script mode to regenerate the CubeMX project from the `.ioc` file |
 | `libxr stm32 cmake` | 把 LibXR 接入 CubeMX 的 CMake 工程 | Integrate LibXR into the CubeMX CMake project |
 | `libxr stm32 flash-info` | 打印某个型号的 Flash 布局 | Print the flash layout of a model |
