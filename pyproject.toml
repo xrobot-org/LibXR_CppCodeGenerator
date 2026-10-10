@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "libxr"
-version = "6.0.0"
+version = "6.0.1"
 description = "C++ code generator for LibXR-based embedded systems, supporting STM32 and modular robotics applications."
 requires-python = ">=3.10"
 authors = [
