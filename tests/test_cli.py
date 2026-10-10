@@ -212,10 +212,19 @@ class Options(TestCase):
         pins = {"run": "cmd_pins"}
         pins_default = {"package": None, "format": "yaml", "directory": None, "libxr_config": None}
         for argv, expected in (
-            (["parse"], {"directory": ".", "output": None, **quiet, "run": "cmd_parse"}),
             (
-                ["parse", "-d", "p", "-o", "o.yaml", "--verbose"],
-                {"directory": "p", "output": "o.yaml", **loud, "run": "cmd_parse"},
+                ["parse"],
+                {"directory": ".", "output": None, "context": "", **quiet, "run": "cmd_parse"},
+            ),
+            (
+                ["parse", "-d", "p", "-o", "o.yaml", "--context", "CortexM7", "--verbose"],
+                {
+                    "directory": "p",
+                    "output": "o.yaml",
+                    "context": "CortexM7",
+                    **loud,
+                    "run": "cmd_parse",
+                },
             ),
             (
                 ["gen", "-i", "x", "-o", "y"],

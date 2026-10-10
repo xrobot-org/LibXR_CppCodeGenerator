@@ -17,16 +17,18 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
-from fixtures import TestCase
+from fixtures import MULTICORE_IOC, MULTICORE_MXPROJECT, TestCase
 
 from libxr.cubemx_generator import (
     ACCESS_BRIDGE_OPTION,
+    DEFAULT_EXPECT_PATHS,
     FIRMWARE_TITLE,
     LICENSE_AGREE,
     WAIT,
     Dialog,
     DialogAnswer,
     DialogStopped,
+    _default_expect_paths,
     _x11_dialog_titles,
     answer_dialog,
     build_cubemx_command,
@@ -236,6 +238,58 @@ class CommandLine(CubeMXTestCase):
             FileNotFoundError, f"{absent} does not exist and is not a command on PATH"
         ):
             self.generate(cubemx_cmd=absent)
+
+
+class DefaultExpectPaths(TestCase):
+    """默认的生成结果检查路径：多核工程按每个核子工程的 Core/Inc 检查，单核按根目录。
+    The default paths generation must produce: every core's Core/Inc for a multicore
+    project, and the root paths for a single-core one.
+    """
+
+    def setUp(self):
+        super().setUp()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.project = Path(temporary.name)
+
+    def write_multicore(self):
+        """写一个能解析出 CM7/CM4 子工程的多核 .ioc 和 .mxproject，返回 .ioc 路径。
+        Write a multicore .ioc and .mxproject that resolve the CM7/CM4 subprojects and
+        return the .ioc path.
+        """
+        (self.project / "demo.ioc").write_text(MULTICORE_IOC, encoding="utf-8")
+        (self.project / ".mxproject").write_text(MULTICORE_MXPROJECT, encoding="utf-8")
+        for core in ("CM7", "CM4"):
+            (self.project / core / "Core" / "Inc").mkdir(parents=True)
+        return str(self.project / "demo.ioc")
+
+    def test_a_multicore_project_expects_every_cores_core_inc(self):
+        # 多核工程把 Core/ 生成在子工程里，检查路径跟着变；否则成功的生成被误报成失败。
+        # 子工程目录按真实路径（realpath）给出：Windows 的用户目录会解析成 8.3 短名。
+        # A multicore project generates Core/ in the subprojects, and the checked paths
+        # follow; otherwise a successful generation is reported as a failure. The
+        # subproject directories come as real paths: on Windows the user directory
+        # resolves to its 8.3 short name.
+        expected = [
+            os.path.join(os.path.realpath(self.project / core), "Core", "Inc")
+            for core in ("CM7", "CM4")
+        ]
+        self.assertEqual(_default_expect_paths(self.write_multicore()), expected)
+
+    def test_a_single_core_project_expects_the_root_paths(self):
+        (self.project / "demo.ioc").write_text("Mcu.Name=STM32F103\n", encoding="utf-8")
+        self.assertEqual(
+            _default_expect_paths(str(self.project / "demo.ioc")), DEFAULT_EXPECT_PATHS
+        )
+
+    def test_an_unreadable_layout_falls_back_to_the_root_paths(self):
+        # 布局判断失败（如 .mxproject 缺失）时退回单核的检查路径，不让检查本身报错。
+        # When the layout cannot be told (a missing .mxproject for one), the check falls
+        # back to the single-core paths instead of failing on its own.
+        (self.project / "demo.ioc").write_text(MULTICORE_IOC, encoding="utf-8")
+        self.assertEqual(
+            _default_expect_paths(str(self.project / "demo.ioc")), DEFAULT_EXPECT_PATHS
+        )
 
 
 class Generation(CubeMXTestCase):

@@ -16,7 +16,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from fixtures import IOC, GeneratorTestCase, TestCase
+from fixtures import (
+    IOC,
+    MULTICORE_IOC,
+    MULTICORE_MXPROJECT,
+    GeneratorTestCase,
+    TestCase,
+)
 
 from libxr import config_cubemx_project as cubemx_cfg
 from libxr import generator_code_stm32 as generator
@@ -667,6 +673,85 @@ class SetupRun(LibXRRemote, GeneratorTestCase):
             (project / "CMakeLists.txt")
             .read_text(encoding="utf-8")
             .endswith(stm32_cmake.include_cmake_cmd)
+        )
+
+
+class MulticoreSetup(GeneratorTestCase):
+    """多核工程的 setup：每个核各自解析硬件、生成代码和接入 CMake，XRobot 选择逐核判定。
+    The setup of a multicore project: every core parses its hardware, generates its
+    code and integrates CMake on its own, and the XRobot choice is made per core.
+    """
+
+    def setUp(self):
+        super().setUp()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        # 工程根目录只有 .ioc 和 .mxproject，Core/ 在每个核的子工程里（多核布局）。
+        # The project root holds only the .ioc and .mxproject, with Core/ in every
+        # core's subproject (the multicore layout).
+        (self.root / "demo.ioc").write_text(MULTICORE_IOC, encoding="utf-8")
+        (self.root / ".mxproject").write_text(MULTICORE_MXPROJECT, encoding="utf-8")
+        for core in ("CM7", "CM4"):
+            (self.root / core / "Core" / "Src").mkdir(parents=True)
+            (self.root / core / "Core" / "Inc").mkdir(parents=True)
+            (self.root / core / "CMakeLists.txt").write_text("", encoding="utf-8")
+        # LibXR 子模块在根目录，核通过 LIBXR_SOURCE_DIR 用它。
+        # The LibXR submodule sits in the root, and a core uses it through
+        # LIBXR_SOURCE_DIR.
+        checkout = self.root / "Middlewares" / "Third_Party" / "LibXR"
+        (checkout / "cmake").mkdir(parents=True)
+        (checkout / "cmake" / "XRobot.cmake").write_text("", encoding="utf-8")
+
+    def run_setup(self):
+        """带 mock 的 add_libxr 运行 setup_project，其余步骤真实执行。
+        Run setup_project with add_libxr mocked and every other step real.
+        """
+        with mock.patch.object(cubemx_cfg, "add_libxr"):
+            cubemx_cfg.setup_project(str(self.root))
+
+    def test_every_core_gets_its_own_configuration_and_code(self):
+        # 两个核各自解析出的硬件不同（USART3 只归 CM7，TIM6 的时基只归 CM4），各自生成
+        # 入口源文件和 CMake 接入。
+        # The two cores parse different hardware (USART3 belongs to CM7 only, and the
+        # TIM6 timebase to CM4 only) and each generates its entry source and CMake
+        # integration.
+        self.run_setup()
+        cm7 = (self.root / "CM7" / ".config.yaml").read_text(encoding="utf-8")
+        cm4 = (self.root / "CM4" / ".config.yaml").read_text(encoding="utf-8")
+        self.assertIn("Source: SysTick", cm7)
+        self.assertIn("Source: TIM6", cm4)
+        self.assertIn("USART3:", cm7)
+        self.assertNotIn("USART3:", cm4)
+        for core in ("CM7", "CM4"):
+            self.assertTrue((self.root / core / "User" / "app_main.cpp").exists())
+            self.assertTrue((self.root / core / "cmake" / "LibXR.CMake").exists())
+            self.assertIn(
+                "include(${CMAKE_CURRENT_LIST_DIR}/cmake/LibXR.CMake)",
+                (self.root / core / "CMakeLists.txt").read_text(encoding="utf-8"),
+            )
+        # CM7 的入口源文件引用 huart3，CM4 的没有：CM4 的 main.c 从不定义它，以前照抄
+        # 会在链接时失败。
+        # CM7's entry source references huart3 and CM4's does not: CM4's main.c never
+        # defines it, and copying it over used to fail the link.
+        self.assertIn("huart3", (self.root / "CM7" / "User" / "app_main.cpp").read_text())
+        self.assertNotIn("huart3", (self.root / "CM4" / "User" / "app_main.cpp").read_text())
+
+    def test_the_xrobot_choice_is_made_per_core(self):
+        # CM7 的入口源文件已按 --xrobot 生成、CM4 的是普通 LibXR：setup 后 CM7 仍是
+        # XRobot，CM4 不跟着变成 XRobot。
+        # CM7's entry source was generated with --xrobot and CM4's is plain LibXR:
+        # after setup CM7 keeps XRobot and CM4 does not follow it.
+        (self.root / "CM7" / "User").mkdir()
+        (self.root / "CM7" / "User" / "app_main.cpp").write_text(
+            self.generate(use_xrobot=True), encoding="utf-8"
+        )
+        self.run_setup()
+        self.assertIn(
+            "XR_REGISTER", (self.root / "CM7" / "User" / "app_main.cpp").read_text(encoding="utf-8")
+        )
+        self.assertNotIn(
+            "XR_REGISTER", (self.root / "CM4" / "User" / "app_main.cpp").read_text(encoding="utf-8")
         )
 
 

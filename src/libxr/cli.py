@@ -89,10 +89,13 @@ def _has_hpmpc(directory: str) -> bool:
 def _stm32_parse(args: argparse.Namespace) -> None:
     """用 STM32 解析器运行 libxr parse。
     Run libxr parse with the STM32 parser.
+
+    旧命令（见 legacy.py）的参数没有 --context。
+    The arguments of the old commands (see legacy.py) have no --context.
     """
     from libxr.peripheral_analyzer_stm32 import parse_project
 
-    parse_project(args.directory, args.output)
+    parse_project(args.directory, args.output, context=getattr(args, "context", "") or None)
 
 
 def _stm32_gen(args: argparse.Namespace) -> None:
@@ -520,6 +523,16 @@ def _add_parse(commands) -> None:
         help=tr(
             "output YAML file (default: .config.yaml in DIRECTORY)",
             "输出的 YAML 文件（默认：DIRECTORY 中的 .config.yaml）",
+        ),
+    )
+    parser.add_argument(
+        "--context",
+        default="",
+        help=tr(
+            "CubeMX context to parse, one core of a multicore project "
+            "(for example CortexM4 or CortexM7; default: all cores together)",
+            "要解析的 CubeMX 上下文，多核工程的一个核"
+            "（如 CortexM4 或 CortexM7；默认：所有核一起解析）",
         ),
     )
 

@@ -308,25 +308,26 @@ def _add_missing(settings: str, name: str, line: str, after: str | None = None) 
     return settings.rstrip("\n") + "\n" + line + "\n"
 
 
-def _follow_xrobot_choice(settings: str, use_xrobot: bool) -> str:
+def _follow_xrobot_choice(settings: str, use_xrobot: bool, line: str = "") -> str:
     """让设置块中的 XROBOT_MODULES_DIR 与入口源文件的选择一致，返回新内容。
     Make XROBOT_MODULES_DIR in the settings block agree with the choice of the entry source and
     return the new content.
 
-    使用 XRobot 而没有这一设置时，在 LIBXR_DRIVER 之后加入 XROBOT_MODULES_DIR_LINE；不使用 XRobot
-    而有这一设置时删除它。每次改动都记录一条说明。
-    With XRobot and no such setting, XROBOT_MODULES_DIR_LINE is added after LIBXR_DRIVER; without
-    XRobot, an existing setting is removed. Each change is logged.
+    使用 XRobot 而没有这一设置时，在 LIBXR_DRIVER 之后加入 line（默认 XROBOT_MODULES_DIR_LINE）；
+    不使用 XRobot 而有这一设置时删除它。每次改动都记录一条说明。
+    With XRobot and no such setting, line (XROBOT_MODULES_DIR_LINE by default) is added after
+    LIBXR_DRIVER; without XRobot, an existing setting is removed. Each change is logged.
     """
+    line = line or XROBOT_MODULES_DIR_LINE
     setting = re.compile(r"^[ \t]*set\s*\(\s*XROBOT_MODULES_DIR\b[^\n]*\n?", re.MULTILINE)
     if use_xrobot and not setting.search(settings):
         logging.info(
             tr(
-                f"LibXR.CMake: added {XROBOT_MODULES_DIR_LINE}, as User/app_main.cpp uses XRobot",
-                f"LibXR.CMake：User/app_main.cpp 使用了 XRobot，已加入 {XROBOT_MODULES_DIR_LINE}",
+                f"LibXR.CMake: added {line}, as User/app_main.cpp uses XRobot",
+                f"LibXR.CMake：User/app_main.cpp 使用了 XRobot，已加入 {line}",
             )
         )
-        return _add_missing(settings, "XROBOT_MODULES_DIR", XROBOT_MODULES_DIR_LINE, "LIBXR_DRIVER")
+        return _add_missing(settings, "XROBOT_MODULES_DIR", line, "LIBXR_DRIVER")
     if not use_xrobot and setting.search(settings):
         logging.info(
             tr(
@@ -339,7 +340,12 @@ def _follow_xrobot_choice(settings: str, use_xrobot: bool) -> str:
 
 
 def _complete_settings(
-    settings: str, system: str, use_xrobot: bool, opt_debug: str, opt_release: str
+    settings: str,
+    system: str,
+    use_xrobot: bool,
+    opt_debug: str,
+    opt_release: str,
+    xrobot_line: str = "",
 ) -> str:
     """补全并校正设置块：LIBXR_SYSTEM 取检测到的系统，缺少的 LIBXR_DRIVER 和优化级别补上默认值，
     XROBOT_MODULES_DIR 与入口源文件的选择一致；其余内容不动。
@@ -349,7 +355,7 @@ def _complete_settings(
     """
     settings = _set_system(settings, system)
     settings = _add_missing(settings, "LIBXR_DRIVER", "set(LIBXR_DRIVER st)", "LIBXR_SYSTEM")
-    settings = _follow_xrobot_choice(settings, use_xrobot)
+    settings = _follow_xrobot_choice(settings, use_xrobot, xrobot_line)
     sources, debug, release = _setting_lines(opt_debug, opt_release, USER_SOURCES_GLOB)
     settings = _add_missing(settings, "LIBXR_USER_SOURCES_GLOB", sources)
     settings = _add_missing(settings, "LIBXR_OPT_DEBUG", debug)
@@ -690,23 +696,34 @@ def migrate_libxr_cmake(content: str, cmake_dir: str) -> tuple[str, str]:
     return settings, "\n\n".join(after)
 
 
-def update_or_create_libxr_cmake(file_path: str, system: str, use_xrobot: bool) -> None:
+def update_or_create_libxr_cmake(
+    file_path: str, system: str, use_xrobot: bool, xrobot_modules_dir_line: str = ""
+) -> None:
     """生成 LibXR.CMake，或把已有的文件重写为固定结构。
     Generate LibXR.CMake, or rewrite an existing file into the fixed structure.
 
     已有的新格式文件保留 “Project settings” 块（只校正 LIBXR_SYSTEM 和 XROBOT_MODULES_DIR，补上缺少
     的设置）和 “Kept” 块，其余块重新生成；旧格式的文件见 migrate_libxr_cmake()。新文件只在
-    use_xrobot 为真时设置 XROBOT_MODULES_DIR。内容有变化时才写回。
+    use_xrobot 为真时设置 XROBOT_MODULES_DIR，设置行用 xrobot_modules_dir_line（多核工程的核指向
+    工程根目录的 Modules，见 integrate()），缺省时用 XROBOT_MODULES_DIR_LINE；已有的
+    XROBOT_MODULES_DIR 不动。内容有变化时才写回。
     An existing file in the current format keeps its "Project settings" block (only LIBXR_SYSTEM
     and XROBOT_MODULES_DIR are corrected and missing settings added) and its "Kept" block, and
     the other blocks are generated again; a file in an earlier format is handled by
-    migrate_libxr_cmake(). A new file sets XROBOT_MODULES_DIR only when use_xrobot is true. The
-    file is written only when its content changes.
+    migrate_libxr_cmake(). A new file sets XROBOT_MODULES_DIR only when use_xrobot is true, with
+    xrobot_modules_dir_line as the setting line (the core of a multicore project names the
+    Modules directory of the project root, see integrate()); without it XROBOT_MODULES_DIR_LINE
+    is used. An existing XROBOT_MODULES_DIR stays. The file is written only when its content
+    changes.
     """
     cmake_path = Path(file_path)
     if not cmake_path.exists():
         settings = default_settings(system, DEFAULT_OPT_DEBUG, DEFAULT_OPT_RELEASE)
-        settings = _follow_xrobot_choice(settings, use_xrobot) if use_xrobot else settings
+        settings = (
+            _follow_xrobot_choice(settings, use_xrobot, xrobot_modules_dir_line)
+            if use_xrobot
+            else settings
+        )
         # XRobot 工程通过 LibXR 构建其 Modules；纯 LibXR 工程不得指定 Modules 目录。
         # XRobot projects build their Modules through LibXR; plain LibXR
         # projects must not name a Modules directory.
@@ -730,7 +747,12 @@ def update_or_create_libxr_cmake(file_path: str, system: str, use_xrobot: bool) 
         settings = blocks.get(SETTINGS_TITLE, "")
         kept = blocks.get(KEPT_TITLE, "")
     settings = _complete_settings(
-        settings, system, use_xrobot, DEFAULT_OPT_DEBUG, DEFAULT_OPT_RELEASE
+        settings,
+        system,
+        use_xrobot,
+        DEFAULT_OPT_DEBUG,
+        DEFAULT_OPT_RELEASE,
+        xrobot_modules_dir_line,
     )
     new_content = render_libxr_cmake(settings, kept)
     if new_content != content.replace("\r\n", "\n"):
@@ -835,13 +857,18 @@ def integrate(input_directory: str) -> None:
     Integrate LibXR into the CubeMX CMake project in input_directory.
 
     依次生成或重写 cmake/LibXR.CMake，把 cmake/starm-clang.cmake 恢复为 CubeMX 原样，并在
-    CMakeLists.txt 没有 include LibXR.CMake 时（见 includes_libxr_cmake()）追加一行。LIBXR_SYSTEM
-    由 Core/Inc 中的 FreeRTOSConfig.h 或 app_threadx.h 决定，都没有时为 None。输入目录或
-    CMakeLists.txt 不存在时以状态 1 退出。
+    CMakeLists.txt 没有 include LibXR.CMake 时（见 includes_libxr_cmake()）写进 include 块（见
+    update_cmake_include()）。LIBXR_SYSTEM 由 Core/Inc 中的 FreeRTOSConfig.h 或 app_threadx.h
+    决定，都没有时为 None。input_directory 自己没有 Middlewares/Third_Party/LibXR 而父目录有
+    （多核工程的一个核，见 project_root_for()）时，CMakeLists.txt 中的 LIBXR_SOURCE_DIR 指向父
+    目录里的子模块。输入目录或 CMakeLists.txt 不存在时以状态 1 退出。
     In order, it generates or rewrites cmake/LibXR.CMake, restores cmake/starm-clang.cmake to
-    what CubeMX wrote, and appends a line that includes LibXR.CMake to CMakeLists.txt when it
-    does not include it yet (see includes_libxr_cmake()). LIBXR_SYSTEM follows FreeRTOSConfig.h
-    or app_threadx.h in Core/Inc, and is None without either. A missing input directory or
+    what CubeMX wrote, and writes the block that includes LibXR.CMake into CMakeLists.txt when
+    it does not include it yet (see includes_libxr_cmake() and update_cmake_include()).
+    LIBXR_SYSTEM follows FreeRTOSConfig.h or app_threadx.h in Core/Inc, and is None without
+    either. When input_directory has no Middlewares/Third_Party/LibXR of its own while its
+    parent does (a core of a multicore project, see project_root_for()), the LIBXR_SOURCE_DIR
+    in CMakeLists.txt names the submodule in the parent. A missing input directory or
     CMakeLists.txt exits with status 1.
     """
 
@@ -856,6 +883,8 @@ def integrate(input_directory: str) -> None:
     if not os.path.exists(main_cmake_path):
         logging.error(tr(f"{main_cmake_path} not found.", f"找不到 {main_cmake_path}。"))
         sys.exit(1)
+
+    project_root = project_root_for(input_directory)
 
     cmake_dir = os.path.join(input_directory, "cmake")
     os.makedirs(cmake_dir, exist_ok=True)
@@ -874,20 +903,172 @@ def integrate(input_directory: str) -> None:
     else:
         system = "None"
 
-    update_or_create_libxr_cmake(file_path, system, project_uses_xrobot(input_directory))
+    # 多核工程的 XRobot Modules 常在工程根目录；核自己没有 Modules 而根目录有时，设置行指向根
+    # 目录的 Modules。LibXR.CMake 被 include 时 CMAKE_CURRENT_SOURCE_DIR 仍是核的目录，而
+    # CMAKE_CURRENT_LIST_DIR 已是 cmake/ 子目录，所以这里用 SOURCE_DIR。
+    # The XRobot Modules of a multicore project usually sit in the project root; when the core
+    # has none of its own while the root does, the setting line names the root's Modules. While
+    # LibXR.CMake is included, CMAKE_CURRENT_SOURCE_DIR still names the core's directory while
+    # CMAKE_CURRENT_LIST_DIR already names its cmake/ subdirectory, so SOURCE_DIR is used here.
+    use_xrobot = project_uses_xrobot(input_directory)
+    xrobot_modules_dir_line = ""
+    if use_xrobot and project_root != os.path.abspath(input_directory):
+        prefix = _root_prefix(input_directory, project_root)
+        if not os.path.isdir(os.path.join(input_directory, "Modules")) and os.path.isdir(
+            os.path.join(project_root, "Modules")
+        ):
+            xrobot_modules_dir_line = (
+                f'set(XROBOT_MODULES_DIR "${{CMAKE_CURRENT_SOURCE_DIR}}/{prefix}Modules")'
+            )
+
+    update_or_create_libxr_cmake(file_path, system, use_xrobot, xrobot_modules_dir_line)
 
     restore_starm_clang_toolchain(os.path.join(cmake_dir, "starm-clang.cmake"))
 
-    cmake_content = read_text_with_fallback(main_cmake_path)
-    if not includes_libxr_cmake(cmake_content):
-        with open(main_cmake_path, "a", encoding="utf-8", newline="\n") as f:
-            f.write("\n# Add LibXR\n" + include_cmake_cmd)
+    update_cmake_include(input_directory, project_root)
+
+
+# 非注释的 “# Add LibXR” 块：可选的 LIBXR_SYSTEM 行（5.x 的 xr_stm32_cmake 写的）和
+# LIBXR_SOURCE_DIR 行加上 include 行。
+# The uncommented "# Add LibXR" block: an optional LIBXR_SYSTEM line (written by the xr_stm32_cmake
+# of 5.x) and an optional LIBXR_SOURCE_DIR line plus the include line.
+_LIBXR_INCLUDE_BLOCK = re.compile(
+    r"(?ms)^"
+    r"(?:# Add LibXR[ \t]*\n)?"
+    r"(?:set\(LIBXR_SYSTEM[^\n]*\)[ \t]*\n)?"
+    r"(?:set\(LIBXR_SOURCE_DIR[^\n]*\)[ \t]*\n)?"
+    r"include\(\$\{CMAKE_CURRENT_LIST_DIR\}/(?:\.\./)?cmake/LibXR\.CMake\)[ \t]*\n?"
+)
+
+
+def project_root_for(input_directory: str) -> str:
+    """持有 LibXR 子模块的工程根目录：input_directory 自带 Middlewares/Third_Party/LibXR 时是
+    它自己，父目录带时是父目录，否则仍是它自己（找不到子模块时不改变行为）。
+    The project root holding the LibXR submodule: input_directory itself when it contains
+    Middlewares/Third_Party/LibXR, its parent when the parent does, and input_directory again
+    when neither does (a missing submodule changes nothing).
+
+    多核工程的 LibXR 子模块只加入工程根目录一次，每个核的子工程通过 LIBXR_SOURCE_DIR 用它。
+    A multicore project adds the LibXR submodule to its root once, and every core's subproject
+    uses it through LIBXR_SOURCE_DIR.
+    """
+    directory = os.path.abspath(input_directory)
+    if os.path.isdir(os.path.join(directory, "Middlewares", "Third_Party", "LibXR")):
+        return directory
+    parent = os.path.dirname(directory)
+    if os.path.isdir(os.path.join(parent, "Middlewares", "Third_Party", "LibXR")):
+        return parent
+    return directory
+
+
+def _root_prefix(input_directory: str, project_root: str) -> str:
+    """从 input_directory 到工程根目录 project_root 的相对路径前缀，带一个斜杠（同一目录时为空）。
+    The relative path prefix from input_directory to the project root project_root, with one
+    slash (empty when both are the same directory).
+    """
+    relative_root = os.path.relpath(project_root, input_directory).replace(os.sep, "/")
+    return "" if relative_root == "." else f"{relative_root}/"
+
+
+def cmake_include_block(input_directory: str, project_root: str) -> str:
+    """多核工程的一个核写进 CMakeLists.txt 的块：把 LIBXR_SOURCE_DIR 指到工程根目录里的子模块，
+    再 include 本核自己的 LibXR.CMake（其中的设置属于这一个核）。
+    The block a core of a multicore project writes into its CMakeLists.txt: LIBXR_SOURCE_DIR
+    names the submodule in the project root, then the core's own LibXR.CMake is included (its
+    settings belong to this one core).
+    """
+    prefix = _root_prefix(input_directory, project_root)
+    return (
+        "set(LIBXR_SOURCE_DIR "
+        f'"${{CMAKE_CURRENT_LIST_DIR}}/{prefix}Middlewares/Third_Party/LibXR")\n'
+        "include(${CMAKE_CURRENT_LIST_DIR}/cmake/LibXR.CMake)\n"
+    )
+
+
+def update_cmake_include(input_directory: str, project_root: str) -> None:
+    """把 include LibXR.CMake 的块写进 input_directory 的 CMakeLists.txt。
+    Write the block that includes LibXR.CMake into the CMakeLists.txt of input_directory.
+
+    单核工程（project_root 就是 input_directory）保持 6.0.0 的行为：没有 include 时追加一行。
+    多核工程的一个核没有 include 块时追加 LIBXR_SOURCE_DIR 行和 include；已有块（5.x 写的带
+    LIBXR_SYSTEM 的、只写了 include 的，或上一次运行写出的）时原位更新；已有自定义写法的
+    include（不是本模块写的块）时保留原样，不追加第二个 include。LIBXR_SOURCE_DIR 让这个核把
+    工程根目录里的 LibXR 子模块（而不是它自己没有的 Middlewares）加进构建；CMake 3.21 起的默认
+    策略下普通变量会遮蔽 LibXR.CMake 里的 CACHE PATH 默认值。
+    A single-core project (project_root is input_directory) keeps the 6.0.0 behavior: one line
+    is appended when the include is missing. A core of a multicore project without an include
+    block gains a LIBXR_SOURCE_DIR line and the include; an existing block (the 5.x one with a
+    LIBXR_SYSTEM line, one with only the include, or one written by a previous run) is updated
+    in place; a custom include this module did not write is left alone instead of gaining a
+    second one. LIBXR_SOURCE_DIR makes the core add the LibXR submodule of the project root to
+    the build, not the Middlewares it does not have itself; with the default policy of CMake
+    3.21 and later the normal variable shadows the CACHE PATH default inside LibXR.CMake.
+    """
+    main_cmake_path = os.path.join(input_directory, "CMakeLists.txt")
+    if project_root == os.path.abspath(input_directory):
+        # 单核：与 6.0.0 相同，只在没有 include 时追加。
+        # Single core: as in 6.0.0, append only when the include is missing.
+        if not os.path.exists(main_cmake_path):
+            logging.error(tr(f"{main_cmake_path} not found.", f"找不到 {main_cmake_path}。"))
+            sys.exit(1)
+        if not includes_libxr_cmake(read_text_with_fallback(main_cmake_path)):
+            with open(main_cmake_path, "a", encoding="utf-8", newline="\n") as f:
+                f.write("\n# Add LibXR\n" + include_cmake_cmd)
+            logging.info(
+                tr(
+                    "LibXR.CMake included in CMakeLists.txt.",
+                    "已在 CMakeLists.txt 中 include LibXR.CMake。",
+                )
+            )
+        else:
+            logging.info(
+                tr(
+                    "LibXR.CMake already included in CMakeLists.txt.",
+                    "CMakeLists.txt 已经 include LibXR.CMake。",
+                )
+            )
+        return
+
+    if not os.path.exists(main_cmake_path):
+        logging.error(tr(f"{main_cmake_path} not found.", f"找不到 {main_cmake_path}。"))
+        sys.exit(1)
+    content = read_text_with_fallback(main_cmake_path)
+    if _LIBXR_INCLUDE_BLOCK.search(content):
+        # 已有块：原位替换，块之外的行（如用户自己的 target_compile_definitions）不动。
+        # An existing block: replace it in place; lines outside it, such as the user's own
+        # target_compile_definitions, stay.
+        block = "# Add LibXR\n" + cmake_include_block(input_directory, project_root)
+        new_content = _LIBXR_INCLUDE_BLOCK.sub(block, content, count=1)
+        updated = True
+    elif includes_libxr_cmake(content):
         logging.info(
             tr(
-                "LibXR.CMake included in CMakeLists.txt.",
-                "已在 CMakeLists.txt 中 include LibXR.CMake。",
+                "CMakeLists.txt already includes LibXR.CMake with a custom block; left as is.",
+                "CMakeLists.txt 已用自定义的块 include LibXR.CMake；保持原样。",
             )
         )
+        return
+    else:
+        block = "# Add LibXR\n" + cmake_include_block(input_directory, project_root)
+        new_content = content.rstrip() + "\n\n" + block
+        updated = False
+    if new_content != content:
+        with open(main_cmake_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(new_content)
+        if updated:
+            logging.info(
+                tr(
+                    "LibXR.CMake include updated in CMakeLists.txt.",
+                    "已更新 CMakeLists.txt 中的 LibXR.CMake include。",
+                )
+            )
+        else:
+            logging.info(
+                tr(
+                    "LibXR.CMake included in CMakeLists.txt.",
+                    "已在 CMakeLists.txt 中 include LibXR.CMake。",
+                )
+            )
     else:
         logging.info(
             tr(

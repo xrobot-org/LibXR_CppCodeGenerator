@@ -1208,6 +1208,29 @@ def _prepare_script_path(project_dir: str, script_path: str, keep_script: bool) 
     return name, True
 
 
+def _default_expect_paths(ioc_file: str) -> Sequence[str]:
+    """默认的生成结果检查路径：单核工程为根目录的 Core/Inc 和 Drivers，多核工程为每个核
+    子工程的 Core/Inc。
+    The default paths generation must produce: Core/Inc and Drivers of the root for a
+    single-core project, and the Core/Inc of every core's subproject for a multicore one.
+
+    多核工程把 Core/ 生成在每个核的子工程里，根目录没有 Core/Inc 和 Drivers；仍按单核
+    的路径检查会把成功的生成误报成失败。
+    A multicore project generates Core/ in every core's subproject and the root has no
+    Core/Inc or Drivers; checking the single-core paths would report a successful
+    generation as a failure.
+    """
+    from libxr.config_cubemx_project import select_cube_contexts
+
+    try:
+        contexts = select_cube_contexts(ioc_file)
+    except (OSError, ValueError):
+        contexts = []
+    if contexts:
+        return [os.path.join(context["project_dir"], "Core", "Inc") for context in contexts]
+    return DEFAULT_EXPECT_PATHS
+
+
 def _normalize_expect_paths(project_dir: str, expect_paths: Sequence[str]) -> list[str]:
     """把期望路径转为绝对路径，相对路径以工程目录为基准。
     Make the expected paths absolute, resolving relative ones against the project directory.
@@ -1508,7 +1531,9 @@ def generate_cubemx_project(
             + _tail_text(stdout_text, 15)
         )
 
-    effective_expect_paths = DEFAULT_EXPECT_PATHS if expect_paths is None else expect_paths
+    effective_expect_paths = (
+        _default_expect_paths(ioc_path) if expect_paths is None else expect_paths
+    )
     missing_paths = [
         path
         for path in _normalize_expect_paths(project_dir, effective_expect_paths)

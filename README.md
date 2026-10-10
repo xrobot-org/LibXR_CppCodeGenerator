@@ -865,6 +865,22 @@ belong to one platform sit under its name.
 入门教程和完整说明见文档 / Tutorials and reference: <https://xrobot.work/docs/code_gen> ·
 <https://xrobot.work/en/docs/code_gen>
 
+### 多核工程 / Multicore projects
+
+`libxr stm32 setup` 自动识别“简单多核”的 CubeMX 工程（`.ioc` 中有 `Mcu.ContextN` 条目，且
+`.mxproject` 能把每个上下文无歧义地对应到一个生成的子工程），然后为每个核分别生成配置、
+`User/app_main.cpp` 和 `cmake/LibXR.CMake`。LibXR 子模块仍只加入工程根目录一次；核的
+`CMakeLists.txt` 通过 `LIBXR_SOURCE_DIR` 使用根目录里的子模块。单核工程的行为不变。
+`libxr parse --context CortexM7` 只解析多核工程中一个核的硬件；上下文不是 .ioc 中的核时报错退出。
+
+`libxr stm32 setup` recognizes a "simple multicore" CubeMX project automatically (`Mcu.ContextN`
+entries in the `.ioc`, with `.mxproject` mapping every context unambiguously to one generated
+subproject), then generates the configuration, `User/app_main.cpp` and `cmake/LibXR.CMake` once
+per core. The LibXR submodule is still added to the project root only once; the CMakeLists.txt
+of a core uses it through `LIBXR_SOURCE_DIR`. Single-core projects behave as before.
+`libxr parse --context CortexM7` parses the hardware of one core of a multicore project only;
+a context the `.ioc` does not hold stops with an error.
+
 ### 旧命令 / Old commands
 
 6.0.0 之前的 `xr_*` 命令仍可使用，参数与原来相同，运行时提示对应的新命令，将在 7.0.0 删除。以下几处
