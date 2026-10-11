@@ -6,6 +6,7 @@ import contextlib
 import io
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from fixtures import IOC, TestCase, run_libxr
+from fixtures import DATA, IOC, TestCase, run_libxr
 
 from libxr import cli, update_notice
 
@@ -42,7 +43,9 @@ class Platforms(TestCase):
             logs.output,
             [
                 f"ERROR:root:{self.root}: no supported platform recognized "
-                "(stm32: a directory with an STM32CubeMX .ioc file)"
+                "(stm32: a directory with an STM32CubeMX .ioc file; hpm: a directory with an "
+                "app.yaml and a .hpmpc under boards/; mspm0: a directory with a SysConfig "
+                ".syscfg file in its root)"
             ],
         )
 
@@ -95,7 +98,9 @@ class Platforms(TestCase):
             logs.output,
             [
                 "ERROR:root:.: no supported platform recognized "
-                "(stm32: a directory with an STM32CubeMX .ioc file)"
+                "(stm32: a directory with an STM32CubeMX .ioc file; hpm: a directory with an "
+                "app.yaml and a .hpmpc under boards/; mspm0: a directory with a SysConfig "
+                ".syscfg file in its root)"
             ],
         )
         self.assertFalse(output.exists())
@@ -111,8 +116,37 @@ class Platforms(TestCase):
             logs.output,
             [
                 f"ERROR:root:{config}: platform 'zephyr' is not supported "
-                "(stm32: a directory with an STM32CubeMX .ioc file)"
+                "(stm32: a directory with an STM32CubeMX .ioc file; hpm: a directory with an "
+                "app.yaml and a .hpmpc under boards/; mspm0: a directory with a SysConfig "
+                ".syscfg file in its root)"
             ],
+        )
+
+    def test_an_hpm_project_is_detected(self):
+        project = self.root / "hpm"
+        (project / "boards" / "hpm5301evklite").mkdir(parents=True)
+        shutil.copy(
+            DATA / "hpm" / "hpm5301evklite.hpmpc",
+            project / "boards" / "hpm5301evklite" / "tool_config.hpmpc",
+        )
+        (project / "app.yaml").write_text("dependency: []\n", encoding="utf-8")
+        (project / "main.c").write_text("int main(void) { init_bsp_pins(); }\n", encoding="utf-8")
+        self.assertEqual(run_libxr("parse", "-d", str(project))[0], 0)
+        self.assertEqual(
+            (project / ".config.yaml").read_text(encoding="utf-8").splitlines()[1],
+            "Platform: hpm",
+        )
+
+    def test_an_hpm_project_with_a_syscfg_is_still_hpm(self):
+        # 识别顺序与 libxr pins 和扩展一致：stm32、hpm、mspm0。
+        # The order of recognition is that of libxr pins and the extension: stm32, hpm, mspm0.
+        self.test_an_hpm_project_is_detected()
+        project = self.root / "hpm"
+        (project / "board.syscfg").write_text("// a stray SysConfig file\n", encoding="utf-8")
+        self.assertEqual(run_libxr("parse", "-d", str(project))[0], 0)
+        self.assertEqual(
+            (project / ".config.yaml").read_text(encoding="utf-8").splitlines()[1],
+            "Platform: hpm",
         )
 
     def test_a_missing_directory_is_an_error(self):
@@ -175,6 +209,8 @@ class Options(TestCase):
         loud = {"verbose": True}
         setup = {"terminal": "", "commit": "", "git_source": "auto", "git_mirrors": ""}
         toolchain = {"run": "cmd_stm32_toolchain"}
+        pins = {"run": "cmd_pins"}
+        pins_default = {"package": None, "format": "yaml", "directory": None, "libxr_config": None}
         for argv, expected in (
             (["parse"], {"directory": ".", "output": None, **quiet, "run": "cmd_parse"}),
             (
@@ -280,6 +316,32 @@ class Options(TestCase):
                 {"model": "STM32F103C8T6", **loud, "run": "cmd_stm32_flash_info"},
             ),
             (
+                ["pins", "STM32H723VGT6"],
+                {**pins_default, "model": "STM32H723VGT6", **quiet, **pins},
+            ),
+            (
+                ["pins", "MSPM0G3507", "-p", "PM", "-f", "json", "--verbose"],
+                {
+                    **pins_default,
+                    "model": "MSPM0G3507",
+                    "package": "PM",
+                    "format": "json",
+                    **loud,
+                    **pins,
+                },
+            ),
+            (
+                ["pins", "-d", "p", "-c", "c.yaml"],
+                {
+                    **pins_default,
+                    "model": None,
+                    "directory": "p",
+                    "libxr_config": "c.yaml",
+                    **quiet,
+                    **pins,
+                },
+            ),
+            (
                 ["stm32", "toolchain", "gcc"],
                 {"directory": ".", "compiler": "gcc", "std": None, **quiet, **toolchain},
             ),
@@ -294,6 +356,52 @@ class Options(TestCase):
             (
                 ["stm32", "toolchain", "clang", "-p"],
                 {"directory": ".", "compiler": "clang", "std": "picolibc", **quiet, **toolchain},
+            ),
+            (
+                ["hpm", "setup"],
+                {
+                    "directory": ".",
+                    "output": "",
+                    "xrobot": None,
+                    "libxr_config": "",
+                    **quiet,
+                    "run": "cmd_hpm_setup",
+                },
+            ),
+            (
+                ["hpm", "setup", "-d", "p", "-o", "o.cpp", "--xrobot"]
+                + ["--libxr-config", "c.yaml", "--verbose"],
+                {
+                    "directory": "p",
+                    "output": "o.cpp",
+                    "xrobot": True,
+                    "libxr_config": "c.yaml",
+                    **loud,
+                    "run": "cmd_hpm_setup",
+                },
+            ),
+            (
+                ["mspm0", "setup"],
+                {
+                    "directory": ".",
+                    "output": "",
+                    "xrobot": None,
+                    "libxr_config": "",
+                    **quiet,
+                    "run": "cmd_mspm0_setup",
+                },
+            ),
+            (
+                ["mspm0", "setup", "-d", "p", "-o", "o.cpp", "--no-xrobot"]
+                + ["--libxr-config", "c.yaml", "--verbose"],
+                {
+                    "directory": "p",
+                    "output": "o.cpp",
+                    "xrobot": False,
+                    "libxr_config": "c.yaml",
+                    **loud,
+                    "run": "cmd_mspm0_setup",
+                },
             ),
         ):
             with self.subTest(argv=argv):

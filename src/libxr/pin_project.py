@@ -1,0 +1,1069 @@
+"""libxr pins -d：把工程里已选的引脚信号叠加到布局上，并对应到 libxr_config.yaml 的外设设置。
+libxr pins -d: overlay the pin signals a project has selected on the layout, and tie them to the
+peripheral settings of libxr_config.yaml.
+
+STM32 的已选信号来自 CubeMX 的 .ioc（Pxn.Signal），MSPM0 的来自根目录 SysConfig 工程
+（.syscfg）的 $assign 行（求解器选的 $suggestSolution 作兜底），HPM 的来自 boards/ 下 .hpmpc
+里 main.c 调用的 pinmux 函数。信号按布局中该引脚的可选信号核对；核对不上的原样给出，
+matched 为 false。
+The selected signals of an STM32 come from the CubeMX .ioc (Pxn.Signal), those of an MSPM0 from
+the $assign lines of a SysConfig project (.syscfg) in the root (the solver's $suggestSolution
+as the fallback), and those of an HPM from the pinmux functions of the .hpmpc under boards/
+that the root main.c calls. A signal is checked against the selectable signals of its pin in the
+layout; one that does not match is given as it is, with matched false.
+"""
+
+import json
+import logging
+import re
+from dataclasses import dataclass
+from functools import cache
+from pathlib import Path
+
+import yaml
+from xr_syntax.i18n import tr
+
+from libxr import pin_layout
+from libxr.pin_layout import Pin, PinLayout
+
+# 外设类型到 libxr_config.yaml 的段：libxr gen 为这些类型生成对象。
+# Peripheral kind to the section of libxr_config.yaml: libxr gen generates objects for these.
+STM32_SECTIONS = {
+    "USART": "USART",
+    "UART": "USART",
+    "SPI": "SPI",
+    "I2C": "I2C",
+    "ADC": "ADC",
+    "DAC": "DAC",
+    "TIM": "TIM",
+    "CAN": "CAN",
+    "FDCAN": "FDCAN",
+    "USB_OTG": "USB",
+    "USB_DRD": "USB",
+}
+# USB 实例在 libxr_config.yaml 中的键；USB_DRD_FS 和 USB 都叫 usb_fs。
+# The key of a USB instance in libxr_config.yaml; USB_DRD_FS and USB are both usb_fs.
+USB_KEYS = {"USB_DRD_FS": "usb_fs", "USB": "usb_fs"}
+
+
+def read_ioc(path: Path) -> tuple[str, dict[str, dict], set[str]]:
+    """读取 .ioc：返回芯片型号（Mcu.UserName）、引脚键 -> {signal, label} 和启用的外设（Mcu.IPn）。
+    Read an .ioc: return the chip model (Mcu.UserName), pin key -> {signal, label} and the
+    enabled peripherals (Mcu.IPn).
+
+    引脚键可以带后缀，如 PH0-OSC_IN\\ (PH0)；转义的空格还原为空格。
+    A pin key may carry a suffix such as PH0-OSC_IN\\ (PH0); an escaped space is restored.
+    """
+    model = ""
+    pins: dict[str, dict] = {}
+    enabled: set[str] = set()
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = re.match(r"^(P[A-Z]\d+[^=]*?)\.(Signal|GPIO_Label)=(.*)$", line)
+        if match:
+            key = match.group(1).replace("\\ ", " ")
+            field = "signal" if match.group(2) == "Signal" else "label"
+            pins.setdefault(key, {})[field] = match.group(3).strip()
+        elif line.startswith("Mcu.UserName="):
+            model = line.split("=", 1)[1].strip()
+        elif re.match(r"Mcu\.IP\d+=", line):
+            enabled.add(line.split("=", 1)[1].strip())
+    return model, {key: value for key, value in pins.items() if "signal" in value}, enabled
+
+
+def find_pin(layout: PinLayout, key: str) -> Pin | None:
+    """布局中与 .ioc 引脚键对应的引脚：先按名字，再按 P<字母><数字> 开头（PH0-OSC_IN (PH0)）。
+    The pin of the layout that an .ioc pin key stands for: by name first, then by the leading
+    P<letter><digits> (PH0-OSC_IN (PH0)).
+    """
+    for pin in layout.pins:
+        if pin.name == key:
+            return pin
+    base = re.match(r"P[A-Z]\d+", key)
+    if base is None:
+        return None
+    for pin in layout.pins:
+        if re.match(rf"{base.group(0)}(?!\d)", pin.name):
+            return pin
+    return None
+
+
+def resolve_stm32(pin: Pin, signal: str, enabled: set[str]) -> dict:
+    """一个 .ioc 信号对应的外设、类型和功能。
+    The peripheral, kind and function an .ioc signal stands for.
+
+    CubeMX 在 .ioc 里有几种写法与 ST 的信号名不同：GPIO_Output、GPIO_Input 和 GPXTIn（GPIO、
+    外部中断）、S_TIM2_CH1_ETR（共享引脚）、ADCx_INP19（不带实例的 ADC 通道）、FMC_D2_DA2（
+    共用前缀的两个功能）、ETH_TXD1（省掉 MII 或 RMII）、SharedAnalog_PA4 和 COMP_DAC11_group
+    （模拟）。
+    CubeMX writes several forms in the .ioc that differ from ST's signal names: GPIO_Output,
+    GPIO_Input and GPXTIn (GPIO, external interrupt), S_TIM2_CH1_ETR (shared pin), ADCx_INP19 (an
+    ADC channel without its instance), FMC_D2_DA2 (two functions that share a prefix), ETH_TXD1
+    (MII or RMII left out), SharedAnalog_PA4 and COMP_DAC11_group (analog).
+    """
+    port_line = pin_layout.gpio_port_and_line(pin.name)
+    gpio = f"GPIO{port_line[0]}" if port_line else "GPIO"
+    function = f"P{port_line[1]}" if port_line else "GPIO"
+    if re.fullmatch(r"GPIO_(Input|Output|Analog)", signal):
+        return {"peripheral": gpio, "kind": "GPIO", "function": function, "matched": True}
+    external = re.fullmatch(r"GPXTI(\d+)", signal)
+    if external:
+        return {
+            "peripheral": "EXTI",
+            "kind": "EXTI",
+            "function": f"LINE{external.group(1)}",
+            "matched": True,
+        }
+    if signal.startswith(("SharedAnalog_", "COMP_DAC")):
+        return {"peripheral": "ANALOG", "kind": "ANALOG", "function": signal, "matched": True}
+    vendor = set(pin.signals)
+    inner = signal[2:] if signal.startswith("S_") else signal
+    shared = re.fullmatch(r"([A-Z]+)(\d*)(DFSDM\d)", inner) if signal.startswith("S_") else None
+    if shared:
+        # S_DATAIN1DFSDM1 是 DFSDM1_DATIN1。
+        # S_DATAIN1DFSDM1 is DFSDM1_DATIN1.
+        inner = f"{shared.group(3)}_{shared.group(1).replace('DATAIN', 'DATIN')}{shared.group(2)}"
+    adc = re.fullmatch(r"ADCx_(.+)", inner)
+    if adc:
+        instances = sorted(
+            {
+                pin_layout.recognize_stm32(s)[0]
+                for s in vendor
+                if re.fullmatch(rf"ADC\d*_{re.escape(adc.group(1))}", s)
+            },
+            key=pin_layout.natural_key,
+        )
+        # 有多个 ADC 可选时，取工程里启用的那个。
+        # With several ADCs to choose from, take the one the project enables.
+        if len(instances) > 1 and len([i for i in instances if i in enabled]) == 1:
+            instances = [i for i in instances if i in enabled]
+        found = {
+            "peripheral": "ADC",
+            "kind": "ADC",
+            "function": adc.group(1),
+            "matched": bool(instances),
+        }
+        if len(instances) == 1:
+            found["peripheral"] = instances[0]
+        elif instances:
+            found["candidates"] = instances
+        return found
+    if inner in vendor:
+        peripheral, kind, function = pin_layout.recognize_stm32(inner)
+        return {"peripheral": peripheral, "kind": kind, "function": function, "matched": True}
+    for known in sorted(vendor, key=len, reverse=True):
+        # FMC_D2_DA2：前一个信号 FMC_D2 加上共用前缀的 FMC_DA2。
+        # FMC_D2_DA2: the signal FMC_D2 plus FMC_DA2, which shares its prefix.
+        prefix = inner.split("_")[0] + "_"
+        if inner.startswith(known + "_") and prefix + inner[len(known) + 1 :] in vendor:
+            first = pin_layout.recognize_stm32(known)
+            second = pin_layout.recognize_stm32(prefix + inner[len(known) + 1 :])
+            return {
+                "peripheral": first[0],
+                "kind": first[1],
+                "function": f"{first[2]}/{second[2]}",
+                "matched": True,
+            }
+    for known in vendor:
+        # ETH_TXD1：ST 写成 ETH_MII_TXD1 或 ETH_RMII_TXD1。
+        # ETH_TXD1: ST writes ETH_MII_TXD1 or ETH_RMII_TXD1.
+        if known.replace("_RMII_", "_", 1).replace("_MII_", "_", 1) == inner and inner.startswith(
+            "ETH_"
+        ):
+            peripheral, kind, _ = pin_layout.recognize_stm32(known)
+            return {
+                "peripheral": peripheral,
+                "kind": kind,
+                "function": inner.split("_", 1)[1],
+                "matched": True,
+            }
+    recognized = pin_layout.recognize_stm32(inner)
+    if recognized is None:
+        return {"peripheral": gpio, "kind": "GPIO", "function": function, "matched": False}
+    return {
+        "peripheral": recognized[0],
+        "kind": recognized[1],
+        "function": recognized[2],
+        "matched": False,
+    }
+
+
+def stm32_assignments(directory: Path, layout_for) -> tuple[str, str, PinLayout, dict[str, dict]]:
+    """工程里 STM32 的已选信号：型号、来源文件、布局和 引脚名 -> 信号及其识别结果。
+    The selected signals of an STM32 in a project: the model, the source file, the layout and
+    pin name -> signal and what it was recognized as.
+
+    layout_for 由型号给出布局，使调用者可以自行决定封装。
+    layout_for gives the layout of a model, so the caller decides the package.
+    """
+    iocs = sorted(directory.glob("*.ioc"))
+    model, signals, enabled = read_ioc(iocs[0])
+    layout = layout_for(model)
+    assigned: dict[str, dict] = {}
+    for key, value in signals.items():
+        pin = find_pin(layout, key)
+        if pin is None:
+            continue
+        entry = {"signal": value["signal"], **resolve_stm32(pin, value["signal"], enabled)}
+        if "label" in value:
+            entry["label"] = value["label"]
+        assigned[pin.name] = entry
+    return model, iocs[0].name, layout, assigned
+
+
+SYSCFG_ARGS = re.compile(r"^[ \t]*(?://|\*)?[ \t]*@(v2)?[Cc]li[Aa]rgs[ \t]+(.*)$", re.M)
+
+
+@dataclass
+class Syscfg:
+    """一个 .syscfg 的 @cliArgs 里的器件、封装和板子；没有的为 None。
+    The device, package and board in the @cliArgs of a .syscfg; None for what it does not give.
+    """
+
+    device: str | None = None
+    package: str | None = None
+    board: str | None = None
+
+
+def cli_option(arguments: str, name: str) -> str | None:
+    """@cliArgs 的参数串中 --name 的值（带引号或不带）。
+    The value of --name in the argument string of an @cliArgs, quoted or not.
+    """
+    match = re.search(rf'--{name}[ \t]+(?:"([^"]*)"|(\S+))', arguments)
+    return (match.group(1) if match.group(1) is not None else match.group(2)) if match else None
+
+
+def read_syscfg(path: Path) -> Syscfg:
+    """读 .syscfg 开头的 @cliArgs 和 @v2CliArgs（后者在后，覆盖前者）。
+    Read the @cliArgs and @v2CliArgs at the top of a .syscfg (the latter comes last and overrides
+    the former).
+    """
+    info = Syscfg()
+    text = path.read_text(encoding="utf-8", errors="replace")
+    for _, arguments in sorted(SYSCFG_ARGS.findall(text), key=lambda found: found[0] == "v2"):
+        info.device = cli_option(arguments, "device") or info.device
+        info.package = cli_option(arguments, "package") or info.package
+        board = cli_option(arguments, "board")
+        info.board = board.rsplit("/", 1)[-1] if board else info.board
+    return info
+
+
+@cache
+def load_boards() -> dict:
+    """MSPM0 SDK 的板子（LP_MSPM0G3507 等）到器件和封装。
+    The boards of the MSPM0 SDK (LP_MSPM0G3507, ...) to their device and package.
+    """
+    path = pin_layout.DATA / "mspm0_boards.json"
+    return json.loads(path.read_text(encoding="utf-8"))["boards"]
+
+
+SYSCFG_MODULE = re.compile(
+    r'^const\s+(\w+)\s*=\s*scripting\.addModule\(\s*"/ti/driverlib/(\w+)"', re.M
+)
+SYSCFG_INSTANCE = re.compile(r"^const\s+(\w+)\s*=\s*(\w+)\.addInstance\(\)", re.M)
+SYSCFG_ASSIGNMENT = re.compile(r"^(\w+)((?:\.[$\w]+|\[\d+\])+)\s*=\s*(.+?);\s*$", re.M)
+SYSCFG_GPIO_PIN = re.compile(r"^\.associatedPins\[(\d+)\]\.pin\.\$assign$")
+SYSCFG_GPIO_PIN_SUGGESTED = re.compile(r"^\.associatedPins\[(\d+)\]\.pin\.\$suggestSolution$")
+SYSCFG_GPIO_NAME = re.compile(r"^\.associatedPins\[(\d+)\]\.\$name$")
+SYSCFG_PERIPH_PIN = re.compile(r"^\.peripheral\.(\w*Pin\w*)\.\$assign$")
+SYSCFG_PERIPH_PIN_SUGGESTED = re.compile(r"^\.peripheral\.(\w*Pin\w*)\.\$suggestSolution$")
+SYSCFG_ADC_PIN = re.compile(r"^[Aa][Dd][Cc]Pin(\d+)$")
+
+
+def syscfg_value(text: str):
+    """.syscfg 中赋值的右边：字符串、数字、布尔值和数组按其类型，表达式原样保留为字符串。
+    The right side of an assignment in a .syscfg: strings, numbers, booleans and arrays as what
+    they are; an expression is kept as written, as a string.
+    """
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    if re.fullmatch(r"0[xX][0-9a-fA-F]+", text):
+        return int(text, 16)
+    return text
+
+
+def read_syscfg_settings(path: Path) -> dict[str, dict]:
+    """.syscfg 中每个外设的设置：外设实例（UART0）-> 模块、名字（UART_0）和参数。
+    The settings of each peripheral in a .syscfg: the peripheral instance (UART0) -> its module,
+    its name (UART_0) and its parameters.
+
+    SysConfig 的配置是脚本：UART1.targetBaudRate = 9600; 和 UART1.peripheral.$assign = "UART0";。
+    变量 UART1 是模块 UART 的一个实例，peripheral.$assign（用户指定）或 $suggestSolution（求解器
+    给出）说明它用的外设。引脚的指定和求解器内部的 $ 项不是设置，不收。
+    The configuration of SysConfig is a script: UART1.targetBaudRate = 9600; and
+    UART1.peripheral.$assign = "UART0";. The variable UART1 is an instance of the module UART, and
+    peripheral.$assign (the user's) or $suggestSolution (the solver's) names the peripheral it
+    uses. The assignment of pins and the solver's own $ items are not settings and are left out.
+    """
+    text = path.read_text(encoding="utf-8", errors="replace")
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    text = re.sub(r"^[ \t]*//.*$", "", text, flags=re.M)
+    modules = {var: module for var, module in SYSCFG_MODULE.findall(text)}
+    instances = {
+        var: modules[module] for var, module in SYSCFG_INSTANCE.findall(text) if module in modules
+    }
+    found: dict[str, dict] = {}
+    for var, tail, value in SYSCFG_ASSIGNMENT.findall(text):
+        if var not in instances:
+            continue
+        entry = found.setdefault(
+            var,
+            {
+                "module": instances[var],
+                "name": None,
+                "assigned": None,
+                "suggested": None,
+                "params": {},
+            },
+        )
+        if tail == ".$name":
+            entry["name"] = syscfg_value(value)
+        elif tail == ".peripheral.$assign":
+            entry["assigned"] = syscfg_value(value)
+        elif tail == ".peripheral.$suggestSolution":
+            entry["suggested"] = syscfg_value(value)
+        elif not tail.startswith(".peripheral.") and "$" not in tail:
+            entry["params"][tail.lstrip(".")] = syscfg_value(value)
+    settings = {}
+    for entry in found.values():
+        peripheral = entry["assigned"] or entry["suggested"]
+        if peripheral:
+            settings[peripheral] = {
+                "module": entry["module"],
+                "name": entry["name"],
+                "params": entry["params"],
+            }
+    return settings
+
+
+def peripheral_entry(pin: Pin, instance: str, member: str) -> dict:
+    """外设引脚的叠加项：在引脚的信号表中认出 <外设>.<功能>；认不出时按成员名原样给出。
+    The overlay entry of a peripheral pin: recognize <peripheral>.<function> among the signals of
+    the pin; without a match the signal is given from the member name as it is.
+
+    成员名是 SysConfig 的引脚成员：rxPin、cs0Pin、OutPin、adcPin3（数字是 ADC 的通道）。
+    The member is a pin member of SysConfig: rxPin, cs0Pin, OutPin, adcPin3 (the digit is the
+    channel of the ADC).
+
+    TI 对 CANFD 的功能名带 CAN 前缀（CANRX、CANTX），成员名没有，按后缀核对。
+    TI names the functions of a CANFD with the CAN prefix (CANRX, CANTX) that the member names
+    leave out, so the check also accepts the suffix.
+    """
+    adc = SYSCFG_ADC_PIN.match(member)
+    target = adc.group(1) if adc else member.replace("Pin", "").upper()
+    candidates = [s for s in pin.signals if "." in s and s.split(".", 1)[0] == instance]
+    chosen = None
+    if len(candidates) == 1:
+        chosen = candidates[0]
+    else:
+        for signal in candidates:
+            function = signal.split(".", 1)[1]
+            if function.upper() == target or (target and function.upper().endswith(target)):
+                chosen = signal
+                break
+    return {
+        "signal": chosen or f"{instance}.{target}",
+        "peripheral": instance,
+        "kind": re.sub(r"\d+$", "", instance),
+        "function": chosen.split(".", 1)[1] if chosen else target,
+        "matched": chosen is not None,
+    }
+
+
+SYSCFG_GPIO_ASSIGNED = re.compile(r"^\.associatedPins\[(\d+)\]\.assigned(Pin|Port)$")
+IDENTIFIER = re.compile(r"[A-Za-z_]\w*")
+
+
+def mspm0_gpio_name(group: str, name: str) -> tuple[str, bool]:
+    """MSPM0 GPIO 对象名（libxr parse 和 libxr pins 共用）：引脚 $name 去掉 PIN_ 前缀
+    （PIN_LED1 -> LED1）；去掉后不是合法标识符时（SysConfig 的默认名 PIN_0 -> 0）是小写的组名
+    加引脚名（gpio_btn_pin_0）。第二项说明是否用了后一种。
+    The name of an MSPM0 GPIO object (shared by libxr parse and libxr pins): the pin $name
+    without its PIN_ prefix (PIN_LED1 -> LED1); when that is not a valid identifier (the
+    SysConfig default PIN_0 -> 0), the lower-case group plus pin name (gpio_btn_pin_0). The
+    second item says whether the latter was used.
+    """
+    label = name[4:] if name.startswith("PIN_") else name
+    if IDENTIFIER.fullmatch(label):
+        return label, False
+    return re.sub(r"\W", "_", f"{group}_{name}".lower()), True
+
+
+def syscfg_assignments(path: Path, layout: PinLayout) -> dict[str, dict]:
+    """.syscfg 中 MSPM0 的已选信号：引脚名 -> 信号及其识别结果。
+    The selected signals of an MSPM0 in a .syscfg: pin name -> signal and what it was recognized
+    as.
+
+    外设引脚是 <实例>.peripheral.<功能>Pin.$assign（<实例> 取 peripheral.$assign 指定的外设，
+    功能按引脚的信号表核对），GPIO 是 <变量>.associatedPins[i].pin.$assign，或 TI 例程的端口
+    加引脚号写法（组的 port 或引脚的 assignedPort，加 assignedPin）；标签是 libxr gen 生成的
+    对象名（mspm0_gpio_name）。求解器选的 $suggestSolution 兜底，$assign 优先；DMA 通道和
+    clockTree 的晶振引脚不收。
+    A peripheral pin is <instance>.peripheral.<function>Pin.$assign (the instance is the
+    peripheral peripheral.$assign names, and the function is checked against the signals of the
+    pin), a GPIO one is <variable>.associatedPins[i].pin.$assign or the port plus pin number
+    form of TI's examples (the port of the group or the assignedPort of the pin, with
+    assignedPin); the label is the object name libxr gen generates (mspm0_gpio_name). The
+    solver's $suggestSolution is the fallback, and $assign wins; the DMA channels and the
+    oscillator pins of the clock tree are left out.
+    """
+    text = path.read_text(encoding="utf-8", errors="replace")
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    text = re.sub(r"^[ \t]*//.*$", "", text, flags=re.M)
+    modules = {var: module for var, module in SYSCFG_MODULE.findall(text)}
+    # 单例外设（DAC12 等）没有 addInstance，直接配在模块变量上。
+    # A singleton peripheral (DAC12, ...) has no addInstance; the module variable is configured
+    # directly.
+    instances = dict(modules)
+    instances.update(
+        {var: modules[module] for var, module in SYSCFG_INSTANCE.findall(text) if module in modules}
+    )
+    peripheral_of: dict[str, str] = {}
+    periph_pin: dict[tuple[str, str], str] = {}
+    gpio_pin: dict[tuple[str, int], str] = {}
+    gpio_label: dict[tuple[str, int], str] = {}
+    # 端口加引脚号写法：(变量, 引脚序号) -> 端口（序号 -1 是组的 port）或引脚号。
+    # The port plus pin number form: (variable, pin index) -> port (index -1 is the port of the
+    # group) or pin number.
+    gpio_port: dict[tuple[str, int], str] = {}
+    gpio_line: dict[tuple[str, int], str] = {}
+    for var, tail, value in SYSCFG_ASSIGNMENT.findall(text):
+        if var not in instances:
+            continue
+        if tail == ".port" and instances[var] == "GPIO":
+            gpio_port[(var, -1)] = syscfg_value(value)
+            continue
+        assigned_member = SYSCFG_GPIO_ASSIGNED.match(tail)
+        if assigned_member and instances[var] == "GPIO":
+            key = (var, int(assigned_member.group(1)))
+            target = gpio_line if assigned_member.group(2) == "Pin" else gpio_port
+            target[key] = str(syscfg_value(value))
+            continue
+        if tail == ".peripheral.$assign":
+            peripheral_of[var] = syscfg_value(value)
+        elif tail == ".peripheral.$suggestSolution":
+            peripheral_of.setdefault(var, syscfg_value(value))
+        elif tail == ".$name" and instances[var] == "GPIO":
+            # 组的 $name 是没有引脚 $name 时的标签。
+            # The $name of the group is the label when a pin has no $name of its own.
+            gpio_label[(var, -1)] = syscfg_value(value)
+            continue
+        index = SYSCFG_GPIO_NAME.match(tail)
+        if index:
+            gpio_label[(var, int(index.group(1)))] = syscfg_value(value)
+            continue
+        member = SYSCFG_PERIPH_PIN.match(tail) or SYSCFG_PERIPH_PIN_SUGGESTED.match(tail)
+        if member:
+            key = (var, member.group(1))
+            # $assign 覆盖同名的 $suggestSolution。
+            # $assign overrides a $suggestSolution of the same member.
+            if member.re is SYSCFG_PERIPH_PIN or key not in periph_pin:
+                periph_pin[key] = syscfg_value(value)
+            continue
+        gpio = SYSCFG_GPIO_PIN.match(tail) or SYSCFG_GPIO_PIN_SUGGESTED.match(tail)
+        if gpio:
+            key = (var, int(gpio.group(1)))
+            if gpio.re is SYSCFG_GPIO_PIN or key not in gpio_pin:
+                gpio_pin[key] = syscfg_value(value)
+    for (var, index), line in gpio_line.items():
+        port = re.fullmatch(
+            r"PORT([A-Z])", str(gpio_port.get((var, index), gpio_port.get((var, -1))))
+        )
+        if (var, index) not in gpio_pin and port and line.isdigit():
+            gpio_pin[(var, index)] = f"P{port.group(1)}{int(line)}"
+    by_name = {pin.name: pin for pin in layout.pins}
+    assigned: dict[str, dict] = {}
+    for (var, member), pin_name in periph_pin.items():
+        instance = peripheral_of.get(var)
+        pin = by_name.get(pin_name) if instance else None
+        if pin is not None:
+            assigned[pin.name] = peripheral_entry(pin, instance, member)
+    for (var, index), pin_name in gpio_pin.items():
+        pin = by_name.get(pin_name)
+        if pin is None:
+            continue
+        port_line = pin_layout.gpio_port_and_line(pin.name)
+        entry = {
+            "signal": pin.name,
+            "peripheral": f"GPIO{port_line[0]}" if port_line else "GPIO",
+            "kind": "GPIO",
+            "function": f"P{port_line[1]}" if port_line else "GPIO",
+            "matched": pin.name in pin.signals,
+        }
+        name = gpio_label.get((var, index))
+        if name:
+            entry["label"] = mspm0_gpio_name(gpio_label.get((var, -1)) or var, name)[0]
+        assigned[pin.name] = entry
+    return assigned
+
+
+def hpm_canonical(signal: str) -> str:
+    """.hpmpc 的信号（UART0.A.TXD、GPIO.A.A[10]）到 hpm_iomux.h 的宏名（UART0_TXD、GPIO_A_10）：
+    去掉中间的 IOC 通道字母，方括号换成下划线。
+    The signal of a .hpmpc (UART0.A.TXD, GPIO.A.A[10]) to the macro name of hpm_iomux.h
+    (UART0_TXD, GPIO_A_10): the IOC channel letter in the middle goes, and brackets become
+    underscores.
+    """
+    parts = signal.split(".")
+    if len(parts) == 3:
+        parts = [parts[0], parts[2]]
+    return "_".join(parts).replace("[", "_").replace("]", "")
+
+
+HPM_DIRECTIVE = re.compile(r"^[ \t]*#[ \t]*(if|ifdef|ifndef|elif|else|endif)\b")
+HPM_CALL = re.compile(r"\b(\w+)\s*\(\s*(?:void\s*)?\)\s*;")
+HPM_MAIN = re.compile(r"\bmain\s*\([^)]*\)\s*\{")
+# C 源码里的注释和字面量：块注释、行注释、字符串和字符常量（带转义）。
+# The comments and literals of C source: block comments, line comments, string and character
+# constants (with escapes).
+C_COMMENT_OR_LITERAL = re.compile(
+    r"/\*.*?\*/|//[^\n]*|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'", re.S
+)
+
+
+@dataclass
+class HpmFunction:
+    """.hpmpc 的一个 pinmux 函数：选中的引脚（pad -> 信号和 pad 设置）和 gpiom 写下的 GPIO 设置。
+    One pinmux function of a .hpmpc: the selected pins (pad -> signal and pad settings) and the
+    GPIO settings the gpiom manager wrote.
+    """
+
+    pins: dict[str, dict]
+    gpiom: dict[str, dict]
+
+
+@dataclass
+class HpmProject:
+    """一个 .hpmpc：SoC（大写，没有给出时为 None）、封装和各 pinmux 函数，按文件中的顺序。
+    One .hpmpc: the SoC (upper case, None when not given), the package and the pinmux functions,
+    in file order.
+    """
+
+    path: Path
+    soc: str | None
+    package: str | None
+    functions: dict[str, HpmFunction]
+
+
+def _mapping(value, what: str, path: Path) -> dict:
+    """value 本身（映射），null 为空映射；其他值抛出说明 what 的 ValueError。
+    value itself when it is a mapping, an empty mapping for null; any other value raises a
+    ValueError that names what.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(
+            tr(
+                f"{path}: {what} is not a mapping; export the project again from the HPM Pinmux "
+                "Tool",
+                f"{path}：{what} 不是映射；请从 HPM Pinmux Tool 重新导出工程",
+            )
+        )
+    return value
+
+
+def read_hpmpc(path: Path) -> HpmProject:
+    """读一个 .hpmpc（允许 UTF-8 BOM）。info 和 pinmux 缺失或类型不对时抛出 ValueError；值为
+    null 的 managers、gpiom 和 selectPins 当作空。SoC 名换成大写。
+    Read a .hpmpc (a UTF-8 BOM is allowed). A missing or mistyped info or pinmux raises
+    ValueError; a null managers, gpiom or selectPins counts as empty. The SoC name is put in
+    upper case.
+    """
+    try:
+        document = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            tr(f"{path}: not a readable .hpmpc: {error}", f"{path}：无法读取的 .hpmpc：{error}")
+        ) from error
+    content = _mapping(_mapping(document, "the file", path).get("content"), "content", path)
+    if "info" not in content or "pinmux" not in content:
+        raise ValueError(
+            tr(
+                f"{path}: no info or pinmux in content; export the project again from the HPM "
+                "Pinmux Tool",
+                f"{path}：content 中没有 info 或 pinmux；请从 HPM Pinmux Tool 重新导出工程",
+            )
+        )
+    info = _mapping(content["info"], "content.info", path)
+    soc = info.get("socName")
+    soc = soc.strip().upper() if isinstance(soc, str) and soc.strip() else None
+    package = info.get("packageName")
+    raw = _mapping(
+        _mapping(content["pinmux"], "content.pinmux", path).get("functions"),
+        "content.pinmux.functions",
+        path,
+    )
+    functions: dict[str, HpmFunction] = {}
+    for name, function in raw.items():
+        where = f"content.pinmux.functions.{name}"
+        function = _mapping(function, where, path)
+        pins = {}
+        for pad, selection in _mapping(
+            function.get("selectPins"), f"{where}.selectPins", path
+        ).items():
+            selection = _mapping(selection, f"{where}.selectPins.{pad}", path)
+            signal = selection.get("signal")
+            if not isinstance(signal, str) or not signal:
+                continue
+            pins[str(pad)] = {
+                "signal": signal,
+                "padCtls": _mapping(
+                    selection.get("padCtls"), f"{where}.selectPins.{pad}.padCtls", path
+                ),
+            }
+        managers = _mapping(function.get("managers"), f"{where}.managers", path)
+        gpiom = {
+            str(pad): _mapping(value, f"{where}.managers.gpiom.{pad}", path)
+            for pad, value in _mapping(
+                managers.get("gpiom"), f"{where}.managers.gpiom", path
+            ).items()
+        }
+        functions[str(name)] = HpmFunction(pins, gpiom)
+    return HpmProject(path, soc, package if isinstance(package, str) else None, functions)
+
+
+def _blank(match: re.Match) -> str:
+    """注释或字面量换成同样多的空白，换行保留，使行号和预处理指令的位置不变。
+    A comment or literal replaced by as much white space, the newlines kept, so the lines and
+    the places of the preprocessor directives stay.
+    """
+    return re.sub(r"[^\n]", " ", match.group(0))
+
+
+def hpm_main_calls(main_c: Path, functions) -> tuple[list[str], list[str]]:
+    """main.c 的 main 函数体里调用的 pinmux 函数（functions 中的名字），按调用顺序：预处理
+    条件外的和条件里的（O2：后者不算，例如 rmcs 的 JTAG 共用引脚）。注释和字符串里的不算，
+    辅助函数里的不算；main.c 不存在或没有 main 时都为空。
+    The pinmux functions (names in functions) that the body of main in main.c calls, in call
+    order: those outside preprocessor conditions and those inside one (O2: the latter do not
+    count, such as the rmcs JTAG shared pins). Calls in comments and strings or in a helper
+    function do not count; both are empty when main.c or its main does not exist.
+    """
+    if not main_c.is_file():
+        return [], []
+    text = C_COMMENT_OR_LITERAL.sub(_blank, main_c.read_text(encoding="utf-8", errors="replace"))
+    start = HPM_MAIN.search(text)
+    if start is None:
+        return [], []
+    # main 的函数体：从它的 { 数到配对的 }。
+    # The body of main: from its { to the matching }.
+    depth, end = 0, len(text)
+    for index in range(start.end() - 1, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                end = index
+                break
+    called: list[str] = []
+    conditional: list[str] = []
+    condition = 0
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        line_start, offset = offset, offset + len(line)
+        directive = HPM_DIRECTIVE.match(line)
+        if directive:
+            if directive.group(1) in ("if", "ifdef", "ifndef"):
+                condition += 1
+            elif directive.group(1) == "endif":
+                condition = max(0, condition - 1)
+            continue
+        for call in HPM_CALL.finditer(line):
+            position = line_start + call.start()
+            name = call.group(1)
+            if not start.end() <= position < end or name not in functions:
+                continue
+            target = conditional if condition else called
+            if name not in target:
+                target.append(name)
+    return called, [name for name in conditional if name not in called]
+
+
+def hpm_called_functions(main_c: Path, functions) -> list[str]:
+    """main.c 的 main 在预处理条件外调用的 pinmux 函数，按调用顺序（见 hpm_main_calls）。
+    The pinmux functions that main in main.c calls outside preprocessor conditions, in call
+    order (see hpm_main_calls).
+    """
+    return hpm_main_calls(main_c, functions)[0]
+
+
+def hpm_active_functions(main_c: Path, functions) -> list[str]:
+    """读引脚的 pinmux 函数：main.c 在预处理条件外调用的、.hpmpc 里存在的函数。main.c 不存在
+    或根本没有调用任何 pinmux 函数时退回 init_bsp_pins；调用全在预处理条件里时不退回（O2：
+    条件里的函数不读，包括 init_bsp_pins）。
+    The pinmux functions the pins are read from: those of the .hpmpc that the root main.c calls
+    outside preprocessor conditions. The fallback is init_bsp_pins when main.c does not exist or
+    calls no pinmux function at all; there is no fallback when every call sits inside a
+    condition (O2: a function in a condition is not read, init_bsp_pins included).
+    """
+    called, conditional = hpm_main_calls(main_c, functions)
+    if called or conditional:
+        return called
+    return ["init_bsp_pins"] if "init_bsp_pins" in functions else []
+
+
+def hpm_selections(
+    project: HpmProject, active: list[str]
+) -> tuple[list[dict], list[tuple[str, str, str, str, str]]]:
+    """活动函数选中的引脚，按选择顺序：[{pad, signal, padCtls, gpiom, function}]；同一 pad 被
+    后一个函数再次选中时替换前面的记录，并记进冲突 (pad, 前一个函数, 信号, 后一个函数, 信号)。
+    The pins the active functions select, in selection order: [{pad, signal, padCtls, gpiom,
+    function}]; a pad selected again by a later function replaces the earlier record and is
+    recorded as a conflict (pad, earlier function, signal, later function, signal).
+    """
+    selections: dict[str, dict] = {}
+    conflicts = []
+    for name in active:
+        function = project.functions[name]
+        for pad, selection in function.pins.items():
+            previous = selections.get(pad)
+            if previous is not None and previous["function"] != name:
+                conflicts.append(
+                    (pad, previous["function"], previous["signal"], name, selection["signal"])
+                )
+            # 后一个为准，记录留在原来的位置。
+            # The later one wins, and the record keeps its place.
+            selections[pad] = {
+                "pad": pad,
+                "signal": selection["signal"],
+                "padCtls": selection["padCtls"],
+                "gpiom": function.gpiom.get(pad, {}),
+                "function": name,
+            }
+    return list(selections.values()), conflicts
+
+
+def hpm_assignments(hpmpc: Path, main_c: Path, layout: PinLayout) -> dict[str, dict]:
+    """.hpmpc 里 main.c 调用的 pinmux 函数的已选信号：引脚名 -> 信号及其识别结果。
+    The selected signals of the pinmux functions of the .hpmpc that the root main.c calls: pin name ->
+    signal and what it was recognized as.
+
+    信号是工具的三段式（UART0.A.TXD），化成 hpm_iomux.h 的宏名（UART0_TXD）后按引脚的信号表
+    核对；GPIO 的（GPIO.A.A[10]）与 MSPM0 一样算普通用法。.hpmpc 不带名字，没有标签。
+    A signal is the tool's three-part form (UART0.A.TXD), checked against the signals of the pin
+    as the macro name of hpm_iomux.h (UART0_TXD); a GPIO one (GPIO.A.A[10]) counts as the plain
+    use like MSPM0. The .hpmpc carries no names, so there is no label.
+    """
+    project = read_hpmpc(hpmpc)
+    by_name = {pin.name: pin for pin in layout.pins}
+    assigned: dict[str, dict] = {}
+    selections, conflicts = hpm_selections(project, hpm_active_functions(main_c, project.functions))
+    for pad, first, first_signal, second, second_signal in conflicts:
+        logging.warning(
+            hpm_conflict_message(hpmpc, pad, first, first_signal, second, second_signal)
+        )
+    for selection in selections:
+        pin = by_name.get(selection["pad"])
+        if pin is None:
+            continue
+        canonical = hpm_canonical(selection["signal"])
+        if canonical.startswith("GPIO_"):
+            port_line = pin_layout.gpio_port_and_line(pin.name)
+            assigned[pin.name] = {
+                "signal": canonical,
+                "peripheral": f"GPIO{port_line[0]}" if port_line else "GPIO",
+                "kind": "GPIO",
+                "function": f"P{int(port_line[1])}" if port_line else "GPIO",
+                "matched": canonical in pin.signals,
+            }
+            controller = hpm_gpio_controller(selection["gpiom"])
+            if controller != HPM_GPIO0_CONTROLLER:
+                assigned[pin.name]["gpio_controller"] = controller
+            continue
+        recognized = pin_layout.recognize_hpm(canonical)
+        instance, kind, pin_function = recognized or (canonical, "", "")
+        assigned[pin.name] = {
+            "signal": canonical,
+            "peripheral": instance,
+            "kind": kind,
+            "function": pin_function,
+            "matched": canonical in pin.signals,
+        }
+    return assigned
+
+
+# .hpmpc 里 gpiom 管理器的 gpioController 值：1 是 SoC 的 GPIO0（工具为它生成
+# gpiom_soc_gpio0），HPMGPIO 只驱动这一个控制器；没写时就是它。
+# The gpioController value of the gpiom manager of a .hpmpc: 1 is the GPIO0 of the SoC (the
+# tool generates gpiom_soc_gpio0 for it), the only controller HPMGPIO drives; it is the one
+# when none is written.
+HPM_GPIO0_CONTROLLER = "1"
+
+
+def hpm_gpio_controller(gpiom: dict) -> str:
+    """gpiom 设置里引脚分给的 GPIO 控制器（工具的编号）；没写时是 GPIO0。
+    The GPIO controller the gpiom settings assign the pin to (the tool's number); GPIO0 when
+    none is written.
+    """
+    return str(gpiom.get("gpioController") or HPM_GPIO0_CONTROLLER)
+
+
+def hpm_conflict_message(
+    hpmpc: Path, pad: str, first: str, first_signal: str, second: str, second_signal: str
+) -> str:
+    """两个活动函数选中同一个 pad 的警告。
+    The warning about two active functions selecting the same pad.
+    """
+    return tr(
+        f"{hpmpc}: {pad} is selected by both {first} ({first_signal}) and {second} "
+        f"({second_signal}); the later one wins",
+        f"{hpmpc}：{pad} 同时被 {first}（{first_signal}）和 {second}（{second_signal}）选中；"
+        "以后一个为准",
+    )
+
+
+def config_entries(
+    platform: str,
+    instance: str,
+    kind: str,
+    functions: dict,
+    settings: dict,
+    sysconfig: dict | None,
+    model: str | None = None,
+) -> list[dict]:
+    """一个已选外设在 libxr_config.yaml 中的设置条目；libxr gen 不生成它的设置时为空。
+    The config entries of a selected peripheral in libxr_config.yaml; empty when libxr gen does
+    not generate settings for it.
+
+    一个条目是 {section, key, present, params}。key 为 None 时条目是整段（HPM 的 GPIO 改名），
+    params 是该外设每个引脚的现名，文件里没有的为 None。PWM 一个实例有多个通道，每通道一个
+    条目；MSPM0 的定时器只有 SysConfig 模块是 PWM 的才生成，QEI 等没有。
+    An entry is {section, key, present, params}. With a None key the entry is a whole section
+    (the GPIO renames of an HPM) and params holds the current name of every pin of the
+    peripheral, None when the file has none. An instance of PWM has a channel per entry, and an
+    MSPM0 timer generates only with the SysConfig module PWM, not QEI and the like.
+    """
+
+    def keyed(section: str, name: str) -> dict:
+        """一个有键的条目：键的大小写以文件为准，文件里没有时 present 为 False。
+        A keyed entry: the case of the key is the file's, and present is False when the file has
+        none.
+        """
+        values = settings.get(section) if isinstance(settings.get(section), dict) else {}
+        actual = next((key for key in values if str(key).lower() == name), None)
+        entry = {"section": section, "key": actual or name, "present": actual is not None}
+        if actual is not None:
+            entry["params"] = values[actual]
+        return entry
+
+    def channels(pattern: str) -> list[int]:
+        """外设各引脚功能里的通道号，升序去重。
+        The channel numbers in the functions of the peripheral's pins, ascending and unique.
+        """
+        return sorted({int(match.group(1)) for f in functions if (match := re.match(pattern, f))})
+
+    if platform == "stm32":
+        section = STM32_SECTIONS.get(kind)
+        if section is None:
+            return []
+        return [keyed(section, USB_KEYS.get(instance, instance.lower()))]
+    if platform == "mspm0":
+        params = (sysconfig or {}).get("params", {})
+        # 与 libxr parse 一致：只有控制器模式的 I2C 和 SPI 生成对象（I2C 的
+        # basicEnableController 默认关闭，SPI 的 mode 默认 CONTROLLER）。
+        # As libxr parse decides: only an I2C and an SPI in controller mode generate objects
+        # (basicEnableController of an I2C is off by default, mode of an SPI is CONTROLLER).
+        if kind == "I2C" and params.get("basicEnableController") is not True:
+            return []
+        if kind == "SPI" and str(params.get("mode", "CONTROLLER")) != "CONTROLLER":
+            return []
+        if kind in ("UART", "I2C", "SPI"):
+            return [keyed(kind, instance.lower())]
+        if kind in ("TIMA", "TIMG") and sysconfig and sysconfig.get("module") == "PWM":
+            return [keyed("PWM", f"pwm_{instance.lower()}_c{n}") for n in channels(r"CCP(\d+)")]
+        return []
+    if platform == "hpm":
+        # 与 libxr parse 一致：缺 SCL 或 SDA 的 I2C 不生成。
+        # As libxr parse decides: an I2C without SCL or SDA is not generated.
+        if kind == "I2C" and {"SCL", "SDA"} <= set(functions):
+            return [keyed("I2C", instance.lower())]
+        # GPTMR 的 PWM 只在 SoC 没有 PWM 外设时生成（与解析一致）。
+        # A PWM on a GPTMR is generated only when the SoC has no PWM peripheral, as parsed.
+        if kind == "GPTMR" and not (model and pin_layout.hpm_soc_has_pwm(model)):
+            return [keyed("PWM", f"pwm_{instance.lower()}_ch{n}") for n in channels(r"COMP_(\d+)")]
+        if kind == "GPIO":
+            values = settings.get("GPIO") if isinstance(settings.get("GPIO"), dict) else {}
+            params = {}
+            for pin_name in functions.values():
+                port_line = pin_layout.gpio_port_and_line(pin_name)
+                if port_line is None:
+                    continue
+                # 名字的规则与解析器的一致：p 加端口小写字母加线号（PA03 -> pa3）；文件里的键
+                # 不分大小写，保留文件的写法（与 libxr gen 一样）。
+                # The rule of the name is the parser's: p, the lower-case port letter and the
+                # line (PA03 -> pa3); the key of the file matches in any case and keeps the
+                # file's spelling (as in libxr gen).
+                name = f"p{port_line[0].lower()}{int(port_line[1]):d}"
+                key = next((key for key in values if str(key).lower() == name), name)
+                params[key] = values.get(key)
+            if not params:
+                return []
+            return [{"section": "GPIO", "key": None, "present": bool(values), "params": params}]
+        return []
+    return []
+
+
+def project_overlay(
+    layout: PinLayout,
+    assigned: dict[str, dict],
+    config_path: Path | None,
+    sysconfig: dict[str, dict] | None = None,
+) -> dict:
+    """工程叠加结果：每个引脚的已选信号，以及每个已选外设用到的引脚和它在 libxr_config.yaml
+    中的设置。
+    The project overlay: the selected signal of each pin, and for each selected peripheral the
+    pins it uses and its settings in libxr_config.yaml.
+    """
+    settings = {}
+    if config_path is not None and config_path.is_file():
+        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        settings = loaded if isinstance(loaded, dict) else {}
+    peripherals: dict[str, dict] = {}
+    for pin_name, entry in assigned.items():
+        used = peripherals.setdefault(entry["peripheral"], {"kind": entry["kind"], "pins": {}})
+        used["pins"][entry["function"]] = pin_name
+        if entry.get("gpio_controller"):
+            used.setdefault("excluded", set()).add(pin_name)
+    for instance, used in peripherals.items():
+        # MSPM0：外设的设置在 SysConfig 工程（.syscfg）里，只读给出。
+        # MSPM0: the settings of a peripheral are in the SysConfig project (.syscfg), given read-only.
+        if sysconfig and instance in sysconfig:
+            used["sysconfig"] = sysconfig[instance]
+        entries = (
+            config_entries(
+                layout.platform,
+                instance,
+                used["kind"],
+                used["pins"],
+                settings,
+                used.get("sysconfig"),
+                layout.model,
+            )
+            if not used.get("excluded")
+            else []
+        )
+        if used.get("excluded"):
+            # HPM：分给 GPIO0 以外控制器的引脚 gen 不生成对象，也就没有改名项。
+            # HPM: gen makes no object for a pin on a controller other than GPIO0, so it has no
+            # rename entry.
+            pins = {f: p for f, p in used["pins"].items() if p not in used["excluded"]}
+            entries = config_entries(
+                layout.platform, instance, used["kind"], pins, settings, None, layout.model
+            )
+        used.pop("excluded", None)
+        if entries:
+            used["config"] = entries
+    return {
+        "assignments": dict(
+            sorted(assigned.items(), key=lambda item: pin_layout.natural_key(item[0]))
+        ),
+        "peripherals": dict(
+            sorted(peripherals.items(), key=lambda item: pin_layout.natural_key(item[0]))
+        ),
+    }
+
+
+def layout_with_project(
+    directory: str, model: str | None, package: str | None, libxr_config: str | None
+) -> dict:
+    """工程目录中的布局和叠加：识别平台，读出已选信号，给出带 project 段的布局字典。
+    The layout and overlay of a project directory: recognize the platform, read the selected
+    signals and return the layout dict with a project section.
+
+    给出 model 时以它为准，否则取自工程（STM32 的 .ioc，MSPM0 的根目录 .syscfg，HPM 的
+    boards/ 下 .hpmpc 的 SoC 名）。MSPM0 的封装取自 .syscfg 的 --package 或 --board，HPM 的取
+    自 .hpmpc 的 packageName，package 给出时以它为准。
+    libxr_config 默认为目录下的 User/libxr_config.yaml。
+    A given model wins; otherwise it comes from the project (the .ioc of an STM32, the root
+    .syscfg of an MSPM0, the SoC name of the .hpmpc under boards/ of an HPM). The package of an
+    MSPM0 comes from the --package or --board of the .syscfg, that of an HPM from the
+    packageName of the .hpmpc, and a given package wins. libxr_config defaults to
+    User/libxr_config.yaml in the directory.
+    """
+    root = Path(directory)
+    config_path = Path(libxr_config) if libxr_config else root / "User" / "libxr_config.yaml"
+    syscfg_file, sysconfig = None, {}
+    hpmpcs = sorted(root.glob("boards/*/*.hpmpc")) if (root / "app.yaml").is_file() else []
+    if sorted(root.glob("*.ioc")):
+        chip, source, layout, assigned = stm32_assignments(
+            root, lambda chip: pin_layout.layout_pins(model or chip, package)
+        )
+    elif hpmpcs:
+        if len(hpmpcs) > 1:
+            raise ValueError(
+                tr(
+                    f"{root}: several .hpmpc files under boards/; keep one",
+                    f"{root}：boards/ 下有多个 .hpmpc；请只保留一个",
+                )
+            )
+        # HPM 的工程：SoC 和封装在 .hpmpc 的 info 里，已选信号取 main.c 无条件调用的 pinmux
+        # 函数（O2：条件编译里的不算）。
+        # An HPM project: the SoC and the package are in the info of the .hpmpc, and the selected
+        # signals come from the pinmux functions main.c calls without a condition (O2: a call
+        # inside a conditional does not count).
+        project = read_hpmpc(hpmpcs[0])
+        if not (model or project.soc):
+            raise ValueError(
+                tr(
+                    f"{hpmpcs[0]} does not name a SoC; give the model",
+                    f"{hpmpcs[0]} 没有给出 SoC；请给出型号",
+                )
+            )
+        layout = pin_layout.layout_pins(model or project.soc, package or project.package)
+        assigned = hpm_assignments(hpmpcs[0], root / "main.c", layout)
+        source = hpmpcs[0].relative_to(root).as_posix()
+        # sysconfig_file 对 HPM 是 .hpmpc 本身：外设配置就住在里面。
+        # sysconfig_file is the .hpmpc itself for an HPM: the peripheral configuration lives in
+        # it.
+        syscfg_file, sysconfig = hpmpcs[0], {}
+    else:
+        syscfgs = sorted(root.glob("*.syscfg"))
+        if len(syscfgs) > 1:
+            raise ValueError(
+                tr(
+                    f"{root}: several .syscfg files in the root; keep one",
+                    f"{root}：根目录里有多个 .syscfg；请只保留一个",
+                )
+            )
+        if not syscfgs:
+            raise ValueError(
+                tr(
+                    f"{root}: no STM32CubeMX .ioc, HPM .hpmpc or root SysConfig .syscfg found",
+                    f"{root}：没有找到 STM32CubeMX 的 .ioc、HPM 的 .hpmpc 或根目录的 SysConfig"
+                    " .syscfg",
+                )
+            )
+        # SysConfig 工程在根目录：器件、封装、已选信号和设置都直接取自它，不需要跑 SysConfig。
+        # A SysConfig project in the root: device, package, selected signals and settings all
+        # come from it directly; SysConfig does not have to run.
+        meta = read_syscfg(syscfgs[0])
+        board = load_boards().get(meta.board or "")
+        # 板子型工程（--board）的器件和封装由板子表给出。
+        # A board-based project (--board) takes its device and package from the board table.
+        device = model or meta.device or (board or {}).get("device")
+        if device is None:
+            raise ValueError(
+                tr(
+                    f"{syscfgs[0]} does not name a device; give the model",
+                    f"{syscfgs[0]} 没有给出器件；请给出型号",
+                )
+            )
+        if package is None:
+            package = meta.package or (board or {}).get("package")
+        layout = pin_layout.layout_pins(device, package)
+        assigned = syscfg_assignments(syscfgs[0], layout)
+        source = syscfgs[0].name
+        syscfg_file, sysconfig = syscfgs[0], read_syscfg_settings(syscfgs[0])
+    info = pin_layout.layout_to_dict(layout)
+    info["project"] = {
+        "directory": str(root),
+        "source": source,
+        "libxr_config": str(config_path) if config_path.is_file() else None,
+        "sysconfig_file": syscfg_file.relative_to(root).as_posix() if syscfg_file else None,
+        **project_overlay(layout, assigned, config_path, sysconfig),
+    }
+    return info

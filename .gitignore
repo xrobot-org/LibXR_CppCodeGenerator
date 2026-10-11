@@ -7,6 +7,11 @@
 *.hpp
 *.c
 *.h
+# 测试固件（MSPM0 工程文件和 SysConfig 输出、HPM 工程文件）随仓库提交。
+# The test fixtures (the MSPM0 project files and SysConfig output, the HPM project files)
+# are committed with the repo.
+!tests/data/mspm0/*
+!tests/data/hpm/*
 __pycache__/
 *.pyc
 *.pyo
