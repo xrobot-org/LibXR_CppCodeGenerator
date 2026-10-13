@@ -654,3 +654,23 @@ class GenerationChecks(TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GeneratedThroughTheFileBuilder(Generation):
+    """app_main 由 CppFileBuilder 拼装，因此生成结果能被 xr-syntax 自己解析。
+    app_main is assembled by CppFileBuilder, so the generated source is something xr-syntax can
+    parse itself.
+    """
+
+    def test_the_generated_source_parses_without_diagnostics(self):
+        from xr_syntax.cpp import CppDocument
+
+        _root, code = self.generate("hpm5301evklite")
+        document = CppDocument.parse(code.encode("utf-8"))
+        self.assertEqual(document.diagnostics, ())
+        self.assertEqual(document.render_bytes(), code.encode("utf-8"))
+
+    def test_the_regenerated_source_is_the_same_bytes(self):
+        _root, code = self.generate("hpm5301evklite")
+        root, _ = self.generate("hpm5301evklite")
+        self.assertEqual((root / "User" / "app_main.cpp").read_bytes(), code.encode("utf-8"))

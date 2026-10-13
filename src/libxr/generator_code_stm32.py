@@ -19,11 +19,11 @@ import urllib.request
 from dataclasses import dataclass, replace
 
 import yaml
-from xr_syntax.cpp import CppDocument, identifier_occurrences
+from xr_syntax.cpp import CppDocument, CppFileBuilder, identifier_occurrences
+from xr_syntax.format import COLUMN_LIMIT, Braces, layout_statement
 from xr_syntax.i18n import tr
 
 from libxr import libxr_config_file, update_notice
-from libxr.cpp_layout import COLUMN_LIMIT, Braces, layout
 from libxr.libxr_config_file import LibXRConfigError
 
 # --------------------------
@@ -1826,7 +1826,7 @@ class PeripheralFactory:
 
         _use_header("stm32_adc.hpp")
         _use_handle("ADC_HandleTypeDef", f"h{name}")
-        lines = layout(
+        lines = layout_statement(
             f"static STM32ADC {name}",
             [f"&h{name}", dma_argument(f"{name}_buf"), Braces(*conversions), str(vref)],
         )
@@ -1837,7 +1837,9 @@ class PeripheralFactory:
             if channel_name in names:
                 channel_name = f"{channel_name}_rank{index + 1}"
             names.add(channel_name)
-            lines += layout(f"static auto& {channel_name} = {name}.GetChannel", [str(index)])
+            lines += layout_statement(
+                f"static auto& {channel_name} = {name}.GetChannel", [str(index)]
+            )
             if not generating_for_xrobot:
                 lines.append(f"{INDENT}UNUSED({channel_name});")
             _register_device(channel_name, "ADC")
@@ -1875,7 +1877,7 @@ class PeripheralFactory:
             var_name = f"{name}_{out_name.lower()}"
             if var_name.startswith("dac_dac_"):
                 var_name = var_name.replace("dac_dac_", "dac_")
-            lines += layout(
+            lines += layout_statement(
                 f"static STM32DAC {var_name}",
                 [f"&h{name}", channel_id, str(init_voltage), str(vref)],
             )
@@ -1907,7 +1909,9 @@ class PeripheralFactory:
         handle = f"h{name.replace('usart', 'uart')}"
         _use_header("stm32_uart.hpp")
         _use_handle("UART_HandleTypeDef", handle)
-        lines = layout(f"static STM32UART {name}", [f"&{handle}", rx_buf, tx_buf, str(tx_queue)])
+        lines = layout_statement(
+            f"static STM32UART {name}", [f"&{handle}", rx_buf, tx_buf, str(tx_queue)]
+        )
         _register_device(name, "UART")
         return "uart", lines
 
@@ -1927,7 +1931,7 @@ class PeripheralFactory:
         _use_header("stm32_i2c.hpp")
         _use_handle("I2C_HandleTypeDef", f"h{name}")
         _register_device(name, "I2C")
-        return "i2c", layout(
+        return "i2c", layout_statement(
             f"static STM32I2C {name}",
             [f"&h{name}", dma_argument(f"{name}_buf"), str(dma_min_size)],
         )
@@ -1955,7 +1959,7 @@ class PeripheralFactory:
             complementary = ch_cfg.get("Complementary", False)
             if complementary and ch_num.endswith("n"):
                 ch_num = ch_num[:-1]
-            lines += layout(
+            lines += layout_statement(
                 f"static STM32PWM {dev_name}",
                 [f"&h{name}", f"TIM_CHANNEL_{ch_num}", "true" if complementary else "false"],
             )
@@ -1975,7 +1979,7 @@ class PeripheralFactory:
         _use_header("stm32_canfd.hpp")
         _use_handle("FDCAN_HandleTypeDef", f"h{name}")
         _register_device(name, "FDCAN")
-        return "can", layout(f"static STM32CANFD {name}", [f"&h{name}", str(queue_size)])
+        return "can", layout_statement(f"static STM32CANFD {name}", [f"&h{name}", str(queue_size)])
 
     @staticmethod
     def _generate_can(instance: str, config: dict) -> tuple:
@@ -1996,7 +2000,7 @@ class PeripheralFactory:
             "CAN",
             tr(f"classic CAN peripheral {instance}", f"经典 CAN 外设 {instance}"),
         )
-        return "can", layout(f"static STM32CAN {name}", [f"&h{name}", str(queue_size)])
+        return "can", layout_statement(f"static STM32CAN {name}", [f"&h{name}", str(queue_size)])
 
     @staticmethod
     def _generate_spi(instance: str, config: dict) -> tuple:
@@ -2047,7 +2051,7 @@ class PeripheralFactory:
         _use_header("stm32_spi.hpp")
         _use_handle("SPI_HandleTypeDef", f"h{name}")
         _register_device(name, "SPI")
-        return "spi", layout(
+        return "spi", layout_statement(
             f"static STM32SPI {name}", [f"&h{name}", rx_buf, tx_buf, str(dma_min_size)]
         )
 
@@ -2071,7 +2075,7 @@ class PeripheralFactory:
         _use_header("stm32_watchdog.hpp")
         _use_handle("IWDG_HandleTypeDef", f"h{name}")
         _register_device(name, "Watchdog")
-        return "watchdog", layout(
+        return "watchdog", layout_statement(
             f"static STM32Watchdog {name}", [f"&h{name}", str(timeout_ms), str(feed_ms)]
         )
 
@@ -2171,7 +2175,7 @@ class PeripheralFactory:
 
         title = name.replace("_", " ")
         lines = [f"{INDENT}// {title}: {len(cdcs)} CDC"]
-        lines += layout(
+        lines += layout_statement(
             f"static constexpr auto {strings} = USB::DescriptorStrings::MakeLanguagePack",
             ["USB::DescriptorStrings::Language::EN_US", f'"{manufacturer}"', f'"{product}"']
             + [f'"{serial}"'],
@@ -2192,7 +2196,7 @@ class PeripheralFactory:
             # A set interface names both the control and the data interface; the host tells the
             # CDCs that share VID:PID apart by it.
             interface = cdc["interface"].replace('"', '\\"')
-            lines += layout(
+            lines += layout_statement(
                 f"static USB::CDCUart {cdc_name}",
                 [
                     endpoint(data_in),
@@ -2235,7 +2239,7 @@ class PeripheralFactory:
                 )
                 configs.append(Braces(buffer(f"ep{data + 1}_in_buf"), "16", "true"))
             endpoints = [Braces(*configs)]
-        lines += layout(
+        lines += layout_statement(
             f"static {instance_type} {inst_lower}",
             [f"&{pcd_handle}"]
             + endpoints
@@ -2750,7 +2754,7 @@ def _generate_core_system(project_data: dict) -> list[str]:
         handler = f"h{source.lower()}"
         if source.startswith("TIM"):
             _use_handle("TIM_HandleTypeDef", handler)
-        timebase = layout("static STM32TimerTimebase timebase", [f"&{handler}"])
+        timebase = layout_statement("static STM32TimerTimebase timebase", [f"&{handler}"])
     else:
         # 默认使用 SysTick / Default to SysTick
         timebase = [f"{INDENT}static STM32Timebase timebase;"]
@@ -2774,7 +2778,7 @@ def _generate_core_system(project_data: dict) -> list[str]:
     return (
         [f"{INDENT}// Timebase and platform"]
         + timebase
-        + layout("PlatformInit", init_args)
+        + layout_statement("PlatformInit", init_args)
         + [f"{INDENT}static STM32PowerManager power_manager;"]
     )
 
@@ -2790,7 +2794,7 @@ def generate_gpio_config(project_data: dict) -> list[str]:
     lines = []
     for port, config in project_data.get("GPIO", {}).items():
         name, arguments = generate_gpio_declaration(port, config, project_data)
-        lines += layout(f"static STM32GPIO {name}", arguments)
+        lines += layout_statement(f"static STM32GPIO {name}", arguments)
     if not lines:
         return []
     _use_header("stm32_gpio.hpp")
@@ -2919,7 +2923,7 @@ def configure_watchdog(project_data: dict) -> list[str]:
                 "Watchdog.thread_priority", wdg_config.setdefault("thread_priority", 3)
             )
             lines.append(f"{INDENT}static Thread {name}_thread;")
-            lines += layout(
+            lines += layout_statement(
                 f"{name}_thread.Create",
                 [
                     watchdog,
@@ -2930,7 +2934,7 @@ def configure_watchdog(project_data: dict) -> list[str]:
                 ],
             )
         else:
-            lines += layout(
+            lines += layout_statement(
                 f"static auto {name}_task = Timer::CreateTask",
                 [f"{name}.TaskFun", watchdog, str(feed_interval)],
             )
@@ -3018,7 +3022,7 @@ def configure_terminal(project_data: dict) -> list[str]:
     ]
     if run_as_thread:
         lines.append(f"{INDENT}static Thread term_thread;")
-        lines += layout(
+        lines += layout_statement(
             "term_thread.Create",
             [
                 "&terminal",
@@ -3029,7 +3033,7 @@ def configure_terminal(project_data: dict) -> list[str]:
             ],
         )
     else:
-        lines += layout(
+        lines += layout_statement(
             "static auto terminal_task = Timer::CreateTask",
             ["terminal.TaskFun", "&terminal", "10"],
         )
@@ -3296,13 +3300,13 @@ def generate_full_code(
     Generate the full content of the app_main source file and put back the User Code bodies of
     the existing code.
 
-    输出已按 LibXR 的 clang-format 风格排版（见 libxr.cpp_layout），不再用 clang-format 和
+    输出已按 LibXR 的 clang-format 风格排版（见 xr_syntax.format），不再用 clang-format 和
     NOLINT 标记保护。启用 XRobot 时为每个生成的对象输出 XR_REGISTER，并在 User Code 3 之后调用
     XROBOT_MAIN()；否则 User Code 3 的默认内容是一个无限休眠的循环。启用 XRobot 时，已有代码的
     User Code 3 若仍是这个循环（或 libxr 5.x 的默认内容 XRobotMain(peripherals);）则被清空，否则
     XROBOT_MAIN() 永远执行不到。User Code 中其他用到 HardwareContainer 的代码被拒绝（见
     reject_user_hardware_container()）。flash_map 为假表示没有 flash_map.hpp，这时不能启用数据库。
-    The output is laid out in the clang-format style of LibXR (see libxr.cpp_layout) and is
+    The output is laid out in the clang-format style of LibXR (see xr_syntax.format) and is
     not protected by clang-format and NOLINT markers. With XRobot every generated object gets
     an XR_REGISTER line and XROBOT_MAIN() is called after User Code 3; otherwise the default
     body of User Code 3 is a loop that sleeps forever. With XRobot, a User Code 3 of the
@@ -3368,16 +3372,32 @@ def generate_full_code(
     if use_xrobot:
         lines.append(f"{INDENT}XROBOT_MAIN();")
     lines.append("}")
-    generated = "\n".join(lines) + "\n"
+    generated = _assemble_source(lines)
     check_gpio_names(project_data, generated, use_xrobot)
     return _preserve_generated_regions(existing_code, generated)
 
 
-APP_MAIN_HEADER = (
-    "#pragma once\n"
-    + GENERATED_NOTICE
-    + "\n"
-    + """
+def _assemble_source(lines: list[str]) -> str:
+    """把生成的行交给 CppFileBuilder 拼成整份文件：每一行原样追加，最后解析一次。
+    Hand the generated lines to CppFileBuilder: every line is appended as written and the whole
+    file is parsed once at the end.
+
+    结果里有用户手写的 User Code 区域，所以不要求解析结果没有诊断；解析一次是为了让生成结果和读取
+    已有源码走同一套模型，生成器写出自己读不了的东西时能立刻发现。
+    The result holds hand-written User Code regions, so a clean parse is not required; the one parse
+    keeps the generated file and the reading of existing source on the same model, so a generator
+    that writes something it cannot read is caught at once.
+    """
+    builder = CppFileBuilder()
+    for line in lines:
+        builder.raw(line)
+    return builder.build().render()
+
+
+# app_main.h 中 extern "C" 声明的正文；pragma once、生成说明和空行由 app_main_header() 拼上。
+# The body of the extern "C" declaration of app_main.h; app_main_header() adds pragma once, the
+# generated-file notice and the blank line.
+APP_MAIN_HEADER_BODY = """\
 #ifdef __cplusplus
 extern "C"
 {
@@ -3387,9 +3407,20 @@ extern "C"
 
 #ifdef __cplusplus
 }
-#endif
-"""
-)
+#endif"""
+
+
+def app_main_header() -> str:
+    """app_main.h 的内容：pragma once、生成说明和 extern "C" 的声明。
+    The content of app_main.h: pragma once, the generated-file notice and the extern "C"
+    declaration.
+    """
+    builder = CppFileBuilder()
+    builder.directive("#pragma once")
+    builder.raw(GENERATED_NOTICE)
+    builder.raw("")
+    builder.raw(APP_MAIN_HEADER_BODY)
+    return builder.build(require_clean=True).render()
 
 
 def generate_flash_map_cpp(flash_info: dict) -> str:
@@ -3469,12 +3500,16 @@ def flash_map_header(flash_info: dict, mcu_model: str) -> str:
     The content of flash_map.hpp: the generated-file notice, the MCU type, the includes and the
     code of generate_flash_map_cpp().
     """
-    return (
-        f"#pragma once\n{GENERATED_NOTICE}\n// MCU: {mcu_model}\n\n"
-        '#include "main.h"\n#include "stm32_flash.hpp"\n\n'
-        + generate_flash_map_cpp(flash_info)
-        + "\n"
-    )
+    builder = CppFileBuilder()
+    builder.directive("#pragma once")
+    builder.raw(GENERATED_NOTICE)
+    builder.raw(f"// MCU: {mcu_model}")
+    builder.raw("")
+    builder.include("main.h")
+    builder.include("stm32_flash.hpp")
+    builder.raw("")
+    builder.raw(generate_flash_map_cpp(flash_info))
+    return builder.build(require_clean=True).render()
 
 
 def _remove_generated(path: str) -> bool:
@@ -3618,7 +3653,7 @@ def generate(
             os.path.basename(output_path): generate_full_code(
                 project_data, use_xrobot, existing_code, flash_info is not None
             ),
-            "app_main.h": APP_MAIN_HEADER,
+            "app_main.h": app_main_header(),
         }
         if flash_info is None:
             files["flash_map.hpp"] = None
