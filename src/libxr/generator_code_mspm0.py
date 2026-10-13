@@ -67,10 +67,10 @@ import re
 import sys
 
 from xr_syntax.cpp import CppDocument
+from xr_syntax.format import Braces, layout_statement
 from xr_syntax.i18n import tr
 
 from libxr import generator_code_stm32 as stm32
-from libxr.cpp_layout import Braces, layout
 from libxr.generator_code_stm32 import GENERATED_NOTICE, INDENT
 
 # generator_code_stm32 的其余接口（登记表、设置、写入助手）经模块属性访问：测试会用
@@ -582,7 +582,9 @@ def _gpio_section(gpio: dict) -> list[str]:
         INDENT,
     )
     for label, pin in gpio.items():
-        lines += layout(f"static MSPM0GPIO {label}", [pin["Port"], pin["PinMacro"], pin["IOMUX"]])
+        lines += layout_statement(
+            f"static MSPM0GPIO {label}", [pin["Port"], pin["PinMacro"], pin["IOMUX"]]
+        )
     return lines
 
 
@@ -622,7 +624,7 @@ def _uart_section(uarts: list, extend: set[str]) -> list[str]:
         tx_buf = f"{name}_tx_buf"
         if instance in extend:
             rx_buf = f"{name}_rx_dma_buf"
-            lines += layout(
+            lines += layout_statement(
                 f"static MSPM0UART {name}",
                 [
                     f"MSPM0_UART_EXTEND_INIT({instance}",
@@ -637,7 +639,7 @@ def _uart_section(uarts: list, extend: set[str]) -> list[str]:
                 ],
             )
             continue
-        lines += layout(
+        lines += layout_statement(
             f"static MSPM0UART {name}",
             [
                 f"MSPM0_UART_MAIN_INIT({instance}",
@@ -662,7 +664,7 @@ def _i2c_section(i2cs: list, clocks: dict[str, str]) -> list[str]:
     lines = [f"{INDENT}// I2C: polling; the buffer stages DMA transfers."]
     for name, instance, _record, _channel in i2cs:
         settings = _instance_settings("I2C", name)
-        lines += layout(
+        lines += layout_statement(
             f"static MSPM0I2C {name}",
             [
                 f"MSPM0_I2C_INIT({instance}",
@@ -717,7 +719,7 @@ def _spi_section(spis: list, clocks: dict[str, str]) -> list[str]:
                 )
             )
         settings = _instance_settings("SPI", name)
-        lines += layout(
+        lines += layout_statement(
             f"static MSPM0SPI {name}",
             [
                 f"MSPM0_SPI_INIT({instance}",
@@ -750,13 +752,15 @@ def _pwm_section(pwms: list) -> list[str]:
     ]
     frequencies: dict[str, dict[str, int]] = {}
     for name, instance, _record, channel in pwms:
-        lines += layout(f"static MSPM0PWM {name}", [f"MSPM0_PWM_CH({instance}, {channel})"])
+        lines += layout_statement(
+            f"static MSPM0PWM {name}", [f"MSPM0_PWM_CH({instance}, {channel})"]
+        )
         settings = _settings_of("PWM", name)
         frequency = settings.setdefault("frequency", None)
         if frequency is not None:
             frequency = stm32._integer(f"PWM.{name}.frequency", frequency)
             frequencies.setdefault(instance, {})[name] = frequency
-            lines += layout(f"{name}.SetConfig", [Braces(str(frequency))])
+            lines += layout_statement(f"{name}.SetConfig", [Braces(str(frequency))])
     for instance, channels in frequencies.items():
         if len(set(channels.values())) > 1:
             listed = ", ".join(f"{name} {value}" for name, value in channels.items())

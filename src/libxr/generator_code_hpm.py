@@ -45,11 +45,11 @@ import os
 import re
 import sys
 
+from xr_syntax.format import Braces, layout_statement
 from xr_syntax.i18n import tr
 
 from libxr import generator_code_stm32 as stm32
 from libxr import pin_layout
-from libxr.cpp_layout import Braces, layout
 from libxr.generator_code_stm32 import CPP_KEYWORDS, GENERATED_NOTICE, INDENT
 
 # generator_code_stm32 的其余接口（登记表、设置、写入助手）经模块属性访问：测试会用
@@ -412,7 +412,7 @@ def _gpio_section(project_data: dict, gpio: dict[str, dict]) -> list[str]:
     )
     for label, pin in gpio.items():
         port = pin["Port"]
-        lines += layout(
+        lines += layout_statement(
             f"static HPMGPIO {label}",
             ["HPM_GPIO0", f"GPIO_DI_GPIO{port}", str(pin["Line"]), f"IRQn_GPIO0_{port}"],
         )
@@ -439,7 +439,7 @@ def _i2c_section(i2cs: list) -> list[str]:
                     f"{', '.join(map(str, I2C_SPEEDS))} 之一；HPM 的 I2C 驱动只支持这几档",
                 )
             )
-        lines += layout(
+        lines += layout_statement(
             f"static HPMI2C {name}",
             [f"HPM_{instance}", f"clock_{instance.lower()}", Braces(f"{speed}U")],
         )
@@ -467,7 +467,7 @@ def _pwm_section(pwms: list) -> list[str]:
         INDENT,
     )
     for name, instance, _record, channel in pwms:
-        lines += layout(
+        lines += layout_statement(
             f"static HPMPWM {name}",
             [
                 f"reinterpret_cast<LibXRHpmPwmType*>(HPM_{instance})",
@@ -482,7 +482,7 @@ def _pwm_section(pwms: list) -> list[str]:
         frequency = _keyed_settings("PWM", name).setdefault("frequency", None)
         if frequency is not None:
             frequency = _setting_int(f"PWM.{name}.frequency", frequency)
-            lines += layout(f"{name}.SetConfig", [Braces(str(frequency))])
+            lines += layout_statement(f"{name}.SetConfig", [Braces(str(frequency))])
     return lines
 
 
