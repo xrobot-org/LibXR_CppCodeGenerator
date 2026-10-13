@@ -945,7 +945,7 @@ def generate_full_code(project_data: dict, use_xrobot: bool, existing_code: str)
     if use_xrobot:
         lines.append(f"{INDENT}XROBOT_MAIN();")
     lines.append("}")
-    generated = "\n".join(lines) + "\n"
+    generated = stm32._assemble_source(lines)
     # 与生成代码里其他名字（timebase、ramfs、terminal、时钟常量……）相同的 GPIO 名字。
     # GPIO names equal to another name of the generated code (timebase, ramfs, terminal, the
     # clock constants, ...).
@@ -1075,7 +1075,7 @@ def generate(
         _warn_hand_written(output_path, existing_code, code)
         files = {
             os.path.basename(output_path): code,
-            "app_main.h": stm32.APP_MAIN_HEADER,
+            "app_main.h": stm32.app_main_header(),
             "libxr_config.yaml": stm32.libxr_config_text(),
         }
 

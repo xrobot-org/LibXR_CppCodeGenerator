@@ -991,3 +991,23 @@ class Analyzer(TestCase):
         }
         self.assertEqual(analyzer._header_dma_channel("UART_0", "TX", defines), "DMA_CH_UART0_TX")
         self.assertEqual(analyzer._header_dma_channel("UART_0", "RX", defines), "DMA_CH_UART0_RX")
+
+
+class GeneratedThroughTheFileBuilder(Generation):
+    """app_main 由 CppFileBuilder 拼装，因此生成结果能被 xr-syntax 自己解析。
+    app_main is assembled by CppFileBuilder, so the generated source is something xr-syntax can
+    parse itself.
+    """
+
+    def test_the_generated_source_parses_without_diagnostics(self):
+        from xr_syntax.cpp import CppDocument
+
+        _root, code = self.generate("g3507")
+        document = CppDocument.parse(code.encode("utf-8"))
+        self.assertEqual(document.diagnostics, ())
+        self.assertEqual(document.render_bytes(), code.encode("utf-8"))
+
+    def test_the_regenerated_source_is_the_same_bytes(self):
+        _root, code = self.generate("g3507")
+        root, _ = self.generate("g3507")
+        self.assertEqual((root / "User" / "app_main.cpp").read_bytes(), code.encode("utf-8"))

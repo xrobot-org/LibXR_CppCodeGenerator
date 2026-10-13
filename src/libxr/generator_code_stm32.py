@@ -19,7 +19,7 @@ import urllib.request
 from dataclasses import dataclass, replace
 
 import yaml
-from xr_syntax.cpp import CppDocument, identifier_occurrences
+from xr_syntax.cpp import CppDocument, CppFileBuilder, identifier_occurrences
 from xr_syntax.format import COLUMN_LIMIT, Braces, layout_statement
 from xr_syntax.i18n import tr
 
@@ -3372,16 +3372,32 @@ def generate_full_code(
     if use_xrobot:
         lines.append(f"{INDENT}XROBOT_MAIN();")
     lines.append("}")
-    generated = "\n".join(lines) + "\n"
+    generated = _assemble_source(lines)
     check_gpio_names(project_data, generated, use_xrobot)
     return _preserve_generated_regions(existing_code, generated)
 
 
-APP_MAIN_HEADER = (
-    "#pragma once\n"
-    + GENERATED_NOTICE
-    + "\n"
-    + """
+def _assemble_source(lines: list[str]) -> str:
+    """把生成的行交给 CppFileBuilder 拼成整份文件：每一行原样追加，最后解析一次。
+    Hand the generated lines to CppFileBuilder: every line is appended as written and the whole
+    file is parsed once at the end.
+
+    结果里有用户手写的 User Code 区域，所以不要求解析结果没有诊断；解析一次是为了让生成结果和读取
+    已有源码走同一套模型，生成器写出自己读不了的东西时能立刻发现。
+    The result holds hand-written User Code regions, so a clean parse is not required; the one parse
+    keeps the generated file and the reading of existing source on the same model, so a generator
+    that writes something it cannot read is caught at once.
+    """
+    builder = CppFileBuilder()
+    for line in lines:
+        builder.raw(line)
+    return builder.build().render()
+
+
+# app_main.h 中 extern "C" 声明的正文；pragma once、生成说明和空行由 app_main_header() 拼上。
+# The body of the extern "C" declaration of app_main.h; app_main_header() adds pragma once, the
+# generated-file notice and the blank line.
+APP_MAIN_HEADER_BODY = """\
 #ifdef __cplusplus
 extern "C"
 {
@@ -3391,9 +3407,20 @@ extern "C"
 
 #ifdef __cplusplus
 }
-#endif
-"""
-)
+#endif"""
+
+
+def app_main_header() -> str:
+    """app_main.h 的内容：pragma once、生成说明和 extern "C" 的声明。
+    The content of app_main.h: pragma once, the generated-file notice and the extern "C"
+    declaration.
+    """
+    builder = CppFileBuilder()
+    builder.directive("#pragma once")
+    builder.raw(GENERATED_NOTICE)
+    builder.raw("")
+    builder.raw(APP_MAIN_HEADER_BODY)
+    return builder.build(require_clean=True).render()
 
 
 def generate_flash_map_cpp(flash_info: dict) -> str:
@@ -3473,12 +3500,16 @@ def flash_map_header(flash_info: dict, mcu_model: str) -> str:
     The content of flash_map.hpp: the generated-file notice, the MCU type, the includes and the
     code of generate_flash_map_cpp().
     """
-    return (
-        f"#pragma once\n{GENERATED_NOTICE}\n// MCU: {mcu_model}\n\n"
-        '#include "main.h"\n#include "stm32_flash.hpp"\n\n'
-        + generate_flash_map_cpp(flash_info)
-        + "\n"
-    )
+    builder = CppFileBuilder()
+    builder.directive("#pragma once")
+    builder.raw(GENERATED_NOTICE)
+    builder.raw(f"// MCU: {mcu_model}")
+    builder.raw("")
+    builder.include("main.h")
+    builder.include("stm32_flash.hpp")
+    builder.raw("")
+    builder.raw(generate_flash_map_cpp(flash_info))
+    return builder.build(require_clean=True).render()
 
 
 def _remove_generated(path: str) -> bool:
@@ -3622,7 +3653,7 @@ def generate(
             os.path.basename(output_path): generate_full_code(
                 project_data, use_xrobot, existing_code, flash_info is not None
             ),
-            "app_main.h": APP_MAIN_HEADER,
+            "app_main.h": app_main_header(),
         }
         if flash_info is None:
             files["flash_map.hpp"] = None

@@ -627,7 +627,7 @@ def generate_full_code(project_data: dict, use_xrobot: bool, existing_code: str)
     if use_xrobot:
         lines.append(f"{INDENT}XROBOT_MAIN();")
     lines.append("}")
-    generated = "\n".join(lines) + "\n"
+    generated = stm32._assemble_source(lines)
     # 与生成代码里其他名字相同的 GPIO 名字（固定名单之外的）：数一数出现次数。
     # GPIO names equal to another name of the generated code (beyond the fixed list): count
     # the occurrences.
@@ -730,7 +730,7 @@ def generate(
             os.path.basename(output_path): generate_full_code(
                 project_data, use_xrobot, existing_code
             ),
-            "app_main.h": stm32.APP_MAIN_HEADER,
+            "app_main.h": stm32.app_main_header(),
             "libxr_config.yaml": stm32.libxr_config_text(),
         }
 
