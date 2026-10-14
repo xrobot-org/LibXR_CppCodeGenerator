@@ -648,8 +648,15 @@ class SetupRun(LibXRRemote, GeneratorTestCase):
         self.assertEqual(git("rev-parse", "HEAD", cwd=checkout), self.default)
         self.assertEqual(
             (project / ".gitignore").read_text(encoding="utf-8"),
-            "build/**\n.history/**\n.cache/**\n.config.yaml\nCMakeFiles/**\n",
+            "build/**\n.history/**\n.cache/**\n.config.yaml\nCMakeFiles/**\n.libxr/\n",
         )
+        # STM32CubeMX runs the post-generation script after every code generation.
+        self.assertIn(
+            "ProjectManager.UAScriptAfterPath=cmake/libxr_after_cubemx.cmd",
+            next(project.glob("*.ioc")).read_text(encoding="utf-8"),
+        )
+        self.assertTrue((project / "cmake" / "libxr_after_cubemx.cmd").is_file())
+        self.assertTrue((project / "cmake" / "libxr_after_cubemx.sh").is_file())
         self.assertIn(
             "* text=auto\n*.sh text eol=lf\n*.bat text eol=crlf\n",
             (project / ".gitattributes").read_text(encoding="utf-8"),

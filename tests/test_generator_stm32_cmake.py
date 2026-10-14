@@ -228,6 +228,7 @@ class Integration(GeneratorTestCase):
                 "Compile options",
                 "LibXR",
                 "Application",
+                "CubeMX",
                 "Library optimization",
                 "Firmware images",
                 "Application settings",
@@ -548,7 +549,7 @@ class Migration(GeneratorTestCase):
         )
         # 其余块与新文件相同。
         # The other blocks equal those of a new file.
-        for title in ("LibXR", "Application", "Library optimization", "Firmware images"):
+        for title in ("LibXR", "Application", "CubeMX", "Library optimization", "Firmware images"):
             self.assertEqual(
                 blocks[title], stm32_cmake.split_blocks(stm32_cmake.render_libxr_cmake(""))[title]
             )

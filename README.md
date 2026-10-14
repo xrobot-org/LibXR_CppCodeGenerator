@@ -185,6 +185,62 @@ LF in the repository and converted on checkout by platform, so regenerating with
 Windows or on Linux shows only real changes in the commit. An existing `.gitattributes` only
 gets the missing lines.
 
+### CubeMX 重新生成之后 / After CubeMX Generates the Code
+
+setup 把 `cmake/libxr_after_cubemx.cmd` 登记为 CubeMX 的生成后脚本（Project Manager > Code Generator >
+User Actions > After Code Generation）。此后每次在 CubeMX 中生成代码，脚本都运行 `libxr stm32 sync`：
+解析 `.ioc`、重新生成 `User/app_main.cpp`、更新 CMake 集成。同一个脚本在 Windows 上由 cmd 执行，在
+Linux 上由 sh 执行；它依次使用 `LIBXR_PYTHON` 指定的 Python 和 `PATH` 中的 Python，所用的 Python 需要
+装有 libxr。`.ioc` 中已登记别的生成后脚本时，setup 保留它，并提示在那个脚本末尾调用
+`cmake/libxr_after_cubemx.cmd`。
+
+After setup, `cmake/libxr_after_cubemx.cmd` is the post-generation script of CubeMX (Project
+Manager > Code Generator > User Actions > After Code Generation). Every time CubeMX generates the
+code, the script runs `libxr stm32 sync`: it parses the `.ioc` file, generates
+`User/app_main.cpp` again and updates the CMake integration. The same script runs under cmd on
+Windows and under sh on Linux; it uses the Python that `LIBXR_PYTHON` names, then the Python on
+`PATH`, and that Python needs libxr. When the `.ioc` file already registers another
+post-generation script, setup keeps it and asks for a call to `cmake/libxr_after_cubemx.cmd` at
+its end.
+
+CubeMX 只在 Output 窗口显示脚本的输出，脚本失败时照常完成生成。所以输出同时写进
+`.libxr/after_cubemx.log`，`User/app_main.cpp` 记下 `.ioc` 的摘要；LibXR.CMake 在配置时比对摘要，
+`.ioc` 改过而代码没有重新生成时让构建失败，报错中给出这份日志和要运行的命令：
+
+CubeMX shows the output of the script only in its Output window and completes the generation
+when the script fails. So the output also goes to `.libxr/after_cubemx.log`, and
+`User/app_main.cpp` records the digest of the `.ioc` file; LibXR.CMake compares the digest when it
+configures, and when the `.ioc` file changed without the code being generated again the build
+fails with this log and the command to run:
+
+```text
+CMake Error at cmake/LibXR.CMake:66 (message):
+  [LibXR] <project>/DevC.ioc changed after User/app_main.cpp
+  was generated, so the STM32CubeMX post-generation step failed or did not
+  run.  Run
+
+      python -m libxr stm32 sync
+
+  in <project>, or generate the code in STM32CubeMX again.
+
+  Output of its last run (<project>/.libxr/after_cubemx.log):
+
+  [LibXR] FAILED: no Python with a libxr that has `libxr stm32 sync` was
+  found (tried LIBXR_PYTHON, python, py -3).  Install or update it with `pip
+  install -U libxr`, or set LIBXR_PYTHON to the python.exe that has it, then
+  run `python -m libxr stm32 sync` in <project>.
+```
+
+USB OTG 实例由 LibXR 的驱动初始化并处理中断（见下文 USB 一节）。sync 在 `.ioc` 中关掉这些实例的
+初始化调用和中断函数生成，下次在 CubeMX 中生成代码时生效，之后 CubeMX 的代码不再引用 PCD 句柄，
+句柄和 HAL 的 PCD 代码被链接器回收。
+
+The LibXR driver initializes the USB OTG instances and handles their interrupts (see the USB
+section below). sync turns off the initialization call and the interrupt handler of these
+instances in the `.ioc` file; this takes effect the next time CubeMX generates the code, after
+which the CubeMX code no longer references the PCD handle, and the linker drops it together
+with the PCD code of HAL.
+
 ---
 
 ## 🧩 从 .ioc 到代码 / From .ioc to Code
@@ -288,15 +344,16 @@ extern "C" void app_main(void)
 
 生成的部分已按 LibXR 的 `.clang-format`（Google 风格、列宽 90、Allman 大括号）排版，clang-format 不会
 改动它们。缓冲区的对齐取决于芯片：没有数据 cache 的芯片（F1、F4 等）为 `alignas(4)`；有数据 cache 的
-F7、H7 和 N6 按 32 字节的 cache 行对齐，数组大小向上取整到整行，传给驱动的大小仍是配置的值。
-`libxr_config.yaml` 给出 `dma_section` 时，缓冲区放在这个段：
+F7、H7 和 N6 按 32 字节的 cache 行对齐，数组大小向上取整到整行，传给驱动的大小仍是配置的值。USB
+端点缓冲区在所有芯片上都按 32 字节对齐，见下文。`libxr_config.yaml` 给出 `dma_section` 时，缓冲区
+放在这个段：
 
 The generated parts are laid out by the `.clang-format` of LibXR (Google style, column limit 90,
 Allman braces), and clang-format leaves them as they are. The alignment of a buffer depends on
 the chip: a chip without a data cache (F1, F4 and others) gets `alignas(4)`; F7, H7 and N6, which
 have one, align to the 32-byte cache line and round the array up to a whole line, while the size
-a driver is told stays the configured one. With `dma_section` in `libxr_config.yaml`, the buffers
-go into that section:
+a driver is told stays the configured one. USB endpoint buffers are 32-byte aligned on every
+chip, see below. With `dma_section` in `libxr_config.yaml`, the buffers go into that section:
 
 ```cpp
 // DMA buffers (STM32H723VG: D-cache, 32-byte lines)
@@ -424,6 +481,50 @@ USB:
     cdc:
     - {tx_fifo_size: 128, rx_fifo_size: 128, queue_size: 3, interface: Console}
     - {tx_fifo_size: 128, rx_fifo_size: 128, queue_size: 3, interface: Telemetry}
+```
+
+端点缓冲区按 32 字节对齐。EP0 每个方向的缓冲区是一个槽，其余端点的缓冲区平分为两个槽，端点的包长取
+槽放得下的最大合法值：全速时每槽 32 字节用 32 字节的包，64 字节及以上用 64 字节的包；高速批量包只能是
+512 字节，所以高速时每槽至少 512 字节。数据端点取 `tx_buffer_size` 或 `rx_buffer_size`，按两个槽取整，
+分配的值与设置不同时写回 `libxr_config.yaml` 并记录一条提示；通知端点为 64 字节。
+
+Endpoint buffers are aligned to 32 bytes. The EP0 buffer of each direction is one slot, the
+buffer of any other endpoint is split into two slots, and an endpoint takes the largest legal
+packet its slot holds: at full speed a 32-byte slot gives 32-byte packets and 64 bytes or more
+give 64-byte packets; a high-speed bulk packet is 512 bytes only, so at high speed each slot is
+at least 512 bytes. A data endpoint takes `tx_buffer_size` or `rx_buffer_size` rounded to two
+slots, and an allocated value that differs from the setting is written back to
+`libxr_config.yaml` with a notice; a notification endpoint gets 64 bytes.
+
+OTG 的设备对象（`usb_otg_fs`、`usb_otg_hs`）由 LibXR 的驱动初始化控制器并处理中断，不使用 CubeMX
+生成的 PCD 句柄，CubeMX 保持默认设置即可：LibXR 在链接时包装 `HAL_PCD_Init` 和
+`HAL_PCD_IRQHandler`，`main()` 调用的 `MX_USB_OTG_FS_PCD_Init` 不再初始化控制器，CubeMX 生成的
+`OTG_FS_IRQHandler` 进入驱动。CubeMX 中取消了 `OTG_FS_IRQn` 的 Generate IRQ handler 时，生成器在
+`app_main.cpp` 中写出这个向量函数。`OTG_FS_IRQn` 必须在 NVIC 中开启。设备对象的第一个参数是硬件
+配置，由 `.ioc` 中的模式和参数得出：PHY、DMA、VBUS 检测和是否以高速枚举；开启 DMA 时另生成 64 字节的
+EP0 OUT 缓冲区，例如 `usb_otg_hs_ep0_dma_buf`：
+
+The OTG device objects (`usb_otg_fs`, `usb_otg_hs`) have the LibXR driver initialize the
+controller and handle its interrupts, without the PCD handle CubeMX generates, and CubeMX keeps
+its default settings: LibXR wraps `HAL_PCD_Init` and `HAL_PCD_IRQHandler` at link time, so the
+`MX_USB_OTG_FS_PCD_Init` that `main()` calls no longer initializes the controller and the
+`OTG_FS_IRQHandler` CubeMX generates enters the driver. With Generate IRQ handler unticked for
+`OTG_FS_IRQn` in CubeMX, the generator writes that vector function into `app_main.cpp`.
+`OTG_FS_IRQn` must be enabled in NVIC. The first argument of the device object is the hardware
+configuration, derived from the mode and parameters in the `.ioc` file: the PHY, DMA, VBUS
+sensing and whether to enumerate at high speed; with DMA there is also a 64-byte EP0 OUT buffer,
+such as `usb_otg_hs_ep0_dma_buf`:
+
+```cpp
+  static STM32USBDeviceOtgHS usb_otg_hs(
+      {STM32USBOtgDevice::Phy::EMBEDDED_FS, true, false, false, usb_otg_hs_ep0_dma_buf},
+      256, {usb_otg_hs_ep0_out_buf, usb_otg_hs_ep1_out_buf},
+      {{usb_otg_hs_ep0_in_buf, 8},
+       {usb_otg_hs_ep1_in_buf, 128},
+       {usb_otg_hs_ep2_in_buf, 16}},
+      USB::DeviceDescriptor::PacketSize0::SIZE_8, 0x1D50, 0x6199, 0x100,
+      {&usb_otg_hs_strings}, {{&usb_otg_hs_cdc}},
+      {reinterpret_cast<void*>(UID_BASE), 12});
 ```
 
 `database.enable` 为 true 时，`app_main()` 生成 `STM32Flash flash(FLASH_REGIONS, FLASH_REGION_NUMBER)`
@@ -859,6 +960,7 @@ belong to one platform sit under its name.
 | `libxr hpm setup` | 为 HPM 工程生成 LibXR 代码 | Generate LibXR code for an HPM project |
 | `libxr stm32 cubemx-gen` | 以脚本模式运行 STM32CubeMX，由 `.ioc` 重新生成 CubeMX 工程 | Run STM32CubeMX in script mode to regenerate the CubeMX project from the `.ioc` file |
 | `libxr stm32 cmake` | 把 LibXR 接入 CubeMX 的 CMake 工程 | Integrate LibXR into the CubeMX CMake project |
+| `libxr stm32 sync` | CubeMX 生成代码之后更新 LibXR 的代码；CubeMX 的生成后脚本运行它 | Update the LibXR code after CubeMX generated the project; the CubeMX post-generation script runs it |
 | `libxr stm32 flash-info` | 打印某个型号的 Flash 布局 | Print the flash layout of a model |
 | `libxr stm32 toolchain` | 切换工具链和 ST Arm Clang 的标准库 | Switch the toolchain and the ST Arm Clang standard library |
 

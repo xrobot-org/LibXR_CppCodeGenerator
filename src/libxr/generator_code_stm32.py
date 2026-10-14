@@ -43,6 +43,18 @@ used_handles = set()
 # 本次生成的 DMA 缓冲区，键为缓冲区名。
 # The DMA buffers of this generation, keyed by buffer name.
 dma_buffers = {}
+# 本次生成的中断向量函数（CubeMX 不生成时由生成器补上），每个是若干行。
+# The interrupt vector functions of this generation (written when CubeMX generates none), each
+# a list of lines.
+interrupt_vectors = []
+# 本次生成了 LibXR 设备对象的 OTG 实例（如 USB_OTG_FS）；libxr stm32 sync 据此修改 .ioc。
+# The OTG instances that got a LibXR device object in this generation (such as USB_OTG_FS);
+# libxr stm32 sync changes the .ioc file for them.
+otg_devices = []
+# 工程 Core/Src 中 CubeMX 生成的中断函数名；没有 Core/Src 时为 None，这时按 .ioc 的设置判断。
+# The interrupt handler names CubeMX generated in Core/Src of the project; None without
+# Core/Src, and the .ioc settings decide then.
+cubemx_irq_handlers: set[str] | None = None
 # 本次生成是否带 --xrobot：不带时不被引用的通道引用用 UNUSED 标记。
 # Whether this generation has --xrobot: without it, channel references nothing uses are
 # marked with UNUSED.
@@ -122,6 +134,8 @@ def initialize_registry(use_xrobot: bool) -> None:
     used_headers.clear()
     used_handles.clear()
     dma_buffers.clear()
+    interrupt_vectors.clear()
+    otg_devices.clear()
     if use_xrobot:
         _register_device("power_manager", "PowerManager", tr("power manager", "电源管理器"))
 
@@ -935,6 +949,130 @@ def _pcd_handle(instance: str, config: dict) -> str | None:
     return config.get("PCDHandle") or f"hpcd_{name}"
 
 
+# CubeMX 中 OTG_HS 使用外部 ULPI PHY 和内置高速 PHY 的设备模式，取自 CubeMX 数据库中这些模式
+# 的 phy_itface；其余模式（如 Device_Only_FS）使用内置全速 PHY。
+# The OTG_HS device modes in CubeMX that use an external ULPI PHY and the embedded high-speed
+# PHY, from the phy_itface of these modes in the CubeMX database; the other modes (such as
+# Device_Only_FS) use the embedded full-speed PHY.
+_OTG_ULPI_MODES = {"Device_HS", "OTG/Dual_Role_Device_HS", "External_Phy_Device"}
+_OTG_EMBEDDED_HS_MODES = {
+    "Internal_Phy_Device",
+    "Dual_Role_Device",
+    "Dual-Role-Device",
+    "OTG/Dual_Role_Device",
+    "OTG/Dual-Role-Device-HS",
+}
+# 显式写在 .ioc 中的 phy_itface 到 STM32USBOtgDevice::Phy。
+# An explicit phy_itface in the .ioc file to STM32USBOtgDevice::Phy.
+_OTG_PHY_PARAMETERS = {
+    "PCD_PHY_EMBEDDED": "EMBEDDED_FS",
+    "USB_OTG_EMBEDDED_PHY": "EMBEDDED_FS",
+    "USB_OTG_ULPI_PHY": "ULPI",
+    "PCD_PHY_ULPI": "ULPI",
+    "USB_OTG_HS_EMBEDDED_PHY": "EMBEDDED_HS",
+    "PCD_PHY_UTMI": "EMBEDDED_HS",
+}
+
+
+def _otg_hardware(name: str, config: dict) -> dict:
+    """OTG 实例的硬件配置，对应 LibXR 的 STM32USBOtgDevice::HardwareConfig：phy（Phy 的枚举名）、
+    dma、vbus_sensing 和 high_speed。
+    The hardware configuration of an OTG instance, matching STM32USBOtgDevice::HardwareConfig of
+    LibXR: phy (the enumerator name of Phy), dma, vbus_sensing and high_speed.
+
+    参数取实例的全局参数和设备模式 profile 中的参数。.ioc 只写出与默认值不同的参数，CubeMX 中
+    dma_enable 和 vbus_sensing_enable 默认为 DISABLE。PHY 取显式的 phy_itface，否则按模式：
+    USB_OTG_HS 的 _OTG_ULPI_MODES 为 ULPI，_OTG_EMBEDDED_HS_MODES 为内置高速 PHY，其余为内置全速
+    PHY。高速 PHY 默认以高速枚举，speed 为 *_HIGH_IN_FULL 或 *_FULL 时以全速枚举。
+    The parameters are the global ones of the instance and those of its device-mode profile.
+    The .ioc file lists only parameters that differ from their defaults; in CubeMX dma_enable
+    and vbus_sensing_enable default to DISABLE. The PHY is the explicit phy_itface, otherwise
+    by mode: on USB_OTG_HS, _OTG_ULPI_MODES use ULPI and _OTG_EMBEDDED_HS_MODES the embedded
+    high-speed PHY; anything else uses the embedded full-speed PHY. A high-speed PHY
+    enumerates at high speed by default and at full speed when speed is *_HIGH_IN_FULL or
+    *_FULL.
+    """
+    params = {key: value for key, value in config.items() if key != "profiles"}
+    for profile in (config.get("profiles") or {}).values():
+        if "Device" in str(profile.get("VirtualMode", "")):
+            params.update(profile)
+    mode = str(params.get("VirtualMode", ""))
+    phy = _OTG_PHY_PARAMETERS.get(str(params.get("phy_itface", "")))
+    if phy is None:
+        phy = "EMBEDDED_FS"
+        if name == "USB_OTG_HS" and mode in _OTG_ULPI_MODES:
+            phy = "ULPI"
+        elif name == "USB_OTG_HS" and mode in _OTG_EMBEDDED_HS_MODES:
+            phy = "EMBEDDED_HS"
+    speed = str(params.get("speed", ""))
+    return {
+        "phy": phy,
+        "dma": params.get("dma_enable") == "ENABLE",
+        "vbus_sensing": params.get("vbus_sensing_enable") == "ENABLE",
+        "high_speed": phy != "EMBEDDED_FS" and not speed.endswith("FULL"),
+    }
+
+
+def _otg_vector(name: str, config: dict) -> list[str]:
+    """OTG 实例的中断向量函数：CubeMX 生成了中断函数时为空列表，否则是调用驱动 Dispatch() 的
+    向量函数定义。
+    The interrupt vector function of an OTG instance: an empty list when CubeMX generates the
+    interrupt handler, otherwise the definition of a vector function that calls the driver's
+    Dispatch().
+
+    CubeMX 保持默认设置即可：LibXR 在链接时包装 HAL_PCD_Init() 和 HAL_PCD_IRQHandler()，main()
+    调用的 MX_<实例>_PCD_Init() 不再初始化控制器，CubeMX 生成的 <实例>_IRQHandler() 进入驱动。
+    取消了 Generate IRQ handler 时向量函数由这里生成。设置取自解析器记下的 InitCalled、
+    InitStatic 和 Vectors（见 USBParser）；旧的解析结果没有这些键时按 CubeMX 默认处理。初始化
+    函数没有调用且为 static 时记录警告：没有调用的 static 函数会产生编译警告。
+    CubeMX can keep its default settings: LibXR wraps HAL_PCD_Init() and HAL_PCD_IRQHandler()
+    at link time, so MX_<instance>_PCD_Init() called from main() no longer initializes the
+    controller and the <instance>_IRQHandler() CubeMX generates enters the driver. With
+    Generate IRQ handler unticked, the vector function is generated here. The settings come
+    from InitCalled, InitStatic and Vectors that the parser records (see USBParser); an older
+    parse result without these keys is treated as the CubeMX default. An initialization
+    function that is not called and static gets a warning: an uncalled static function draws
+    a compiler warning.
+
+    Raises:
+        LibXRConfigError: NVIC 中没有开启 <实例>_IRQn；没有它 USB 不会有任何中断。
+            <instance>_IRQn is not enabled in NVIC; without it USB gets no interrupt at all.
+    """
+    stem = name[len("USB_") :]
+    main_irq = f"{stem}_IRQn"
+    vectors = config.get("Vectors")
+    main = dict((vectors or {}).get(main_irq, {"Enabled": True, "Handler": True}))
+    if cubemx_irq_handlers is not None:
+        # The generated sources decide: the .ioc file may already be changed while the code
+        # in Core/Src still comes from the earlier settings.
+        main["Handler"] = f"{stem}_IRQHandler" in cubemx_irq_handlers
+    if not main.get("Enabled"):
+        raise LibXRConfigError(
+            tr(
+                f"{name}: {main_irq} is not enabled; enable it in STM32CubeMX NVIC",
+                f"{name}：没有开启 {main_irq}；请在 STM32CubeMX 的 NVIC 中开启",
+            )
+        )
+    function = f"MX_{name}_PCD_Init"
+    if config.get("InitStatic") and not config.get("InitCalled", True):
+        logging.warning(
+            tr(
+                f"{name}: {function} is static and not called; untick its Visibility (Static) "
+                "in Project Manager > Advanced Settings to avoid an unused-function warning",
+                f"{name}：{function} 是 static 且没有调用；请在 Project Manager > Advanced "
+                "Settings 中取消它的 Visibility (Static)，以免产生未使用函数的警告",
+            )
+        )
+    if main.get("Handler"):
+        return []
+    return [
+        f'extern "C" void {stem}_IRQHandler(void)',
+        "{",
+        f"{INDENT}STM32USBOtgDevice::Dispatch({name});",
+        "}",
+    ]
+
+
 def _invalid_setting(key: str, value, english: str, chinese: str) -> LibXRConfigError:
     """设置 key 的值 value 无效时的错误；信息写出 libxr_config_origin、key、value 和应有的值。
     The error for the invalid value of the setting key; the message names libxr_config_origin,
@@ -1433,9 +1571,11 @@ def _mcu_label(project_data: dict) -> str:
 
 @dataclass(frozen=True)
 class DmaBuffer:
-    """一个 DMA 缓冲区：名字、元素类型、驱动使用的元素数、所在段和实际存储的元素数。
-    One DMA buffer: its name, element type, the number of elements the driver uses, its section
-    and the number of elements actually stored.
+    """一个 DMA 缓冲区：名字、元素类型、驱动使用的元素数、所在段、实际存储的元素数和驱动要求的
+    最小对齐字节数（0 表示没有要求）。
+    One DMA buffer: its name, element type, the number of elements the driver uses, its section,
+    the number of elements actually stored and the minimum alignment in bytes the driver needs
+    (0 for none).
 
     有数据 cache 时存储的元素数向上取整到 cache 行的整数倍，使缓冲区两端不与其他数据共用
     cache 行；驱动使用的元素数不变。
@@ -1449,6 +1589,7 @@ class DmaBuffer:
     count: int
     section: str
     stored: int
+    alignment: int = 0
 
     def argument(self) -> "str | Braces":
         """传给驱动的参数：存储的元素数与驱动使用的相同时为缓冲区名，否则为 {名字, 字节数}。
@@ -1485,25 +1626,107 @@ def dma_argument(name: str) -> "str | Braces":
     return buffer.argument() if buffer else name
 
 
-def _usb_buffer_plan(is_otg: bool, cdc_count: int, ep0: int, tx: int, rx: int) -> list:
+# LibXR 端点槽的对齐：32 位 MCU 上的 HW_CACHE_LINE_SIZE。端点缓冲区的地址和长度都必须是它的
+# 整数倍，与 MCU 有没有数据 cache 无关。
+# The alignment of LibXR endpoint slots: HW_CACHE_LINE_SIZE on a 32-bit MCU. The address and
+# length of an endpoint buffer must both be multiples of it, whether or not the MCU has a data
+# cache.
+_USB_SLOT_ALIGN = 32
+# OTG 驱动在 DMA 模式下 EP0 OUT 使用的缓冲区字节数（容一个 EP0 最大包或 3 个背靠背 SETUP）。
+# The bytes of the buffer the OTG driver uses for EP0 OUT in DMA mode (one EP0 packet of the
+# largest size, or three back-to-back SETUP packets).
+_USB_EP0_DMA_SIZE = 64
+
+
+def _usb_slots(count: int, size: int) -> int:
+    """count 个槽、每槽至少 size 字节时端点缓冲区的字节数；每槽向上取整到 _USB_SLOT_ALIGN。
+    The bytes of an endpoint buffer with count slots of at least size bytes each; each slot is
+    rounded up to _USB_SLOT_ALIGN.
+    """
+    return count * (-(-size // _USB_SLOT_ALIGN) * _USB_SLOT_ALIGN)
+
+
+def _usb_data_buffer(size: int, high_speed: bool) -> int:
+    """数据端点缓冲区的字节数：两个槽，每槽取 size 的一半，按 _USB_SLOT_ALIGN 取整；高速时每槽
+    至少 512（高速批量包只能是 512）。全速时 CDC 取槽放得下的最大合法包长：每槽 32 字节为 32，
+    64 字节及以上为 64。
+    The bytes of a data endpoint buffer: two slots of half of size each, rounded to
+    _USB_SLOT_ALIGN; at high speed each slot is at least 512 (a high-speed bulk packet is 512
+    only). At full speed CDC takes the largest legal packet the slot holds: 32 for a 32-byte
+    slot, 64 from 64 bytes up.
+    """
+    return _usb_slots(2, max(-(-size // 2), 512 if high_speed else _USB_SLOT_ALIGN))
+
+
+def _usb_buffer_plan(
+    is_otg: bool,
+    cdc_count: int,
+    ep0: int,
+    tx: int,
+    rx: int,
+    high_speed: bool = False,
+    ep0_dma: bool = False,
+) -> list:
     """USB 设备的端点缓冲区：(名字后缀, 字节数) 的列表。
     The endpoint buffers of a USB device: a list of (name suffix, bytes).
 
     CDC 按顺序分配端点：第 i 个 CDC（从 0 起）的数据 IN 端点为 EP(2i+1)，通知端点为 EP(2i+2)；
     OTG 的数据 OUT 端点为 EP(i+1)，IN 和 OUT 的端点号各自编号；FSDEV 的数据 OUT 与数据 IN
-    使用同一个端点号。通知端点的缓冲区为 16 字节。
+    使用同一个端点号。
     CDCs take endpoints in order: the data IN endpoint of CDC i (from 0) is EP(2i+1) and its
     notification endpoint EP(2i+2); on OTG the data OUT endpoint is EP(i+1), IN and OUT
     endpoints being numbered separately, while FSDEV uses one endpoint number for data OUT and
-    data IN. The notification buffer is 16 bytes.
+    data IN.
+
+    LibXR 把 EP0 的缓冲区当作一个槽，其余端点的缓冲区平分为两个槽，每个槽按 _USB_SLOT_ALIGN
+    对齐；端点的包长取槽放得下的最大合法值。所以 EP0 每个方向至少 ep0 字节；数据端点见
+    _usb_data_buffer()；通知端点每槽 32 字节。ep0_dma 时另有 OTG 驱动在 DMA 模式下使用的 EP0
+    OUT 缓冲区 ep0_dma_buf。
+    LibXR treats the EP0 buffer as one slot and splits the buffer of any other endpoint into
+    two slots, each aligned to _USB_SLOT_ALIGN; an endpoint takes the largest legal packet its
+    slot holds. So EP0 gets at least ep0 bytes per direction; data endpoints follow
+    _usb_data_buffer(); the notification endpoint gets 32 bytes per slot. With ep0_dma there is
+    also ep0_dma_buf, the EP0 OUT buffer the OTG driver uses in DMA mode.
     """
-    plan = [("ep0_in_buf", ep0), ("ep0_out_buf", ep0)]
+    plan = [("ep0_in_buf", _usb_slots(1, ep0)), ("ep0_out_buf", _usb_slots(1, ep0))]
+    if ep0_dma:
+        plan.append(("ep0_dma_buf", _USB_EP0_DMA_SIZE))
     for index in range(cdc_count):
         data, notify = 2 * index + 1, 2 * index + 2
-        plan.append((f"ep{data}_in_buf", tx))
-        plan.append((f"ep{notify}_in_buf", 16))
-        plan.append((f"ep{data if not is_otg else index + 1}_out_buf", rx))
+        plan.append((f"ep{data}_in_buf", _usb_data_buffer(tx, high_speed)))
+        plan.append((f"ep{notify}_in_buf", _usb_slots(2, 16)))
+        plan.append(
+            (f"ep{data if not is_otg else index + 1}_out_buf", _usb_data_buffer(rx, high_speed))
+        )
     return plan
+
+
+def _settle_usb_buffer(name: str, usb_cfg: dict, key: str, hardware: dict) -> int:
+    """OTG 实例的数据端点缓冲区设置 key（tx_buffer_size 或 rx_buffer_size）实际分配的字节数；
+    与设置不同时写回 usb_cfg 并记录一条提示，libxr_config.yaml 随之写出分配的值。FSDEV 的
+    rx_buffer_size 同时是 PMA 的大小，不写回。
+    The bytes actually allocated for the data endpoint buffer setting key (tx_buffer_size or
+    rx_buffer_size) of an OTG instance; when they differ from the setting they are written back
+    to usb_cfg with a notice, so libxr_config.yaml shows the allocated value. The
+    rx_buffer_size of FSDEV is also the PMA size and is not written back.
+    """
+    configured = _integer(key, usb_cfg[key])
+    allocated = _usb_data_buffer(configured, hardware.get("high_speed", False))
+    if allocated != configured:
+        if hardware.get("high_speed", False):
+            reason_en = "two slots of at least one 512-byte high-speed bulk packet each"
+            reason_zh = "两个槽，每槽至少放得下一个 512 字节的高速批量包"
+        else:
+            reason_en = "two slots in 32-byte steps"
+            reason_zh = "两个槽，每槽按 32 字节取整"
+        logging.info(
+            tr(
+                f"USB.{name.lower()}.{key} {configured} -> {allocated}: {reason_en}",
+                f"USB.{name.lower()}.{key} {configured} -> {allocated}：{reason_zh}",
+            )
+        )
+        usb_cfg[key] = allocated
+    return allocated
 
 
 def _cdc_items(cfg: dict) -> list[dict]:
@@ -1541,11 +1764,13 @@ def generate_dma_resources(project_data: dict) -> list[str]:
 
     没有数据 cache 的 MCU 按 4 字节对齐；有数据 cache 的 MCU 按 cache 行对齐，数组长度向上取整到
     cache 行的整数倍，缓冲区两端不与其他数据共用 cache 行；驱动被告知的大小不变，见
-    DmaBuffer.argument()。
+    DmaBuffer.argument()。USB 端点缓冲区总是按 _USB_SLOT_ALIGN 对齐，大小见
+    _usb_buffer_plan()。
     An MCU without a data cache aligns to 4 bytes; one with a data cache aligns to the cache
     line and rounds the array length up to a whole number of cache lines, so no other data
     shares a cache line with either end of a buffer; the size a driver is told stays, see
-    DmaBuffer.argument().
+    DmaBuffer.argument(). USB endpoint buffers are always aligned to _USB_SLOT_ALIGN, with the
+    sizes _usb_buffer_plan() gives.
 
     _DTCM_BSS_FAMILIES 中的系列上有 DMA 访问的缓冲区而 dma_section 为空的实例记录一条警告，见
     _warn_dtcm_buffers()；不用 DMA 的 SPI 的缓冲区只由 CPU 访问，不计入。
@@ -1561,12 +1786,15 @@ def generate_dma_resources(project_data: dict) -> list[str]:
     # The keys of the instance settings with buffers and an empty dma_section, such as SPI.spi1.
     unplaced: list[str] = []
 
-    def add(key: str, element: str, name: str, count: int, section: str) -> None:
-        """登记实例设置 key 的一个缓冲区：count 个 element 类型的元素，位于 section 段。
+    def add(
+        key: str, element: str, name: str, count: int, section: str, alignment: int = 0
+    ) -> None:
+        """登记实例设置 key 的一个缓冲区：count 个 element 类型的元素，位于 section 段，至少按
+        alignment 字节对齐。
         Register one buffer of the instance settings key: count elements of the type element in
-        the section section.
+        the section section, aligned to at least alignment bytes.
         """
-        dma_buffers[name] = DmaBuffer(name, element, count, section, count)
+        dma_buffers[name] = DmaBuffer(name, element, count, section, count, alignment)
         if not section and key not in unplaced:
             unplaced.append(key)
 
@@ -1689,12 +1917,30 @@ def generate_dma_resources(project_data: dict) -> list[str]:
                 ep0 = _integer("ep0_packet_size", usb_cfg["ep0_packet_size"])
                 tx_sz = _integer("tx_buffer_size", usb_cfg["tx_buffer_size"])
                 rx_sz = _integer("rx_buffer_size", usb_cfg["rx_buffer_size"])
+                is_otg = name.startswith("USB_OTG_")
+                hardware = _otg_hardware(name, instances[instance]) if is_otg else {}
+                if is_otg:
+                    tx_sz = _settle_usb_buffer(name, usb_cfg, "tx_buffer_size", hardware)
+                    rx_sz = _settle_usb_buffer(name, usb_cfg, "rx_buffer_size", hardware)
                 plan = _usb_buffer_plan(
-                    name.startswith("USB_OTG_"), len(_cdc_items(usb_cfg)), ep0, tx_sz, rx_sz
+                    is_otg,
+                    len(_cdc_items(usb_cfg)),
+                    ep0,
+                    tx_sz,
+                    rx_sz,
+                    hardware.get("high_speed", False),
+                    hardware.get("dma", False),
                 )
                 for suffix, size in plan:
                     section = usb_cfg["dma_section"]
-                    add(f"USB.{name.lower()}", "uint8_t", f"{name.lower()}_{suffix}", size, section)
+                    add(
+                        f"USB.{name.lower()}",
+                        "uint8_t",
+                        f"{name.lower()}_{suffix}",
+                        size,
+                        section,
+                        _USB_SLOT_ALIGN,
+                    )
 
     if not dma_buffers:
         return []
@@ -1712,7 +1958,8 @@ def generate_dma_resources(project_data: dict) -> list[str]:
     lines = [f"// DMA buffers ({_mcu_label(project_data)}: {note})"]
     alignment = line or 4
     for name in sorted(dma_buffers, key=_natural_key):
-        lines.extend(_dma_declaration(dma_buffers[name], alignment))
+        buffer = dma_buffers[name]
+        lines.extend(_dma_declaration(buffer, max(alignment, buffer.alignment)))
     return lines
 
 
@@ -2087,20 +2334,25 @@ class PeripheralFactory:
 
         实例名和设置来自 _usb_settings()；其他实例名（如 USB_DEVICE 中间件）和未启用的实例不生成
         代码，启用了但在 CubeMX 中是主机模式的实例记录警告后不生成。设备对象以实例名命名（如
-        usb_otg_fs），使用 _pcd_handle() 给出的句柄，引用 generate_dma_resources() 定义的端点
-        缓冲区，本方法不定义缓冲区。CDC 串口 <实例>_cdc、<实例>_cdc2 …… 按顺序分配端点，规则见
-        _usb_buffer_plan()，各登记为 UART。
+        usb_otg_fs），引用 generate_dma_resources() 定义的端点缓冲区，本方法不定义缓冲区。OTG
+        设备的第一个参数是 _otg_hardware() 给出的硬件配置，CubeMX 不生成中断函数时由
+        _otg_vector() 补上向量函数；FSDEV 设备使用 _pcd_handle() 给出的句柄。CDC 串口 <实例>_cdc、<实例>_cdc2
+        …… 按顺序分配端点，规则见 _usb_buffer_plan()，各登记为 UART。
         The instance name and settings come from _usb_settings(); other instance names, such as
         the USB_DEVICE middleware, and disabled instances produce no code, and an enabled
         instance in host mode in CubeMX is skipped with a warning. The device object is named
-        after the instance, for example usb_otg_fs, uses the handle _pcd_handle() gives and
-        references the endpoint buffers that generate_dma_resources() defines; this method
-        defines no buffer. The CDC serial ports <instance>_cdc, <instance>_cdc2 ... take
+        after the instance, for example usb_otg_fs, and references the endpoint buffers that
+        generate_dma_resources() defines; this method defines no buffer. The first argument of
+        an OTG device is the hardware configuration _otg_hardware() gives, and _otg_vector()
+        writes the vector function when CubeMX generates no interrupt handler; an FSDEV device
+        uses the handle _pcd_handle() gives. The CDC serial ports <instance>_cdc, <instance>_cdc2 ... take
         endpoints in order, see _usb_buffer_plan(), and are each registered as UART.
 
         Raises:
-            LibXRConfigError: 设置了 cdc_count，或某个设置无效（见 _usb_settings()）。
-                cdc_count is set, or a setting is invalid (see _usb_settings()).
+            LibXRConfigError: 设置了 cdc_count，某个设置无效（见 _usb_settings()），或 OTG 的
+                中断没有在 NVIC 中开启（见 _otg_vector()）。
+                cdc_count is set, a setting is invalid (see _usb_settings()), or the interrupt
+                of an OTG instance is not enabled in NVIC (see _otg_vector()).
         """
         usb = _usb_settings(instance)
         if usb is None:
@@ -2165,7 +2417,14 @@ class PeripheralFactory:
 
         _use_header("stm32_usb_dev.hpp")
         _use_header("cdc_uart.hpp")
-        _use_handle("PCD_HandleTypeDef", pcd_handle)
+        if is_otg:
+            vector = _otg_vector(name, config)
+            if vector:
+                interrupt_vectors.append(vector)
+            otg_devices.append(name)
+            hardware = _otg_hardware(name, config)
+        else:
+            _use_handle("PCD_HandleTypeDef", pcd_handle)
 
         def endpoint(number: int) -> str:
             """端点号 number 对应的 USB::Endpoint::EPNumber 枚举值。
@@ -2222,7 +2481,19 @@ class PeripheralFactory:
                 out_buffers.append(buffer(f"ep{index + 1}_out_buf"))
                 in_configs.append(Braces(buffer(f"ep{2 * index + 1}_in_buf"), str(tx_fifo_size)))
                 in_configs.append(Braces(buffer(f"ep{2 * index + 2}_in_buf"), "16"))
-            endpoints = [str(rx_fifo_size), Braces(*out_buffers), Braces(*in_configs)]
+            # STM32USBOtgDevice::HardwareConfig 的聚合初始化：PHY、DMA、VBUS 检测、高速，DMA 时
+            # 再加 EP0 OUT 缓冲区。
+            # Aggregate initialization of STM32USBOtgDevice::HardwareConfig: PHY, DMA, VBUS
+            # sensing and high speed, plus the EP0 OUT buffer with DMA.
+            first = Braces(
+                f"STM32USBOtgDevice::Phy::{hardware['phy']}",
+                *(
+                    "true" if hardware[key] else "false"
+                    for key in ("dma", "vbus_sensing", "high_speed")
+                ),
+                *([buffer("ep0_dma_buf")] if hardware["dma"] else []),
+            )
+            endpoints = [first, str(rx_fifo_size), Braces(*out_buffers), Braces(*in_configs)]
         else:
             configs = [
                 Braces(buffer("ep0_in_buf"), buffer("ep0_out_buf"), str(ep0_sz), str(ep0_sz))
@@ -2238,11 +2509,10 @@ class PeripheralFactory:
                     )
                 )
                 configs.append(Braces(buffer(f"ep{data + 1}_in_buf"), "16", "true"))
-            endpoints = [Braces(*configs)]
+            endpoints = [f"&{pcd_handle}", Braces(*configs)]
         lines += layout_statement(
             f"static {instance_type} {inst_lower}",
-            [f"&{pcd_handle}"]
-            + endpoints
+            endpoints
             + [
                 f"USB::DeviceDescriptor::PacketSize0::{size_enum}",
                 f"0x{vid:X}",
@@ -2278,7 +2548,12 @@ _HEADER_NAMES = {
     "stm32_pwm.hpp": ("STM32PWM",),
     "stm32_spi.hpp": ("STM32SPI",),
     "stm32_uart.hpp": ("STM32UART",),
-    "stm32_usb_dev.hpp": ("STM32USBDeviceDevFs", "STM32USBDeviceOtgFS", "STM32USBDeviceOtgHS"),
+    "stm32_usb_dev.hpp": (
+        "STM32USBDeviceDevFs",
+        "STM32USBDeviceOtgFS",
+        "STM32USBDeviceOtgHS",
+        "STM32USBOtgDevice",
+    ),
     "stm32_watchdog.hpp": ("STM32Watchdog",),
 }
 # Peripherals 中的段与它们的 HAL 句柄类型；句柄名是 h 加小写的实例名。
@@ -3248,10 +3523,14 @@ def _app_main_notice(project_data: dict) -> list[str]:
     written, otherwise the CubeMX project.
     """
     source = project_data.get("Ioc") or "the CubeMX project"
-    return [
+    lines = [
         f"// Generated by `libxr gen` from {source} and {libxr_config_label}.",
         '// Edit only between "User Code Begin" and "User Code End"; the rest is regenerated.',
     ]
+    if project_data.get("IocDigest"):
+        # LibXR.CMake compares it with the .ioc file (see stm32_cubemx_sync.ioc_digest()).
+        lines.append(f"// {source} digest: {project_data['IocDigest']}")
+    return lines
 
 
 # 不带 --xrobot 生成时 User Code 3 的默认循环，去掉全部空白；5.x 版本写成 while(true) { ... }，
@@ -3364,6 +3643,8 @@ def generate_full_code(
         lines += [""] + externs
     if dma:
         lines += [""] + dma
+    for vector in interrupt_vectors:
+        lines += [""] + vector
     lines += ["", 'extern "C" void app_main(void)', "{"]
     lines += [f"{INDENT}/* User Code Begin 2 */", f"{INDENT}/* User Code End 2 */", ""]
     lines += join_blocks([section for section in sections if section])
@@ -3640,6 +3921,8 @@ def generate(
         )
         load_libxr_config(output_dir, libxr_config)
         _name_libxr_config(output_dir, libxr_config)
+        global cubemx_irq_handlers
+        cubemx_irq_handlers = _cubemx_irq_handlers(os.path.dirname(os.path.abspath(output_dir)))
         check_generator_pin()
         initialize_registry(use_xrobot)
 
@@ -3687,6 +3970,27 @@ def generate(
         logging.error(tr(f"Generation failed: {str(e)}", f"生成失败：{str(e)}"))
         logging.debug(tr("Traceback:", "调用栈："), exc_info=True)
         sys.exit(1)
+
+
+# CubeMX 生成的中断函数定义，例如 void OTG_FS_IRQHandler(void)。
+# An interrupt handler definition CubeMX generates, such as void OTG_FS_IRQHandler(void).
+_IRQ_HANDLER_DEFINITION = re.compile(r"^\s*void\s+(\w+_IRQHandler)\s*\(\s*void\s*\)\s*$", re.M)
+
+
+def _cubemx_irq_handlers(project_root: str) -> set[str] | None:
+    """project_root/Core/Src 的 .c 文件中定义的中断函数名；没有这个目录时为 None。
+    The interrupt handler names defined in the .c files of project_root/Core/Src; None without
+    that directory.
+    """
+    source_dir = os.path.join(project_root, "Core", "Src")
+    if not os.path.isdir(source_dir):
+        return None
+    names = set()
+    for entry in sorted(os.listdir(source_dir)):
+        if entry.endswith(".c"):
+            with open(os.path.join(source_dir, entry), encoding="utf-8", errors="replace") as f:
+                names.update(_IRQ_HANDLER_DEFINITION.findall(f.read()))
+    return names
 
 
 def _report_files(output_dir: str, written: list, unchanged: list, removed: list) -> None:

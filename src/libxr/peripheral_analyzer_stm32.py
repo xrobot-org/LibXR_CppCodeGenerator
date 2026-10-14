@@ -1180,12 +1180,14 @@ class USBParser(PeripheralParser):
         "<param>-<profile>" 形式的参数存入 profiles[profile][param]，其余存在实例下；
         IPParameters 拆成列表。VirtualMode（含各 profile 中的）含 Device 时 Role 为 Device，
         含 Host 时为 Host，主机模式下 CubeMX 生成的是 HCD 句柄。_DRD_FAMILIES 系列的 USB 实例和
-        IP 名为 USB_DRD_FS 的实例记下 PCDHandle hpcd_USB_DRD_FS。
+        IP 名为 USB_DRD_FS 的实例记下 PCDHandle hpcd_USB_DRD_FS。OTG 实例另记下代码生成设置，
+        见 _record_otg_code_generation()。
         A "<param>-<profile>" parameter is stored in profiles[profile][param] and any other
         under the instance; IPParameters is split into a list. Role is Device when a
         VirtualMode, profiles included, contains Device and Host when one contains Host; in
         host mode CubeMX generates an HCD handle. The USB instance of the _DRD_FAMILIES and an
-        instance with the IP name USB_DRD_FS get PCDHandle hpcd_USB_DRD_FS.
+        instance with the IP name USB_DRD_FS get PCDHandle hpcd_USB_DRD_FS. OTG instances also
+        get their code generation settings, see _record_otg_code_generation().
         """
         # 1. 按 .ioc 中的顺序找出 raw_map 里的全部 USB 外设名。
         # 1. Find all USB peripheral names in the raw_map, in .ioc order
@@ -1252,6 +1254,39 @@ class USBParser(PeripheralParser):
                 cfg["Role"] = "Host"
             if usb_name == "USB_DRD_FS" or (usb_name == "USB" and family in self._DRD_FAMILIES):
                 cfg["PCDHandle"] = "hpcd_USB_DRD_FS"
+            if usb_name.startswith("USB_OTG_"):
+                self._record_otg_code_generation(usb_name, cfg)
+
+    def _record_otg_code_generation(self, usb_name: str, cfg: dict) -> None:
+        """记下 OTG 实例在 CubeMX 中的代码生成设置，供生成器检查。
+        Record the code generation settings of an OTG instance in CubeMX for the generator to
+        check.
+
+        InitCalled：main() 是否调用 MX_USB_OTG_*_PCD_Init()（Project Manager 中没有勾选 Do Not
+        Generate Function Call）；InitStatic：该函数是否为 static。Vectors：该实例的每个 NVIC
+        中断（如 OTG_FS_IRQn、OTG_HS_EP1_OUT_IRQn）是否开启、是否生成 IRQ 处理函数；NVIC.<IRQ>
+        的第 1 项是开启，第 6 项是生成处理函数。
+        InitCalled: whether main() calls MX_USB_OTG_*_PCD_Init() (Do Not Generate Function Call
+        is not set in the Project Manager); InitStatic: whether that function is static.
+        Vectors: for each NVIC interrupt of the instance (such as OTG_FS_IRQn or
+        OTG_HS_EP1_OUT_IRQn), whether it is enabled and whether its IRQ handler is generated;
+        field 1 of NVIC.<IRQ> is the enable and field 6 the handler generation.
+        """
+        entries = [e for e in _init_functions(self.raw_map).get(usb_name, []) if e["generate"]]
+        cfg["InitCalled"] = any(e["called"] for e in entries)
+        cfg["InitStatic"] = any(e["static"] for e in entries)
+        stem = usb_name[len("USB_") :]  # OTG_FS / OTG_HS
+        vectors = {}
+        for key, value in self.raw_map.items():
+            root, _, irq = key.partition(".")
+            if root != "NVIC" or not re.fullmatch(rf"{stem}(_\w+)?_IRQn", irq):
+                continue
+            fields = str(value).replace("\\:", ":").split(":")
+            vectors[irq] = {
+                "Enabled": fields[0] == "true",
+                "Handler": len(fields) > 5 and fields[5] == "true",
+            }
+        cfg["Vectors"] = vectors
 
     def _ensure_usb_instance(self, usb_name: str) -> None:
         """USB 实例不存在时创建空字典。
@@ -1752,11 +1787,12 @@ def _init_functions(raw_map: dict[str, str]) -> dict[str, list[dict[str, Any]]]:
 
     条目形如 [false-]<序号>-<函数>-<IP>-<不调用>-<驱动>-<静态>[-<上下文>]：开头的 false 表示取消了
     Generate Code，<不调用> 为 true 表示勾选了 Do Not Generate Function Call，<驱动> 为 HAL 或
-    LL。每个 IP 对应一个列表，多核或 TrustZone 工程的每个上下文各一项。
+    LL，<静态> 为 true 表示函数是 static。每个 IP 对应一个列表，多核或 TrustZone 工程的每个上下文
+    各一项。
     An entry reads [false-]<rank>-<function>-<IP>-<no call>-<driver>-<static>[-<context>]: a
     leading false means Generate Code is off, <no call> true means Do Not Generate Function
-    Call is set, and <driver> is HAL or LL. Each IP maps to a list with one item per context
-    of a multi-core or TrustZone project.
+    Call is set, <driver> is HAL or LL, and <static> true means the function is static. Each
+    IP maps to a list with one item per context of a multi-core or TrustZone project.
     """
     functions: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
     for entry in raw_map.get("ProjectManager.functionlistsort", "").split(","):
@@ -1772,6 +1808,7 @@ def _init_functions(raw_map: dict[str, str]) -> dict[str, list[dict[str, Any]]]:
                 "generate": generate,
                 "called": parts[3] != "true",
                 "driver": parts[4],
+                "static": len(parts) > 5 and parts[5] == "true",
             }
         )
     return functions
@@ -2117,9 +2154,17 @@ def parse_project(directory: str, output: str | None = None, summary: bool = Tru
     logging.info(tr(f"Processing {ioc_file}...", f"正在处理 {ioc_file}……"))
     config_data = parse_ioc_file(os.path.join(directory, ioc_file))
     if config_data:
-        # libxr gen 在生成文件的说明中写出 .ioc 文件名。
-        # libxr gen names the .ioc file in the notice of the files it generates.
-        config_data = {"Platform": config_data["Platform"], "Ioc": ioc_file, **config_data}
+        # libxr gen 在生成文件的说明中写出 .ioc 文件名和摘要；LibXR.CMake 比对摘要。
+        # libxr gen names the .ioc file and its digest in the notice of the files it generates;
+        # LibXR.CMake compares the digest.
+        from libxr.stm32_cubemx_sync import ioc_digest
+
+        config_data = {
+            "Platform": config_data["Platform"],
+            "Ioc": ioc_file,
+            "IocDigest": ioc_digest(os.path.join(directory, ioc_file)),
+            **config_data,
+        }
     output_path = output or os.path.join(directory, ".config.yaml")
     if not config_data or not save_to_yaml(config_data, output_path):
         sys.exit(1)

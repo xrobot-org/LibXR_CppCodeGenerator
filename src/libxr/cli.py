@@ -429,6 +429,19 @@ def cmd_stm32_cmake(args: argparse.Namespace) -> None:
     integrate(args.directory)
 
 
+def cmd_stm32_sync(args: argparse.Namespace) -> None:
+    """libxr stm32 sync：STM32CubeMX 生成代码之后更新 LibXR 的生成结果（见 stm32_cubemx_sync）；
+    失败时以状态 1 退出。
+    libxr stm32 sync: bring the LibXR output up to date after STM32CubeMX generated the code
+    (see stm32_cubemx_sync); a failure exits with status 1.
+    """
+    from libxr.stm32_cubemx_sync import sync
+
+    code = sync(args.directory, after_cubemx=args.after_cubemx)
+    if code:
+        sys.exit(code)
+
+
 def cmd_stm32_flash_info(args: argparse.Namespace) -> None:
     """libxr stm32 flash-info：以 YAML 打印一个 STM32 型号的 Flash 布局。
     libxr stm32 flash-info: print the flash layout of an STM32 model as YAML.
@@ -883,6 +896,33 @@ def _add_stm32_cmake(commands) -> None:
     _add_project_directory(parser)
 
 
+def _add_stm32_sync(commands) -> None:
+    """加入 stm32 sync 子命令。
+    Add the stm32 sync subcommand.
+    """
+    parser = _command(
+        commands,
+        "sync",
+        tr(
+            "update the LibXR code after STM32CubeMX generated the project: parse, generate, "
+            "adjust the .ioc file for LibXR and update the CMake integration; STM32CubeMX runs "
+            "it after each code generation once `libxr stm32 setup` has registered it",
+            "STM32CubeMX 生成工程之后更新 LibXR 的代码：解析、生成、为 LibXR 调整 .ioc、更新 "
+            "CMake 集成；`libxr stm32 setup` 登记之后，STM32CubeMX 每次生成代码都会运行它",
+        ),
+        cmd_stm32_sync,
+    )
+    _add_project_directory(parser)
+    parser.add_argument(
+        "--after-cubemx",
+        action="store_true",
+        help=tr(
+            "called by the STM32CubeMX post-generation script",
+            "由 STM32CubeMX 的生成后脚本调用",
+        ),
+    )
+
+
 def _add_project_directory(parser) -> None:
     """加入 -d/--directory：CubeMX 工程目录，默认当前目录。
     Add -d/--directory: the CubeMX project directory, the current directory by default.
@@ -1075,6 +1115,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_stm32_setup(stm32_commands)
     _add_stm32_cubemx_gen(stm32_commands)
     _add_stm32_cmake(stm32_commands)
+    _add_stm32_sync(stm32_commands)
     _add_stm32_flash_info(stm32_commands)
     _add_stm32_toolchain(stm32_commands)
     hpm = commands.add_parser(
