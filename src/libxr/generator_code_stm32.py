@@ -1246,6 +1246,59 @@ def _default_usb_enables(peripherals: dict) -> None:
             )
 
 
+def _fsdev_vector(name: str, config: dict) -> list[str]:
+    """FSDEV/DRD 实例的中断向量函数：CubeMX 生成了中断函数时为空列表，否则是调用驱动
+    Dispatch() 的向量函数定义。
+    The interrupt vector function of an FSDEV or DRD instance: an empty list when CubeMX
+    generates the interrupt handler, otherwise the definition of a vector function that
+    calls the driver's Dispatch().
+
+    CubeMX 保持默认设置即可：LibXR 在链接时包装 HAL_PCD_Init() 和 HAL_PCD_IRQHandler()，
+    CubeMX 生成的中断函数进入驱动。经典型（F1/F3）的主中断是 USB_LP_CAN1_RX0_IRQn
+    （USB_HP_CAN1_TX_IRQn 只承载 CTR，同一入口处理），DRD 与其余经典型是 USB_IRQn，
+    G0B1 与 UCPD 共用 USB_UCPD1_2_IRQn。NVIC 未开启主中断时报错。
+    CubeMX can keep its default settings: LibXR wraps HAL_PCD_Init() and
+    HAL_PCD_IRQHandler() at link time, so the interrupt handler CubeMX generates enters
+    the driver. The main interrupt of the classic parts (F1/F3) is USB_LP_CAN1_RX0_IRQn
+    (USB_HP_CAN1_TX_IRQn carries only CTR, handled by the same entry), DRD and the other
+    classic parts use USB_IRQn, and G0B1 shares USB_UCPD1_2_IRQn with UCPD. A missing
+    NVIC entry for the main interrupt raises an error.
+    """
+    vectors = config.get("Vectors")
+    main_irq = None
+    if vectors:
+        for preferred in ("USB_LP_CAN1_RX0_IRQn", "USB_UCPD1_2_IRQn", "USB_IRQn"):
+            if preferred in vectors:
+                main_irq = preferred
+                break
+    if main_irq is None:
+        # 老解析结果没有向量信息：按 CubeMX 默认处理。
+        # An older parse result has no vector data: treat it as the CubeMX default.
+        return []
+    entry = dict(vectors.get(main_irq, {"Enabled": True, "Handler": True}))
+    handler = main_irq[: -len("_IRQn")] + "_IRQHandler"
+    if cubemx_irq_handlers is not None:
+        # 生成的源码决定：.ioc 可能已改而 Core/Src 里的代码还是旧的。
+        # The generated sources decide: the .ioc file may already be changed while the
+        # code in Core/Src still comes from the earlier settings.
+        entry["Handler"] = handler in cubemx_irq_handlers
+    if not entry.get("Enabled"):
+        raise LibXRConfigError(
+            tr(
+                f"{name}: {main_irq} is not enabled; enable it in STM32CubeMX NVIC",
+                f"{name}：没有开启 {main_irq}；请在 STM32CubeMX 的 NVIC 中开启",
+            )
+        )
+    if entry.get("Handler"):
+        return []
+    return [
+        f'extern "C" void {handler}(void)',
+        "{",
+        f"{INDENT}LibXR::STM32USBDeviceDevFs::Dispatch();",
+        "}",
+    ]
+
+
 def _usb_settings(instance: str) -> tuple[str, dict] | None:
     """USB 实例的规范名和它在 libxr_settings["USB"] 中的设置；其他实例名（如 USB_DEVICE 中间件）
     为 None。
@@ -1659,7 +1712,6 @@ def _usb_data_buffer(size: int, high_speed: bool) -> int:
 
 
 def _usb_buffer_plan(
-    is_otg: bool,
     cdc_count: int,
     ep0: int,
     tx: int,
@@ -1671,12 +1723,10 @@ def _usb_buffer_plan(
     The endpoint buffers of a USB device: a list of (name suffix, bytes).
 
     CDC 按顺序分配端点：第 i 个 CDC（从 0 起）的数据 IN 端点为 EP(2i+1)，通知端点为 EP(2i+2)；
-    OTG 的数据 OUT 端点为 EP(i+1)，IN 和 OUT 的端点号各自编号；FSDEV 的数据 OUT 与数据 IN
-    使用同一个端点号。
-    CDCs take endpoints in order: the data IN endpoint of CDC i (from 0) is EP(2i+1) and its
-    notification endpoint EP(2i+2); on OTG the data OUT endpoint is EP(i+1), IN and OUT
-    endpoints being numbered separately, while FSDEV uses one endpoint number for data OUT and
-    data IN.
+    数据 OUT 端点为 EP(i+1)（OTG 上与数据 IN 各自编号，FSDEV/DRD 上与数据 IN 同号）。
+    CDCs take endpoints in order: the data IN endpoint of CDC i (from 0) is EP(2i+1), its
+    notification endpoint EP(2i+2), and its data OUT endpoint EP(i+1) (numbered independently
+    from the data IN endpoint on OTG, sharing the number on FSDEV/DRD).
 
     LibXR 把 EP0 的缓冲区当作一个槽，其余端点的缓冲区平分为两个槽，每个槽按 _USB_SLOT_ALIGN
     对齐；端点的包长取槽放得下的最大合法值。所以 EP0 每个方向至少 ep0 字节；数据端点见
@@ -1695,9 +1745,12 @@ def _usb_buffer_plan(
         data, notify = 2 * index + 1, 2 * index + 2
         plan.append((f"ep{data}_in_buf", _usb_data_buffer(tx, high_speed)))
         plan.append((f"ep{notify}_in_buf", _usb_slots(2, 16)))
-        plan.append(
-            (f"ep{data if not is_otg else index + 1}_out_buf", _usb_data_buffer(rx, high_speed))
-        )
+        # 数据 OUT 端点：OTG 与 FSDEV/DRD 都是 EP(i+1)（FSDEV 的数据 IN 与 OUT 同号，
+        # 但 OUT 侧按自己的顺序占号）。
+        # The data OUT endpoint: on OTG and on FSDEV/DRD alike it is EP(i+1); on FSDEV
+        # the data IN and OUT endpoints share a number, yet the OUT side numbers its
+        # own endpoints in order.
+        plan.append((f"ep{index + 1}_out_buf", _usb_data_buffer(rx, high_speed)))
     return plan
 
 
@@ -1923,7 +1976,6 @@ def generate_dma_resources(project_data: dict) -> list[str]:
                     tx_sz = _settle_usb_buffer(name, usb_cfg, "tx_buffer_size", hardware)
                     rx_sz = _settle_usb_buffer(name, usb_cfg, "rx_buffer_size", hardware)
                 plan = _usb_buffer_plan(
-                    is_otg,
                     len(_cdc_items(usb_cfg)),
                     ep0,
                     tx_sz,
@@ -2336,7 +2388,8 @@ class PeripheralFactory:
         代码，启用了但在 CubeMX 中是主机模式的实例记录警告后不生成。设备对象以实例名命名（如
         usb_otg_fs），引用 generate_dma_resources() 定义的端点缓冲区，本方法不定义缓冲区。OTG
         设备的第一个参数是 _otg_hardware() 给出的硬件配置，CubeMX 不生成中断函数时由
-        _otg_vector() 补上向量函数；FSDEV 设备使用 _pcd_handle() 给出的句柄。CDC 串口 <实例>_cdc、<实例>_cdc2
+        _otg_vector() 补上向量函数；FSDEV/DRD 设备的 RX/TX 列表按端点号从 EP0 起，CubeMX 不生成
+        中断函数时由 _fsdev_vector() 补上向量函数。CDC 串口 <实例>_cdc、<实例>_cdc2
         …… 按顺序分配端点，规则见 _usb_buffer_plan()，各登记为 UART。
         The instance name and settings come from _usb_settings(); other instance names, such as
         the USB_DEVICE middleware, and disabled instances produce no code, and an enabled
@@ -2344,9 +2397,11 @@ class PeripheralFactory:
         after the instance, for example usb_otg_fs, and references the endpoint buffers that
         generate_dma_resources() defines; this method defines no buffer. The first argument of
         an OTG device is the hardware configuration _otg_hardware() gives, and _otg_vector()
-        writes the vector function when CubeMX generates no interrupt handler; an FSDEV device
-        uses the handle _pcd_handle() gives. The CDC serial ports <instance>_cdc, <instance>_cdc2 ... take
-        endpoints in order, see _usb_buffer_plan(), and are each registered as UART.
+        writes the vector function when CubeMX generates no interrupt handler; an FSDEV or DRD
+        device takes the RX and TX lists running from EP0, and _fsdev_vector() writes the vector
+        function when CubeMX generates no interrupt handler. The CDC serial ports <instance>_cdc,
+        <instance>_cdc2 ... take endpoints in order, see _usb_buffer_plan(), and are each
+        registered as UART.
 
         Raises:
             LibXRConfigError: 设置了 cdc_count，某个设置无效（见 _usb_settings()），或 OTG 的
@@ -2424,7 +2479,9 @@ class PeripheralFactory:
             otg_devices.append(name)
             hardware = _otg_hardware(name, config)
         else:
-            _use_handle("PCD_HandleTypeDef", pcd_handle)
+            vector = _fsdev_vector(name, config)
+            if vector:
+                interrupt_vectors.append(vector)
 
         def endpoint(number: int) -> str:
             """端点号 number 对应的 USB::Endpoint::EPNumber 枚举值。
@@ -2449,7 +2506,12 @@ class PeripheralFactory:
             cdc_name = f"{inst_lower}_cdc" + (str(index + 1) if index else "")
             cdc_names.append(cdc_name)
             data_in = 2 * index + 1
-            data_out = index + 1 if is_otg else data_in
+            # 数据 OUT 与数据 IN 在 OTG 上各自编号，在 FSDEV/DRD 上共用一个端点号；两种
+            # 控制器上 OUT 侧都按自己的顺序占号，数据 OUT 为 EP(i+1)。
+            # The data OUT endpoints number themselves in order on both controllers, so
+            # the data OUT endpoint is EP(i+1); on FSDEV/DRD it shares the data IN
+            # number, on OTG the IN and OUT numbers are independent.
+            data_out = index + 1
             # 设置了 interface 时它同时作为控制接口和数据接口的名字；主机按它区分 VID:PID 相同的
             # 各路 CDC。
             # A set interface names both the control and the data interface; the host tells the
@@ -2495,21 +2557,20 @@ class PeripheralFactory:
             )
             endpoints = [first, str(rx_fifo_size), Braces(*out_buffers), Braces(*in_configs)]
         else:
-            configs = [
-                Braces(buffer("ep0_in_buf"), buffer("ep0_out_buf"), str(ep0_sz), str(ep0_sz))
-            ]
+            # FSDEV/DRD：RX 与 TX 列表按端点号从 EP0 起，每项是 {槽内存, PMA 字节数}。
+            # FSDEV/DRD: the RX and TX lists run from EP0, each entry {slot memory, PMA
+            # bytes}.
+            out_configs = [Braces(buffer("ep0_out_buf"), str(ep0_sz))]
+            in_configs = [Braces(buffer("ep0_in_buf"), str(ep0_sz))]
             for index in range(len(cdcs)):
-                data = 2 * index + 1
-                configs.append(
-                    Braces(
-                        buffer(f"ep{data}_in_buf"),
-                        buffer(f"ep{data}_out_buf"),
-                        str(tx_fifo_size),
-                        str(rx_buf_sz),
-                    )
+                out_configs.append(
+                    Braces(buffer(f"ep{index + 1}_out_buf"), str(rx_buf_sz))
                 )
-                configs.append(Braces(buffer(f"ep{data + 1}_in_buf"), "16", "true"))
-            endpoints = [f"&{pcd_handle}", Braces(*configs)]
+                in_configs.append(
+                    Braces(buffer(f"ep{2 * index + 1}_in_buf"), str(tx_fifo_size))
+                )
+                in_configs.append(Braces(buffer(f"ep{2 * index + 2}_in_buf"), "16"))
+            endpoints = [Braces(*out_configs), Braces(*in_configs)]
         lines += layout_statement(
             f"static {instance_type} {inst_lower}",
             endpoints

@@ -634,10 +634,13 @@ class PeripheralObjects(GeneratorTestCase):
     def test_on_fsdev_each_cdc_has_a_data_endpoint_and_a_notification_endpoint(
         self,
     ):
-        # FSDEV 的数据 OUT 端点与数据 IN 端点同号：第 i 路 CDC 的数据端点是 EP(2i+1)，通知端点
-        # 是 EP(2i+2)。
-        # On FSDEV the data OUT endpoint has the number of the data IN endpoint: CDC i has its
-        # data endpoint on EP(2i+1) and its notification endpoint on EP(2i+2).
+        # FSDEV/DRD 的 RX/TX 列表按端点号从 EP0 起，每项 {槽内存, PMA 字节数}：第 i 路 CDC
+        # 的数据端点是 EP(2i+1)（IN 与 OUT 同号）、通知端点是 EP(2i+2)，数据 OUT 在 OUT 侧按
+        # 顺序占号为 EP(i+1)。
+        # On FSDEV/DRD the RX/TX lists run from EP0 with {slot memory, PMA bytes} each: CDC
+        # i has its data endpoints on EP(2i+1) (IN and OUT sharing the number), its
+        # notification endpoint on EP(2i+2), and the data OUT endpoints number themselves in
+        # order as EP(i+1).
         generator.libxr_settings.setdefault("USB", {})["usb_fs"] = {
             "enable": True,
             "cdc": [{}, {"queue_size": 5}],
@@ -650,14 +653,15 @@ class PeripheralObjects(GeneratorTestCase):
         code = self.generate(project)
         self.assertIn(
             "  static USB::CDCUart usb_fs_cdc2(USB::Endpoint::EPNumber::EP3,\n"
-            "                                  USB::Endpoint::EPNumber::EP3,\n"
+            "                                  USB::Endpoint::EPNumber::EP2,\n"
             "                                  USB::Endpoint::EPNumber::EP4, 128, 128, 5);\n"
-            "  static STM32USBDeviceDevFs usb_fs(&hpcd_USB_DRD_FS,\n"
-            "                                    {{usb_fs_ep0_in_buf, usb_fs_ep0_out_buf, 8, 8},\n"
-            "                                     {usb_fs_ep1_in_buf, usb_fs_ep1_out_buf, 128, 128},\n"
-            "                                     {usb_fs_ep2_in_buf, 16, true},\n"
-            "                                     {usb_fs_ep3_in_buf, usb_fs_ep3_out_buf, 128, 128},\n"
-            "                                     {usb_fs_ep4_in_buf, 16, true}},\n",
+            "  static STM32USBDeviceDevFs usb_fs(\n"
+            "      {{usb_fs_ep0_out_buf, 8}, {usb_fs_ep1_out_buf, 128}, {usb_fs_ep2_out_buf, 128}},\n"
+            "      {{usb_fs_ep0_in_buf, 8},\n"
+            "       {usb_fs_ep1_in_buf, 128},\n"
+            "       {usb_fs_ep2_in_buf, 16},\n"
+            "       {usb_fs_ep3_in_buf, 128},\n"
+            "       {usb_fs_ep4_in_buf, 16}},\n",
             code,
         )
 
@@ -797,12 +801,13 @@ class PeripheralObjects(GeneratorTestCase):
 
     def test_the_usb_device_uses_the_handle_parse_recorded(self):
         # STM32CubeH5 的 USBX 设备例程都定义 PCD_HandleTypeDef hpcd_USB_DRD_FS；以前生成的是
-        # hpcd_USB_FS，链接失败。
+        # hpcd_USB_FS，链接失败。现在设备没有句柄参数，解析出的句柄名不再进入生成代码。
         # The USBX device examples of STM32CubeH5 all define PCD_HandleTypeDef hpcd_USB_DRD_FS;
-        # hpcd_USB_FS used to be generated and failed to link.
+        # hpcd_USB_FS used to be generated and failed to link. The device takes no handle
+        # argument any more, and the parsed handle name no longer enters the generated code.
         code = self.generate(self.usb_fs("Device"), use_xrobot=False)
-        self.assertIn("extern PCD_HandleTypeDef hpcd_USB_DRD_FS;", code)
-        self.assertIn("static STM32USBDeviceDevFs usb_fs(&hpcd_USB_DRD_FS,", code)
+        self.assertNotIn("hpcd_", code)
+        self.assertIn("static STM32USBDeviceDevFs usb_fs(", code)
 
     def test_the_usb_drd_fs_instance_is_the_usb_fs_device(self):
         # STM32G0B1 的 .ioc 中 USB 的 IP 名是 USB_DRD_FS，参数全为默认值时没有 VirtualMode；以前
@@ -816,8 +821,8 @@ class PeripheralObjects(GeneratorTestCase):
             family="STM32G0",
         )
         code = self.generate(project, use_xrobot=False)
-        self.assertIn("extern PCD_HandleTypeDef hpcd_USB_DRD_FS;", code)
-        self.assertIn("static STM32USBDeviceDevFs usb_fs(&hpcd_USB_DRD_FS,", code)
+        self.assertNotIn("hpcd_", code)
+        self.assertIn("static STM32USBDeviceDevFs usb_fs(", code)
         self.assertTrue(generator.libxr_settings["USB"]["usb_fs"]["enable"])
 
     def test_a_usb_in_host_mode_generates_no_device(self):
