@@ -2563,12 +2563,8 @@ class PeripheralFactory:
             out_configs = [Braces(buffer("ep0_out_buf"), str(ep0_sz))]
             in_configs = [Braces(buffer("ep0_in_buf"), str(ep0_sz))]
             for index in range(len(cdcs)):
-                out_configs.append(
-                    Braces(buffer(f"ep{index + 1}_out_buf"), str(rx_buf_sz))
-                )
-                in_configs.append(
-                    Braces(buffer(f"ep{2 * index + 1}_in_buf"), str(tx_fifo_size))
-                )
+                out_configs.append(Braces(buffer(f"ep{index + 1}_out_buf"), str(rx_buf_sz)))
+                in_configs.append(Braces(buffer(f"ep{2 * index + 1}_in_buf"), str(tx_fifo_size)))
                 in_configs.append(Braces(buffer(f"ep{2 * index + 2}_in_buf"), "16"))
             endpoints = [Braces(*out_configs), Braces(*in_configs)]
         lines += layout_statement(
