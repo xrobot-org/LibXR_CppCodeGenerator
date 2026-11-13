@@ -219,10 +219,11 @@ class LibXRSource:
 
 
 def create_gitignore_file(project_dir):
-    """工程目录没有 .gitignore 时创建一个，忽略 build、.history、.cache、CMakeFiles 和
-    .config.yaml；已有的 .gitignore 不改动。
+    """工程目录没有 .gitignore 时创建一个，忽略 build、.history、.cache、CMakeFiles、
+    .config.yaml 和 .libxr（CubeMX 生成后步骤的日志）；已有的 .gitignore 不改动。
     Create a .gitignore in the project directory that ignores build, .history, .cache,
-    CMakeFiles and .config.yaml; an existing .gitignore is left unchanged.
+    CMakeFiles, .config.yaml and .libxr (the log of the CubeMX post-generation step); an
+    existing .gitignore is left unchanged.
     """
     gitignore_path = os.path.join(project_dir, ".gitignore")
     if not os.path.exists(gitignore_path):
@@ -233,6 +234,7 @@ def create_gitignore_file(project_dir):
 .cache/**
 .config.yaml
 CMakeFiles/**
+.libxr/
 """)
 
 
@@ -664,9 +666,11 @@ def setup_project(
     its choice: XRobot code is generated again when User/app_main.cpp was generated with
     --xrobot. At the end it describes what is left to do by hand (see _report_next_steps()).
     """
+    from libxr import generator_code_stm32
     from libxr.generator_code_stm32 import generate
     from libxr.generator_stm32_cmake import integrate, project_uses_xrobot
     from libxr.peripheral_analyzer_stm32 import parse_project
+    from libxr.stm32_cubemx_sync import apply_otg_settings, install_hook
 
     if shutil.which("git") is None:
         logging.error(
@@ -761,11 +765,27 @@ def setup_project(
     if terminal_source:
         set_terminal_source(user_path, terminal_source)
 
+    # 生成后脚本要登记进 .ioc，所以先于解析和生成：app_main.cpp 记下的摘要必须是 setup 结束
+    # 时的 .ioc 的摘要，否则工程在再次运行 STM32CubeMX 之前无法配置。
+    # The post-generation script is registered in the .ioc file, so it comes before parsing
+    # and generating: app_main.cpp has to record the digest of the .ioc file as setup leaves
+    # it, or the project would not configure until STM32CubeMX runs again.
+    install_hook(project_dir, ioc_file)
+
     logging.info(tr("Parsing .ioc file...", "正在解析 .ioc 文件……"))
     parse_project(project_dir, yaml_output, summary=False)
 
     logging.info(tr("Generating C++ code...", "正在生成 C++ 代码……"))
     generate(yaml_output, cpp_output, xrobot_enable)
+
+    # LibXR 接管的 OTG 实例：在 .ioc 中关掉初始化调用和中断函数生成，再解析和生成一次，使
+    # app_main.cpp 记下改后 .ioc 的摘要。
+    # The OTG instances LibXR takes over: turn off their initialization call and interrupt
+    # handler in the .ioc file, then parse and generate once more so that app_main.cpp records
+    # the digest of the changed .ioc file.
+    if apply_otg_settings(ioc_file, generator_code_stm32.otg_devices):
+        parse_project(project_dir, yaml_output, summary=False)
+        generate(yaml_output, cpp_output, xrobot_enable)
 
     integrate(project_dir)
 

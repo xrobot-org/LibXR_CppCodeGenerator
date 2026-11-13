@@ -346,12 +346,122 @@ class PeripheralObjects(GeneratorTestCase):
     Static objects of peripherals, channels, USB devices, the terminal and DMA buffers.
     """
 
-    def usb_otg_hs(self, **settings):
-        """启用 USB_OTG_HS 的工程数据，USB 设置按给出的值。
-        Project data with USB_OTG_HS enabled and the given USB settings.
+    def usb_otg_hs(self, ioc=None, **settings):
+        """启用 USB_OTG_HS 的工程数据，USB 设置按给出的值；ioc 是解析器记下的实例配置。
+        Project data with USB_OTG_HS enabled and the given USB settings; ioc is the instance
+        configuration the parser records.
         """
         generator.libxr_settings.setdefault("USB", {})["usb_otg_hs"] = {"enable": True, **settings}
-        return self.project(peripherals={"USB": {"USB_OTG_HS": {"enable": True}}})
+        return self.project(peripherals={"USB": {"USB_OTG_HS": {"enable": True, **(ioc or {})}}})
+
+    def test_an_otg_device_with_dma_gets_the_ep0_out_buffer(self):
+        # MC02 的 OTG_HS：内置全速 PHY，开启 DMA。
+        # The OTG_HS of MC02: embedded full-speed PHY with DMA.
+        project = self.usb_otg_hs(
+            {
+                "Role": "Device",
+                "profiles": {
+                    "Device_Only_FS": {"VirtualMode": "Device_Only_FS", "dma_enable": "ENABLE"}
+                },
+            }
+        )
+        code = self.generate(project)
+        self.assertIn("alignas(32) static uint8_t usb_otg_hs_ep0_dma_buf[64];\n", code)
+        self.assertIn(
+            "  static STM32USBDeviceOtgHS usb_otg_hs(\n"
+            "      {STM32USBOtgDevice::Phy::EMBEDDED_FS, true, false, false, usb_otg_hs_ep0_dma_buf},\n"
+            "      256, {usb_otg_hs_ep0_out_buf, usb_otg_hs_ep1_out_buf},\n",
+            code,
+        )
+
+    def test_an_otg_device_on_ulpi_runs_at_high_speed(self):
+        # 高速时数据端点每个槽至少 512 字节；speed 为 *_HIGH_IN_FULL 时以全速枚举。
+        # At high speed each slot of a data endpoint is at least 512 bytes; with speed
+        # *_HIGH_IN_FULL the device enumerates at full speed.
+        for speed, high, size in (("", "true", 1024), ("PCD_SPEED_HIGH_IN_FULL", "false", 128)):
+            with self.subTest(speed=speed):
+                ioc = {"Role": "Device", "VirtualMode": "Device_HS"}
+                if speed:
+                    ioc["speed"] = speed
+                code = self.generate(self.usb_otg_hs(ioc))
+                self.assertIn(f"usb_otg_hs_ep1_in_buf[{size}];\n", code)
+                self.assertIn(f"usb_otg_hs_ep1_out_buf[{size}];\n", code)
+                self.assertIn(f"{{STM32USBOtgDevice::Phy::ULPI, false, false, {high}}}", code)
+
+    def test_the_embedded_high_speed_phy_runs_at_high_speed(self):
+        # STM32F723 这类芯片的 OTG_HS 内置高速 PHY，CubeMX 的模式为 Internal_Phy_Device。
+        # The OTG_HS of chips such as the STM32F723 has an embedded high-speed PHY; the CubeMX
+        # mode is Internal_Phy_Device.
+        code = self.generate(
+            self.usb_otg_hs({"Role": "Device", "VirtualMode": "Internal_Phy_Device"})
+        )
+        self.assertIn("{STM32USBOtgDevice::Phy::EMBEDDED_HS, false, false, true}", code)
+        self.assertIn("usb_otg_hs_ep1_in_buf[1024];\n", code)
+
+    def test_an_otg_device_works_with_the_cubemx_defaults(self):
+        # CubeMX 默认调用初始化函数并生成中断函数：LibXR 在链接时包装 HAL_PCD_Init() 和
+        # HAL_PCD_IRQHandler()，生成器不加向量函数，也不要求改 CubeMX。
+        # By default CubeMX calls the initialization function and generates the interrupt
+        # handler: LibXR wraps HAL_PCD_Init() and HAL_PCD_IRQHandler() at link time, so the
+        # generator adds no vector function and asks for no CubeMX change.
+        project = self.usb_otg_hs(
+            {
+                "Role": "Device",
+                "InitCalled": True,
+                "InitStatic": True,
+                "Vectors": {
+                    "OTG_HS_IRQn": {"Enabled": True, "Handler": True},
+                    "OTG_HS_EP1_OUT_IRQn": {"Enabled": True, "Handler": True},
+                },
+            }
+        )
+        code = self.generate(project)
+        self.assertIn("static STM32USBDeviceOtgHS usb_otg_hs(", code)
+        self.assertNotIn("IRQHandler", code)
+
+    def test_an_otg_vector_is_written_when_cubemx_generates_none(self):
+        project = self.usb_otg_hs(
+            {
+                "Role": "Device",
+                "InitCalled": True,
+                "Vectors": {"OTG_HS_IRQn": {"Enabled": True, "Handler": False}},
+            }
+        )
+        code = self.generate(project)
+        self.assertIn(
+            'extern "C" void OTG_HS_IRQHandler(void)\n'
+            "{\n"
+            "  STM32USBOtgDevice::Dispatch(USB_OTG_HS);\n"
+            "}\n"
+            "\n"
+            'extern "C" void app_main(void)\n',
+            code,
+        )
+
+    def test_an_otg_interrupt_must_be_enabled(self):
+        project = self.usb_otg_hs(
+            {"Role": "Device", "Vectors": {"OTG_HS_IRQn": {"Enabled": False, "Handler": True}}}
+        )
+        with self.assertRaisesMessage(
+            ValueError, "USB_OTG_HS: OTG_HS_IRQn is not enabled; enable it in STM32CubeMX NVIC"
+        ):
+            self.generate(project)
+
+    def test_a_static_otg_init_function_is_warned_about(self):
+        project = self.usb_otg_hs(
+            {
+                "Role": "Device",
+                "InitCalled": False,
+                "InitStatic": True,
+                "Vectors": {"OTG_HS_IRQn": {"Enabled": True, "Handler": False}},
+            }
+        )
+        with self.assertLogs(level="WARNING") as logs:
+            code = self.generate(project)
+        self.assertIn("static STM32USBDeviceOtgHS usb_otg_hs(", code)
+        self.assertTrue(
+            any("MX_USB_OTG_HS_PCD_Init is static and not called" in line for line in logs.output)
+        )
 
     def test_an_otg_device_takes_its_settings(self):
         # 参数顺序与 LibXR 的 STM32USBDeviceOtgHS 和 CDCUart 构造函数一致。
@@ -359,7 +469,7 @@ class PeripheralObjects(GeneratorTestCase):
         # LibXR.
         project = self.usb_otg_hs(
             ep0_packet_size=64,
-            tx_buffer_size=64,
+            tx_buffer_size=100,
             rx_buffer_size=256,
             tx_fifo_size=192,
             rx_fifo_size=512,
@@ -373,19 +483,27 @@ class PeripheralObjects(GeneratorTestCase):
             dma_section=".dma",
         )
         code = self.generate(project, use_xrobot=False)
+        # 端点缓冲区按 32 字节对齐，数据端点分为两个槽、每槽按 32 字节取整，所以 tx_buffer_size
+        # 100 变为 128；通知端点两个槽各 32 字节。
+        # Endpoint buffers are 32-byte aligned and a data endpoint is two slots in 32-byte
+        # steps, so tx_buffer_size 100 becomes 128; the notification endpoint gets 32 bytes per
+        # slot.
         self.assertEqual(
-            [line for line in code.splitlines() if line.startswith("alignas(4) static uint8_t")],
+            [line for line in code.splitlines() if line.startswith("alignas(32) static uint8_t")],
             [
-                f'alignas(4) static uint8_t usb_otg_hs_{name}[{size}] __attribute__((section(".dma")));'
+                f'alignas(32) static uint8_t usb_otg_hs_{name}[{size}] __attribute__((section(".dma")));'
                 for name, size in (
                     ("ep0_in_buf", 64),
                     ("ep0_out_buf", 64),
-                    ("ep1_in_buf", 64),
+                    ("ep1_in_buf", 128),
                     ("ep1_out_buf", 256),
-                    ("ep2_in_buf", 16),
+                    ("ep2_in_buf", 64),
                 )
             ],
         )
+        # The raised size is written back; the other one was already a valid size.
+        settings = generator.libxr_settings["USB"]["usb_otg_hs"]
+        self.assertEqual((settings["tx_buffer_size"], settings["rx_buffer_size"]), (128, 256))
         self.assertIn(
             "  // USB OTG HS: 1 CDC\n"
             "  static constexpr auto usb_otg_hs_strings = USB::DescriptorStrings::MakeLanguagePack(\n"
@@ -394,7 +512,8 @@ class PeripheralObjects(GeneratorTestCase):
             "                                     USB::Endpoint::EPNumber::EP1,\n"
             "                                     USB::Endpoint::EPNumber::EP2, 80, 96, 4);\n"
             "  static STM32USBDeviceOtgHS usb_otg_hs(\n"
-            "      &hpcd_USB_OTG_HS, 512, {usb_otg_hs_ep0_out_buf, usb_otg_hs_ep1_out_buf},\n"
+            "      {STM32USBOtgDevice::Phy::EMBEDDED_FS, false, false, false}, 512,\n"
+            "      {usb_otg_hs_ep0_out_buf, usb_otg_hs_ep1_out_buf},\n"
             "      {{usb_otg_hs_ep0_in_buf, 64},\n"
             "       {usb_otg_hs_ep1_in_buf, 192},\n"
             "       {usb_otg_hs_ep2_in_buf, 16}},\n"
@@ -430,7 +549,7 @@ class PeripheralObjects(GeneratorTestCase):
             "                                      USB::Endpoint::EPNumber::EP2,\n"
             "                                      USB::Endpoint::EPNumber::EP4, 128, 128, 3);\n"
             "  static STM32USBDeviceOtgHS usb_otg_hs(\n"
-            "      &hpcd_USB_OTG_HS, 256,\n"
+            "      {STM32USBOtgDevice::Phy::EMBEDDED_FS, false, false, false}, 256,\n"
             "      {usb_otg_hs_ep0_out_buf, usb_otg_hs_ep1_out_buf, usb_otg_hs_ep2_out_buf},\n"
             "      {{usb_otg_hs_ep0_in_buf, 8},\n"
             "       {usb_otg_hs_ep1_in_buf, 128},\n"
@@ -444,19 +563,19 @@ class PeripheralObjects(GeneratorTestCase):
         )
         self.assertEqual(
             [
-                line.removeprefix("alignas(4) static uint8_t ")
+                line.removeprefix("alignas(32) static uint8_t ")
                 for line in code.splitlines()
-                if line.startswith("alignas(4) static uint8_t")
+                if line.startswith("alignas(32) static uint8_t")
             ],
             [
-                "usb_otg_hs_ep0_in_buf[8];",
-                "usb_otg_hs_ep0_out_buf[8];",
+                "usb_otg_hs_ep0_in_buf[32];",
+                "usb_otg_hs_ep0_out_buf[32];",
                 "usb_otg_hs_ep1_in_buf[128];",
                 "usb_otg_hs_ep1_out_buf[128];",
-                "usb_otg_hs_ep2_in_buf[16];",
+                "usb_otg_hs_ep2_in_buf[64];",
                 "usb_otg_hs_ep2_out_buf[128];",
                 "usb_otg_hs_ep3_in_buf[128];",
-                "usb_otg_hs_ep4_in_buf[16];",
+                "usb_otg_hs_ep4_in_buf[64];",
             ],
         )
         for name in ("usb_otg_hs_cdc", "usb_otg_hs_cdc2"):
@@ -515,10 +634,13 @@ class PeripheralObjects(GeneratorTestCase):
     def test_on_fsdev_each_cdc_has_a_data_endpoint_and_a_notification_endpoint(
         self,
     ):
-        # FSDEV 的数据 OUT 端点与数据 IN 端点同号：第 i 路 CDC 的数据端点是 EP(2i+1)，通知端点
-        # 是 EP(2i+2)。
-        # On FSDEV the data OUT endpoint has the number of the data IN endpoint: CDC i has its
-        # data endpoint on EP(2i+1) and its notification endpoint on EP(2i+2).
+        # FSDEV/DRD 的 RX/TX 列表按端点号从 EP0 起，每项 {槽内存, PMA 字节数}：第 i 路 CDC
+        # 的数据端点是 EP(2i+1)（IN 与 OUT 同号）、通知端点是 EP(2i+2)，数据 OUT 在 OUT 侧按
+        # 顺序占号为 EP(i+1)。
+        # On FSDEV/DRD the RX/TX lists run from EP0 with {slot memory, PMA bytes} each: CDC
+        # i has its data endpoints on EP(2i+1) (IN and OUT sharing the number), its
+        # notification endpoint on EP(2i+2), and the data OUT endpoints number themselves in
+        # order as EP(i+1).
         generator.libxr_settings.setdefault("USB", {})["usb_fs"] = {
             "enable": True,
             "cdc": [{}, {"queue_size": 5}],
@@ -531,14 +653,15 @@ class PeripheralObjects(GeneratorTestCase):
         code = self.generate(project)
         self.assertIn(
             "  static USB::CDCUart usb_fs_cdc2(USB::Endpoint::EPNumber::EP3,\n"
-            "                                  USB::Endpoint::EPNumber::EP3,\n"
+            "                                  USB::Endpoint::EPNumber::EP2,\n"
             "                                  USB::Endpoint::EPNumber::EP4, 128, 128, 5);\n"
-            "  static STM32USBDeviceDevFs usb_fs(&hpcd_USB_DRD_FS,\n"
-            "                                    {{usb_fs_ep0_in_buf, usb_fs_ep0_out_buf, 8, 8},\n"
-            "                                     {usb_fs_ep1_in_buf, usb_fs_ep1_out_buf, 128, 128},\n"
-            "                                     {usb_fs_ep2_in_buf, 16, true},\n"
-            "                                     {usb_fs_ep3_in_buf, usb_fs_ep3_out_buf, 128, 128},\n"
-            "                                     {usb_fs_ep4_in_buf, 16, true}},\n",
+            "  static STM32USBDeviceDevFs usb_fs(\n"
+            "      {{usb_fs_ep0_out_buf, 8}, {usb_fs_ep1_out_buf, 128}, {usb_fs_ep2_out_buf, 128}},\n"
+            "      {{usb_fs_ep0_in_buf, 8},\n"
+            "       {usb_fs_ep1_in_buf, 128},\n"
+            "       {usb_fs_ep2_in_buf, 16},\n"
+            "       {usb_fs_ep3_in_buf, 128},\n"
+            "       {usb_fs_ep4_in_buf, 16}},\n",
             code,
         )
 
@@ -678,12 +801,13 @@ class PeripheralObjects(GeneratorTestCase):
 
     def test_the_usb_device_uses_the_handle_parse_recorded(self):
         # STM32CubeH5 的 USBX 设备例程都定义 PCD_HandleTypeDef hpcd_USB_DRD_FS；以前生成的是
-        # hpcd_USB_FS，链接失败。
+        # hpcd_USB_FS，链接失败。现在设备没有句柄参数，解析出的句柄名不再进入生成代码。
         # The USBX device examples of STM32CubeH5 all define PCD_HandleTypeDef hpcd_USB_DRD_FS;
-        # hpcd_USB_FS used to be generated and failed to link.
+        # hpcd_USB_FS used to be generated and failed to link. The device takes no handle
+        # argument any more, and the parsed handle name no longer enters the generated code.
         code = self.generate(self.usb_fs("Device"), use_xrobot=False)
-        self.assertIn("extern PCD_HandleTypeDef hpcd_USB_DRD_FS;", code)
-        self.assertIn("static STM32USBDeviceDevFs usb_fs(&hpcd_USB_DRD_FS,", code)
+        self.assertNotIn("hpcd_", code)
+        self.assertIn("static STM32USBDeviceDevFs usb_fs(", code)
 
     def test_the_usb_drd_fs_instance_is_the_usb_fs_device(self):
         # STM32G0B1 的 .ioc 中 USB 的 IP 名是 USB_DRD_FS，参数全为默认值时没有 VirtualMode；以前
@@ -697,8 +821,8 @@ class PeripheralObjects(GeneratorTestCase):
             family="STM32G0",
         )
         code = self.generate(project, use_xrobot=False)
-        self.assertIn("extern PCD_HandleTypeDef hpcd_USB_DRD_FS;", code)
-        self.assertIn("static STM32USBDeviceDevFs usb_fs(&hpcd_USB_DRD_FS,", code)
+        self.assertNotIn("hpcd_", code)
+        self.assertIn("static STM32USBDeviceDevFs usb_fs(", code)
         self.assertTrue(generator.libxr_settings["USB"]["usb_fs"]["enable"])
 
     def test_a_usb_in_host_mode_generates_no_device(self):

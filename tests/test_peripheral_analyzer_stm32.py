@@ -555,9 +555,39 @@ class UsbRoles(TestCase):
                 "IPParameters": ["VirtualMode-Device_Only_FS"],
                 "Role": "Device",
                 "profiles": {"Device_Only_FS": {"VirtualMode": "Device_Only_FS"}},
+                "InitCalled": False,
+                "InitStatic": False,
             },
         )
         self.assertEqual(usb["USB_OTG_FS"]["Role"], "Device")
+
+    def test_an_otg_instance_records_its_code_generation_settings(self):
+        # NVIC.<IRQ> 的第 6 项是 Generate IRQ handler；functionlistsort 中 USB_OTG_FS 后的 true
+        # 是 Do Not Generate Function Call，HAL 后的 false 是非 static。
+        # Field 6 of NVIC.<IRQ> is Generate IRQ handler; in functionlistsort the true after
+        # USB_OTG_FS is Do Not Generate Function Call and the false after HAL is non-static.
+        ioc = (
+            "Mcu.Family=STM32F4\n"
+            "Mcu.CPN=STM32F407IGH6\n"
+            "Mcu.IP0=USB_OTG_FS\n"
+            "USB_OTG_FS.IPParameters=VirtualMode\n"
+            "USB_OTG_FS.VirtualMode=Device_Only\n"
+            "NVIC.OTG_FS_IRQn=true\\:5\\:0\\:false\\:false\\:false\\:true\\:true\\:true\\:true\n"
+            "NVIC.OTG_FS_WKUP_IRQn=true\\:5\\:0\\:false\\:false\\:true\\:true\\:true\\:true\\:true\n"
+            "ProjectManager.functionlistsort=1-SystemClock_Config-RCC-false-HAL-false,"
+            "2-MX_USB_OTG_FS_PCD_Init-USB_OTG_FS-true-HAL-false\n"
+        )
+        with self.assertLogs(level="WARNING"):
+            usb = self.parse("", ioc)["Peripherals"]["USB"]["USB_OTG_FS"]
+        self.assertFalse(usb["InitCalled"])
+        self.assertFalse(usb["InitStatic"])
+        self.assertEqual(
+            usb["Vectors"],
+            {
+                "OTG_FS_IRQn": {"Enabled": True, "Handler": False},
+                "OTG_FS_WKUP_IRQn": {"Enabled": True, "Handler": True},
+            },
+        )
 
 
 class Rtos(TestCase):

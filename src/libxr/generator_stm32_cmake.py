@@ -60,6 +60,7 @@ SETTINGS_TITLE = "Project settings"
 COMPILE_OPTIONS_TITLE = "Compile options"
 LIBXR_TITLE = "LibXR"
 APPLICATION_TITLE = "Application"
+CUBEMX_TITLE = "CubeMX"
 OPTIMIZATION_TITLE = "Library optimization"
 FIRMWARE_TITLE = "Firmware images"
 KEPT_TITLE = "Kept from the earlier LibXR.CMake"
@@ -142,6 +143,49 @@ add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
     COMMAND ${CMAKE_OBJCOPY} --output-target binary --strip-all
         $<TARGET_FILE_NAME:${CMAKE_PROJECT_NAME}> ${CMAKE_PROJECT_NAME}.bin
     VERBATIM)"""
+
+# User/app_main.cpp 记下生成它的 .ioc 的摘要（见 stm32_cubemx_sync.ioc_digest()）；配置时比对，
+# .ioc 改过而 LibXR 的代码没有重新生成时让配置失败，并附上生成后步骤的输出。CMake 在 .ioc 或
+# app_main.cpp 变化后重新配置。
+# User/app_main.cpp records the digest of the .ioc file it was generated from (see
+# stm32_cubemx_sync.ioc_digest()); configuring compares it, and fails with the output of the
+# post-generation step when the .ioc file changed without the LibXR code being generated again.
+# CMake configures again after the .ioc file or app_main.cpp changes.
+CUBEMX_BLOCK = r"""# User/app_main.cpp records the digest of the .ioc file it was generated from. Another digest
+# means that STM32CubeMX changed the project and the LibXR code was not generated again: the
+# post-generation step (cmake/libxr_after_cubemx.cmd, `libxr stm32 sync`) failed or did not run.
+file(GLOB LIBXR_IOC "${CMAKE_CURRENT_SOURCE_DIR}/*.ioc")
+set(LIBXR_APP_MAIN "${CMAKE_CURRENT_SOURCE_DIR}/User/app_main.cpp")
+list(LENGTH LIBXR_IOC LIBXR_IOC_COUNT)
+if(LIBXR_IOC_COUNT EQUAL 1 AND EXISTS "${LIBXR_APP_MAIN}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${LIBXR_IOC}" "${LIBXR_APP_MAIN}")
+    file(STRINGS "${LIBXR_APP_MAIN}" LIBXR_IOC_RECORD
+        REGEX "^// .* digest: [0-9a-f]+$" LIMIT_COUNT 1)
+    if(LIBXR_IOC_RECORD)
+        string(REGEX REPLACE "^.* digest: " "" LIBXR_IOC_RECORDED "${LIBXR_IOC_RECORD}")
+        file(READ "${LIBXR_IOC}" LIBXR_IOC_TEXT)
+        string(REPLACE "\r" "" LIBXR_IOC_TEXT "${LIBXR_IOC_TEXT}")
+        string(SHA256 LIBXR_IOC_DIGEST "${LIBXR_IOC_TEXT}")
+        string(SUBSTRING "${LIBXR_IOC_DIGEST}" 0 16 LIBXR_IOC_DIGEST)
+        if(NOT LIBXR_IOC_DIGEST STREQUAL LIBXR_IOC_RECORDED)
+            set(LIBXR_SYNC_LOG "${CMAKE_CURRENT_SOURCE_DIR}/.libxr/after_cubemx.log")
+            if(EXISTS "${LIBXR_SYNC_LOG}")
+                file(READ "${LIBXR_SYNC_LOG}" LIBXR_SYNC_OUTPUT)
+                string(CONCAT LIBXR_SYNC_OUTPUT "Output of its last run (${LIBXR_SYNC_LOG}):\n"
+                    "${LIBXR_SYNC_OUTPUT}")
+            else()
+                set(LIBXR_SYNC_OUTPUT "It has not run in this checkout (no ${LIBXR_SYNC_LOG}).")
+            endif()
+            message(FATAL_ERROR
+                "[LibXR] ${LIBXR_IOC} changed after User/app_main.cpp was generated, so the "
+                "STM32CubeMX post-generation step failed or did not run. Run\n"
+                "    python -m libxr stm32 sync\n"
+                "in ${CMAKE_CURRENT_SOURCE_DIR}, or generate the code in STM32CubeMX again.\n"
+                "${LIBXR_SYNC_OUTPUT}")
+        endif()
+    endif()
+endif()"""
 
 include_cmake_cmd = "include(${CMAKE_CURRENT_LIST_DIR}/cmake/LibXR.CMake)\n"
 
@@ -257,6 +301,9 @@ def render_libxr_cmake(
     builder.raw("")
     builder.raw(_rule(APPLICATION_TITLE))
     builder.raw(APPLICATION_BLOCK)
+    builder.raw("")
+    builder.raw(_rule(CUBEMX_TITLE))
+    builder.raw(CUBEMX_BLOCK)
     builder.raw("")
     builder.raw(_rule(OPTIMIZATION_TITLE))
     builder.raw(OPTIMIZATION_BLOCK)
