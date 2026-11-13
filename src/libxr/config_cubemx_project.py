@@ -765,6 +765,13 @@ def setup_project(
     if terminal_source:
         set_terminal_source(user_path, terminal_source)
 
+    # 生成后脚本要登记进 .ioc，所以先于解析和生成：app_main.cpp 记下的摘要必须是 setup 结束
+    # 时的 .ioc 的摘要，否则工程在再次运行 STM32CubeMX 之前无法配置。
+    # The post-generation script is registered in the .ioc file, so it comes before parsing
+    # and generating: app_main.cpp has to record the digest of the .ioc file as setup leaves
+    # it, or the project would not configure until STM32CubeMX runs again.
+    install_hook(project_dir, ioc_file)
+
     logging.info(tr("Parsing .ioc file...", "正在解析 .ioc 文件……"))
     parse_project(project_dir, yaml_output, summary=False)
 
@@ -781,7 +788,6 @@ def setup_project(
         generate(yaml_output, cpp_output, xrobot_enable)
 
     integrate(project_dir)
-    install_hook(project_dir, ioc_file)
 
     logging.info(tr("[Pass] All tasks completed.", "[通过] 全部任务已完成。"))
     _report_next_steps(project_dir, xrobot_enable)

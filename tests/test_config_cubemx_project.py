@@ -657,6 +657,14 @@ class SetupRun(LibXRRemote, GeneratorTestCase):
         )
         self.assertTrue((project / "cmake" / "libxr_after_cubemx.cmd").is_file())
         self.assertTrue((project / "cmake" / "libxr_after_cubemx.sh").is_file())
+        # app_main.cpp records the digest of the .ioc file as setup leaves it, so the project
+        # configures without another run of STM32CubeMX.
+        from libxr.stm32_cubemx_sync import ioc_digest
+
+        self.assertIn(
+            f" digest: {ioc_digest(str(next(project.glob('*.ioc'))))}\n",
+            (project / "User" / "app_main.cpp").read_text(encoding="utf-8"),
+        )
         self.assertIn(
             "* text=auto\n*.sh text eol=lf\n*.bat text eol=crlf\n",
             (project / ".gitattributes").read_text(encoding="utf-8"),
