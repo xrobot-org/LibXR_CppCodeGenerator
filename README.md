@@ -638,28 +638,9 @@ $ libxr stm32 toolchain clang --newlib
 [INFO] Done.
 ```
 
-`libxr stm32 cmake` 还处理工程根目录中的链接脚本（`*.ld`）。CubeMX 写出的链接脚本没有 `.got`
-输出段，而 CubeMX 生成的 `syscalls.c` 和 `sysmem.c` 会写 `errno`；ST Arm Clang 的 picolibc 中
-`errno` 是线程局部变量，访问它要用一个 GOT 条目。没有 `.got` 输出段时，ld.lld 把这个条目放进 RAM，
-`.bin` 从 Flash 一直延伸到 RAM（约 384 MiB），启动后条目中也不是链接时的值。因此
-`libxr stm32 cmake` 为没有 `.got` 输出段的链接脚本在 `.fini_array` 之后加入一段，放在与
-`.fini_array` 相同的存储区。ld.lld 要求 init/fini 数组和 GOT 连续，两者之间隔着其他输出段时，
-STARM_NEWLIB 配置的链接报 `.got is not contiguous with other relro sections`；已有的 `.got` 不紧跟
-`.fini_array` 时只给出警告，不改动。CubeMX 重新生成代码时保留已有的链接脚本，GCC 构建不受这一段
-影响。
+`libxr stm32 cmake` 还会检查工程根目录的链接脚本（`*.ld`），在缺少 `.got` 输出段时将其紧跟 `.fini_array` 放入 Flash（已存在但位置不连续时仅告警，不改动），避免 ST Arm Clang（`ld.lld`）将孤立 `.got` 放进 RAM 导致 `.bin` 膨胀或 RELRO 链接失败；GCC 构建不受影响。
 
-`libxr stm32 cmake` also handles the linker scripts (`*.ld`) in the root of the project. The
-linker script CubeMX writes has no `.got` output section, while the `syscalls.c` and `sysmem.c`
-CubeMX generates write `errno`; in the picolibc of ST Arm Clang `errno` is thread-local, and
-reaching it takes a GOT entry. Without a `.got` output section ld.lld puts that entry in RAM, the
-`.bin` spans Flash up to RAM (about 384 MiB), and after startup the entry does not hold the linked
-value. `libxr stm32 cmake` therefore adds a `.got` output section after `.fini_array` to a linker
-script without one, in the same memory region as `.fini_array`. ld.lld requires the init/fini
-arrays and the GOT to be contiguous: with another output section between them, an STARM_NEWLIB
-link fails with `.got is not contiguous with other relro sections`, and an existing `.got` that
-does not directly follow `.fini_array` only gets a warning and stays as it is. CubeMX keeps an
-existing linker script when it regenerates the code, and GCC builds are not affected by the
-section.
+`libxr stm32 cmake` also checks root linker scripts (`*.ld`) and inserts a `.got` output section directly after `.fini_array` in Flash when missing (warning without modifying if `.got` exists elsewhere), preventing ST Arm Clang (`ld.lld`) from placing an orphan `.got` in RAM or failing the contiguous RELRO check; GCC builds are unaffected.
 
 ---
 

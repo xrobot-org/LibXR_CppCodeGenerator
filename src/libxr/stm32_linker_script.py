@@ -34,7 +34,7 @@ GOT_SECTION = """\
 {indent}  . = ALIGN(4);
 {indent}  *(.got .got.*)
 {indent}  . = ALIGN(4);
-{indent}}} {region}
+{indent}}}{region_suffix}
 """
 
 # 一行开头的输出段定义：段名，可选的括号（如 (READONLY)、(NOLOAD)），其他属性，然后是冒号。
@@ -44,15 +44,22 @@ _SECTION_HEADER = re.compile(
     r"^(?P<indent>[ \t]*)(?P<name>\.[\w.$]+|/DISCARD/)[ \t]*(?:\([^)\n]*\))?[^:;=\n{}]*:(?![=:])",
     re.MULTILINE,
 )
+# 输出段右花括号后的可选子句（>REGION、AT>LMA_REGION、:PHDR、=FILL 及末尾逗号），允许跨行。
+# Optional clauses after the closing brace of an output section (>REGION, AT>LMA_REGION,
+# :PHDR, =FILL and an optional trailing comma), which may span lines.
+_SECTION_TRAILER = re.compile(
+    r"(?:\s*(?:\bAT\s*>\s*[^\s:;={}/,]+|>\s*[^\s:;={}/,]+|:\s*[^\s:;={}/,]+|=\s*(?:\([^)]*\)|[^\s;{},]+)))*"
+    r"(?:\s*,)?"
+)
 _COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 
 
 def _without_comments(text: str) -> str:
-    """把 text 中的注释换成等长的空格（换行保留），使偏移量不变。
-    Replace the comments of text with as many spaces (keeping the line breaks), so that offsets
-    stay the same.
+    """把 text 中的注释换成等长的空格（换行与回车保留），使偏移量不变。
+    Replace the comments of text with as many spaces (keeping the line breaks and carriage returns),
+    so that offsets stay the same.
     """
-    return _COMMENT.sub(lambda m: re.sub(r"[^\n]", " ", m.group()), text)
+    return _COMMENT.sub(lambda m: re.sub(r"[^\r\n]", " ", m.group()), text)
 
 
 def _sections(code: str) -> list[re.Match]:
@@ -69,9 +76,9 @@ def _sections(code: str) -> list[re.Match]:
 
 
 def _closing_line_end(code: str, header: re.Match) -> tuple[int, str] | None:
-    """header 所定义的输出段结束的那一行：(该行末尾的偏移量, 右花括号之后的内存区域)。
-    The line where the output section that header defines ends: (the offset of the end of that
-    line, the memory region after the closing brace).
+    """header 所定义的输出段结束的位置：(包含跨行区域子句的结束行末尾偏移量, 内存区域等后缀)。
+    Where the output section that header defines ends: (the end-of-line offset after its closing
+    brace and any following region clause across lines, the region/trailer suffix).
 
     找不到配对的花括号时为 None。
     None when the braces do not pair up.
@@ -86,9 +93,12 @@ def _closing_line_end(code: str, header: re.Match) -> tuple[int, str] | None:
         elif code[index] == "}":
             depth -= 1
             if depth == 0:
-                line_end = code.find("\n", index)
+                trailer = _SECTION_TRAILER.match(code, index + 1)
+                trailer_end = trailer.end() if trailer else index + 1
+                line_end = code.find("\n", trailer_end)
                 line_end = len(code) if line_end < 0 else line_end
-                return line_end, code[index + 1 : line_end].strip()
+                region = " ".join(trailer.group().split()).rstrip(",").strip() if trailer else ""
+                return line_end, region
     return None
 
 
@@ -98,17 +108,17 @@ def place_got(file_path: str | Path) -> bool:
     .fini_array; True when the file was written back.
 
     没有 .got 输出段时，在 .fini_array 之后插入一个，内存区域与 .fini_array 相同。已有的 .got
-    不紧跟 .fini_array 时只给出警告，用户写的段不动；没有 .fini_array 时也只警告。换行符和编码
-    保持文件原来的写法。
+    不紧跟 .fini_array 时只给出警告，用户写的段不动；没有 .fini_array 时也只警告。未改动行的换行符
+    和编码保持原样；仅新插入块使用 .fini_array 结束行的换行符。
     Without a .got output section, one is inserted after .fini_array, in the memory region of
     .fini_array. An existing .got that does not directly follow .fini_array only gets a warning,
-    and the user's section stays; a script without .fini_array also only gets a warning. The line
-    endings and the encoding stay as the file has them.
+    and the user's section stays; a script without .fini_array also only gets a warning. Untouched
+    lines keep their original line endings and encoding; only the inserted block uses the line
+    ending of .fini_array's closing line.
     """
     path = Path(file_path)
     raw = path.read_bytes()
-    eol = "\r\n" if b"\r\n" in raw else "\n"
-    text = raw.decode("utf-8", errors="surrogateescape").replace("\r\n", "\n")
+    text = raw.decode("utf-8", errors="surrogateescape")
     code = _without_comments(text)
     sections = _sections(code)
     names = [match.group("name") for match in sections]
@@ -145,15 +155,37 @@ def place_got(file_path: str | Path) -> bool:
         )
         return False
     line_end, region = closing
-    block = GOT_SECTION.format(indent=sections[fini].group("indent"), region=region)
-    placed = text[:line_end] + "\n\n" + block.rstrip("\n") + text[line_end:]
-    path.write_bytes(placed.replace("\n", eol).encode("utf-8", errors="surrogateescape"))
-    logging.info(
-        tr(
-            f"Placed the GOT in {region.lstrip('>').strip()} after .fini_array in {path}",
-            f"已在 {path} 中把 GOT 放进 {region.lstrip('>').strip()}，紧跟 .fini_array",
-        )
+    if line_end < len(text) and line_end > 0 and text[line_end - 1] == "\r":
+        insert_at = line_end - 1
+        eol = "\r\n"
+    elif line_end < len(text):
+        insert_at = line_end
+        eol = "\n"
+    else:
+        insert_at = line_end
+        eol = "\r\n" if "\r\n" in text else "\n"
+    region_suffix = f" {region}" if region else ""
+    block = GOT_SECTION.format(
+        indent=sections[fini].group("indent"),
+        region_suffix=region_suffix,
     )
+    inserted = block.rstrip("\n").replace("\n", eol)
+    placed = text[:insert_at] + eol + eol + inserted + text[insert_at:]
+    path.write_bytes(placed.encode("utf-8", errors="surrogateescape"))
+    if region:
+        logging.info(
+            tr(
+                f"Placed the GOT in {region.lstrip('>').strip()} after .fini_array in {path}",
+                f"已在 {path} 中把 GOT 放进 {region.lstrip('>').strip()}，紧跟 .fini_array",
+            )
+        )
+    else:
+        logging.info(
+            tr(
+                f"Placed the GOT after .fini_array in {path}",
+                f"已在 {path} 中把 GOT 紧跟 .fini_array 放置",
+            )
+        )
     return True
 
 

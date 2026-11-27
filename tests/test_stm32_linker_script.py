@@ -171,6 +171,49 @@ class PlacedGot(TestCase):
             self.assertEqual(self.place(script), (False, script))
         self.assertIn("has no .fini_array output section", logs.output[0])
 
+    def test_next_line_region_clause_stays_on_fini_array(self):
+        multiline = CUBEMX_SCRIPT.replace(
+            "  } >FLASH\n\n  _siccmram",
+            "  } /* end of .fini_array */\n  >FLASH\n\n  _siccmram",
+        )
+        expected = multiline.replace(
+            "  } /* end of .fini_array */\n  >FLASH\n",
+            "  } /* end of .fini_array */\n  >FLASH\n" + GOT_BLOCK,
+        )
+        self.assertEqual(self.place(multiline), (True, expected))
+        self.assertEqual(self.place(expected), (False, expected))
+
+        at_region = CUBEMX_SCRIPT.replace(
+            "  } >FLASH\n\n  _siccmram",
+            "  }\n  >RAM AT> FLASH\n\n  _siccmram",
+        )
+        expected_at = at_region.replace(
+            "  }\n  >RAM AT> FLASH\n",
+            "  }\n  >RAM AT> FLASH\n" + GOT_BLOCK.replace(">FLASH", ">RAM AT> FLASH"),
+        )
+        self.assertEqual(self.place(at_region), (True, expected_at))
+        self.assertEqual(self.place(expected_at), (False, expected_at))
+
+    def test_mixed_line_endings_leave_untouched_lines_unchanged(self):
+        head, tail = CUBEMX_SCRIPT.split("/* Sections */", 1)
+        mixed = head.replace("\n", "\r\n") + "/* Sections */" + tail
+        expected = (
+            head.replace("\n", "\r\n")
+            + "/* Sections */"
+            + tail.replace(FINI_END, FINI_END + GOT_BLOCK)
+        )
+        self.assertEqual(self.place(mixed), (True, expected))
+
+        # .fini_array 的结束行用 CRLF、其余行用 LF 时，仅新增块用 CRLF，未改动行保持 LF。
+        # With CRLF on .fini_array's closing line and LF elsewhere, only the inserted block uses
+        # CRLF while untouched lines stay LF.
+        fini_crlf = CUBEMX_SCRIPT.replace(FINI_END, FINI_END[:-1] + "\r\n")
+        expected_fini_crlf = fini_crlf.replace(
+            "  } >FLASH\r\n",
+            "  } >FLASH\r\n" + GOT_BLOCK.replace("\n", "\r\n"),
+        )
+        self.assertEqual(self.place(fini_crlf), (True, expected_fini_crlf))
+
 
 class ProjectScripts(TestCase):
     """工程根目录中的每份链接脚本，以及 libxr stm32 cmake 中的这一步。
