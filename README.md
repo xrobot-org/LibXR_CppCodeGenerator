@@ -124,6 +124,7 @@ $ libxr stm32 setup -t usart1
 [INFO] System: FreeRTOS
 [INFO] Generated User: wrote app_main.cpp, app_main.h, flash_map.hpp, libxr_config.yaml
 [INFO] Generated LibXR.CMake at: cmake\LibXR.CMake
+[INFO] Placed the GOT in FLASH after .fini_array in STM32F103xx_FLASH.ld
 [INFO] LibXR.CMake included in CMakeLists.txt.
 [INFO] [Pass] All tasks completed.
 [INFO] Next: #include "app_main.h" and call app_main() in the default task StartDefaultTask (Core/Src/main.c), inside USER CODE sections, which CubeMX keeps when it regenerates the code.
@@ -204,6 +205,10 @@ $ libxr stm32 toolchain clang --newlib
 [INFO] Set STARM_TOOLCHAIN_CONFIG to "STARM_NEWLIB" in cmake\starm-clang.cmake
 [INFO] Done.
 ```
+
+`libxr stm32 cmake` 还会检查工程根目录的链接脚本（`*.ld`），在缺少 `.got` 输出段时将其紧跟 `.fini_array` 放入 Flash（已存在但位置不连续时仅告警，不改动），避免 ST Arm Clang（`ld.lld`）将孤立 `.got` 放进 RAM 导致 `.bin` 膨胀或 RELRO 链接失败；GCC 构建不受影响。
+
+`libxr stm32 cmake` also checks root linker scripts (`*.ld`) and inserts a `.got` output section directly after `.fini_array` in Flash when missing (warning without modifying if `.got` exists elsewhere), preventing ST Arm Clang (`ld.lld`) from placing an orphan `.got` in RAM or failing the contiguous RELRO check; GCC builds are unaffected.
 
 ---
 
